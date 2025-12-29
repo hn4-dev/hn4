@@ -27,6 +27,8 @@
 **HN4 is currently in active development.**
 The core architecture is solid and the drivers pass validation, but the API is still evolving. We recommend using this release for testing, benchmarking, and research purposes. Full production certification is in progress.
 
+**Want to verify the physics yourself?**
+You don't have to take our word for it. You can audit the engine's stability right now. Simply run `make` (Linux/macOS/ARM) or `run.bat` (Windows) and watch **thousands of architectural, fuzzing, and unit tests** pass before your eyes to understand the current progress status.
 ---
 
 ## 💾 What is HN4?
