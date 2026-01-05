@@ -1,3 +1,14 @@
+/*
+ * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
+ * MODULE:      Integrity Primitives
+ * HEADER:      hn4_crc.h
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
+ *
+ * DESCRIPTION:
+ * Exposes Slice-by-8 optimized CRC32C (Castagnoli) and optional CRC64
+ * routines for data integrity verification.
+ */
+
 #ifndef HN4_CRC_H
 #define HN4_CRC_H
 

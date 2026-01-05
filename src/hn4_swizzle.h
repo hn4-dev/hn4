@@ -1,19 +1,12 @@
 /*
  * HYDRA-NEXUS 4 (HN4) IMPLEMENTATION STANDARD
  * HEADER FILE: hn4_swizzle.h
- * STATUS: REFERENCE STANDARD (v5.1)
+ * STATUS:      REFERENCE STANDARD (v5.1)
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * PURPOSE:
- * Provides High-Performance Bit-Manipulation and Address Permutation logic.
- *
- * ARCHITECTURAL INTEGRATION:
- *  - [Spec 6.6] Gravity Assist: Use hn4_swizzle_gravity_assist().
- *  - [Spec 10.7] Ludic Protocol: Use hn4_swizzle_morton_2d/3d().
- *  - [Spec 10.2] Tensor Tunnel: Use hn4_swizzle_tensor_offset().
- *
- * WARNING:
- *  - DO NOT use for D2 Streams (Must be linear).
- *  - DO NOT use for Epoch/Chronicle Logs (Must be time-ordered).
+ * High-Performance Bit-Manipulation and Address Permutation logic.
+ * Used for Gravity Assist (Spec 6.6) and Ludic Protocol (Spec 10.7).
  */
 
 #ifndef HN4_SWIZZLE_H

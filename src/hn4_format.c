@@ -1,0 +1,985 @@
+/*
+ * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
+ * MODULE:      Disk Format Utility (mkfs.hn4)
+ * SOURCE:      hn4_format.c
+ * VERSION:     6.6 (Production Release Candidate)
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
+ *
+ * ENGINEERING NOTES:
+ * 1. ABI Stability: Uses fixed-width packed structures.
+ * 2. Atomic Safety: Explicit barriers (FLUSH) injected.
+ * 3. Poisoning: Writes deterministic poison (0xDEADBEEF) on failure.
+ * 4. Sanitization: Handles ZNS Zone Resets and standard TRIM.
+ */
+
+#include "hn4.h"
+#include "hn4_hal.h"
+#include "hn4_endians.h"
+#include "hn4_crc.h"
+#include "hn4_errors.h"
+#include "hn4_addr.h"
+#include "hn4_epoch.h"
+#include "hn4_anchor.h"
+#include "hn4_constants.h"
+#include <string.h>
+
+/* =========================================================================
+ * KERNEL STANDARD MACROS & CONSTANTS
+ * ========================================================================= */
+
+/* 
+ * Issue 1: Explicit Layout Versioning
+ * Prevents ABI drift if internal structs change. 
+ * This is hardcoded to the specific version of the layout logic.
+ */
+#define HN4_LAYOUT_VER_CURRENT  1
+
+/* 
+ * Issue 6: Packed Structure for Disk I/O 
+ * Decoupled from memory struct to ensure precise on-disk layout regardless
+ * of compiler alignment flags for the in-memory `hn4_superblock_t`.
+ */
+typedef struct HN4_PACKED {
+    uint8_t     raw_bytes[HN4_SB_SIZE];
+} hn4_packed_sb_t;
+
+/* 
+ * I/O Buffer Waterfall
+ * We try to alloc the largest buffer first. If that fails, we step down.
+ * Crucial for embedded systems with fragmented RAM.
+ */
+static const uint32_t PREF_IO_SIZES[] = {
+    32 * (uint32_t)HN4_SZ_MB,
+    2  * (uint32_t)HN4_SZ_MB,
+    64 * (uint32_t)HN4_SZ_KB
+};
+
+static uint32_t _resolve_device_type(uint64_t hw_flags, uint32_t profile_id) {
+    /* 
+     * [LAYER 1] BUSINESS LOGIC OVERRIDES
+     * Profile-specific mandates that ignore hardware reality.
+     * 
+     * Rule: Archive Profile on non-NVM/non-ZNS media is treated as TAPE.
+     * (e.g., SMR HDDs, Actual Tape, or Unknown cold storage).
+     */
+    const uint64_t modern_media_mask = (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    
+    if (HN4_UNLIKELY(profile_id == HN4_PROFILE_ARCHIVE)) {
+        if ((hw_flags & modern_media_mask) == 0) {
+            return HN4_DEV_TAPE;
+        }
+    }
+
+    /* 
+     * [LAYER 2] HARDWARE TOPOLOGY RESOLUTION
+     * Priority is critical here. A device might report multiple flags 
+     * (e.g., an HDD might emulate ZNS). We prefer the most specific 
+     * protocol constraint first.
+     */
+    
+    // 1. Zoned Namespaces (Strict Sequential Write Constraints)
+    if (hw_flags & HN4_HW_ZNS_NATIVE) {
+        return HN4_DEV_ZNS;
+    }
+
+    // 2. Rotational Media (Seek Penalties Apply)
+    if (hw_flags & HN4_HW_ROTATIONAL) {
+        return HN4_DEV_HDD;
+    }
+
+    // 3. Non-Volatile Memory (Random Access Friendly)
+    // Note: We fall through to SSD for NVM or if no specific flag matches (Generic).
+    return HN4_DEV_SSD;
+}
+
+/* =========================================================================
+ * PROFILE DEFINITIONS (TABLE LOOKUP)
+ * ========================================================================= */
+
+/* 
+ * Optimization: Replaces switch statements with table lookups.
+ * Centralizes policy definitions.
+ */
+typedef struct {
+    uint64_t    min_cap;
+    uint64_t    max_cap;
+    uint32_t    default_block_size;
+    uint32_t    alignment_target;
+    uint32_t    revision; /* Issue 19: Profile Revisioning */
+    const char* name;
+} hn4_profile_spec_t;
+
+static const hn4_profile_spec_t PROFILE_SPECS[] = {
+    /* [0] GENERIC (SSD/General Purpose) */
+    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   1, "GENERIC" },
+    
+    /* [1] GAMING (Assets/Read-Heavy) */
+    { 1   * HN4_SZ_GB,  16 * HN4_SZ_TB,  16384,    65536,           1, "GAMING"  },
+    
+    /* [2] AI (Tensor Tunnel - UNLIMITED CAPACITY) */
+    { 10  * HN4_SZ_GB,  HN4_CAP_UNLIMITED, 1048576, 2 * HN4_SZ_MB,   1, "AI"      },
+    
+    /* [3] ARCHIVE (Tape/Cold - Capped at 18 EiB) */
+    { 10  * HN4_SZ_GB,  18 * HN4_SZ_EB,  67108864, 67108864,        1, "ARCHIVE" },
+    
+    /* [4] PICO (Embedded/IoT - Tiny Limit) */
+    { 1   * HN4_SZ_MB,  2  * HN4_SZ_GB,  512,      512,             1, "PICO"    },
+    
+    /* [5] SYSTEM (OS Root) */
+    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   1, "SYSTEM"  },
+    
+    /* [6] USB (Portable) */
+    { 128 * HN4_SZ_MB,  2  * HN4_SZ_TB,  65536,    65536,           1, "USB"     }
+};
+
+
+#define HN4_MAX_PROFILES (sizeof(PROFILE_SPECS) / sizeof(hn4_profile_spec_t))
+
+
+/* =========================================================================
+ * 2. SANITIZATION LOGIC (CRITICAL PATH)
+ * ========================================================================= */
+
+/**
+ * _sanitize_zns
+ * Performs strict zone-aligned resets.
+ * Issue 3: Resets critical Zone 0 first, guarantees SB location clear.
+ */
+static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev, 
+                                  uint64_t capacity_bytes, 
+                                  uint32_t zone_size_bytes,
+                                  uint32_t logical_block_size) 
+{
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    if (!caps || logical_block_size != caps->logical_block_size) {
+        HN4_LOG_CRIT("ZNS Sanitize: Logical Block Size mismatch with HAL Caps");
+        return HN4_ERR_INTERNAL_FAULT;
+    }
+    if (zone_size_bytes == 0 || logical_block_size == 0) return HN4_ERR_GEOMETRY;
+
+    uint32_t zone_sectors = zone_size_bytes / logical_block_size;
+    uint64_t aligned_cap = HN4_ALIGN_DOWN(capacity_bytes, zone_size_bytes);
+    uint64_t offset = 0;
+
+    HN4_LOG_VAL("ZNS Sanitize Start. Capacity", capacity_bytes);
+
+    /* Issue 3: Critical - Reset SB Zone First (Zone 0) */
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, hn4_addr_from_u64(0), NULL, zone_sectors);
+    if (res != HN4_OK) return res;
+
+    hn4_hal_barrier(dev); /* Fence: Ensure Zone 0 is empty before touching others */
+
+    /* Reset remainder */
+    offset += zone_size_bytes;
+    while (offset < aligned_cap) {
+        hn4_addr_t lba = hn4_lba_from_blocks(offset / logical_block_size);
+        
+        res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, zone_sectors);
+        if (res != HN4_OK) return res;
+
+        offset += zone_size_bytes;
+        /* Throttle logs */
+        if ((offset % (16 * HN4_SZ_GB)) == 0) {
+             HN4_LOG_VAL("ZNS Progress (Bytes)", offset);
+        }
+    }
+    
+    hn4_hal_barrier(dev);
+    return HN4_OK;
+}
+
+static hn4_result_t _sanitize_generic(hn4_hal_device_t* dev, hn4_size_t capacity_bytes, uint32_t bs) {
+    HN4_LOG_VAL("Generic TRIM/Discard. Bytes", capacity_bytes);
+    /* Issue 9: Discard uses BLOCK COUNT */
+    return hn4_hal_sync_io_large(dev, HN4_IO_DISCARD, hn4_addr_from_u64(0), NULL, capacity_bytes, bs);
+}
+
+/**
+ * _survey_silicon_cartography
+ * Initializes the Quality Mask (Q-Mask).
+ */
+static hn4_result_t _survey_silicon_cartography(
+    hn4_hal_device_t* dev, 
+    const hn4_superblock_t* sb
+) {
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    if (!caps) return HN4_ERR_INTERNAL_FAULT;
+    
+    uint32_t ss = caps->logical_block_size;
+    if (ss == 0) return HN4_ERR_GEOMETRY;
+
+    /* 
+     * Use native address subtraction to determine size.
+     * Do not convert to u64, as LBA might exceed 64-bits.
+     */
+    hn4_addr_t start_lba = sb->info.lba_qmask_start;
+    hn4_addr_t end_lba   = sb->info.lba_flux_start;
+    
+    hn4_size_t sector_delta;
+    hn4_size_t total_bytes;
+
+#ifdef HN4_USE_128BIT
+    /* 128-bit Subtraction */
+    sector_delta = hn4_u128_sub(end_lba, start_lba);
+    
+    /* Approximation for loop limit (QMask is rarely > 18EB itself, even if location is) */
+    /* If the region size itself > 64 bits, we clamp to max u64 for the loop counter 
+       or we implement a 128-bit loop. For QMask, size is small relative to disk. */
+    if (sector_delta.hi > 0) return HN4_ERR_GEOMETRY; // QMask size > 18EB is insane
+    
+    total_bytes.lo = sector_delta.lo * ss;
+    total_bytes.hi = 0; // Assuming QMask size fits in 64-bit
+#else
+    if (end_lba < start_lba) return HN4_ERR_GEOMETRY;
+    sector_delta = end_lba - start_lba;
+    total_bytes = sector_delta * ss;
+#endif
+
+    if (
+#ifdef HN4_USE_128BIT
+        total_bytes.lo == 0 && total_bytes.hi == 0
+#else
+        total_bytes == 0
+#endif
+    ) return HN4_OK;
+
+    /* Default Pattern: SILVER (0xAA) */
+    const uint8_t PATTERN_SILVER = 0xAA;
+
+    void* buf = hn4_hal_mem_alloc(PREF_IO_SIZES[0]); 
+    uint32_t buf_sz = buf ? PREF_IO_SIZES[0] : PREF_IO_SIZES[2];
+    if (HN4_UNLIKELY(!buf)) {
+        buf = hn4_hal_mem_alloc(PREF_IO_SIZES[2]);
+        if (!buf) return HN4_ERR_NOMEM;
+    }
+
+    hn4_addr_t current_lba = start_lba;
+    
+    /* 
+     * Use abstract loop counter 
+     */
+    hn4_size_t remaining = total_bytes;
+    hn4_result_t res = HN4_OK;
+
+    while (
+#ifdef HN4_USE_128BIT
+        remaining.lo > 0 || remaining.hi > 0
+#else
+        remaining > 0
+#endif
+    ) {
+        /* Determine chunk size (clamped to 32-bit buffer) */
+        uint32_t chunk_bytes;
+#ifdef HN4_USE_128BIT
+        if (remaining.hi > 0 || remaining.lo > buf_sz) chunk_bytes = buf_sz;
+        else chunk_bytes = (uint32_t)remaining.lo;
+#else
+        chunk_bytes = (remaining > buf_sz) ? buf_sz : (uint32_t)remaining;
+#endif
+
+        if (chunk_bytes >= ss) {
+            chunk_bytes -= (chunk_bytes % ss);
+        } else {
+            break; 
+        }
+        
+        memset(buf, PATTERN_SILVER, chunk_bytes);
+
+        /* Pass abstract types to HAL (Fixed in previous step) */
+#ifdef HN4_USE_128BIT
+        hn4_size_t io_len = { .lo = chunk_bytes, .hi = 0 };
+#else
+        hn4_size_t io_len = chunk_bytes;
+#endif
+        res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, current_lba, buf, io_len, ss);
+        if (res != HN4_OK) break;
+
+        uint64_t sectors_advanced = chunk_bytes / ss;
+        current_lba = hn4_addr_add(current_lba, sectors_advanced);
+        
+#ifdef HN4_USE_128BIT
+        remaining = hn4_u128_sub(remaining, io_len);
+#else
+        remaining -= chunk_bytes;
+#endif
+    }
+
+    hn4_hal_mem_free(buf);
+    return res;
+}
+
+/**
+ * _zero_region_explicit
+ * Writes actual zeros to metadata regions. 
+ * Issue 8: Checks for zero length.
+ */
+static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev, 
+                                          hn4_addr_t start_lba, 
+                                          uint64_t byte_len, 
+                                          uint32_t block_size) 
+{
+    /* Issue 8: Guard against empty regions */
+    if (byte_len == 0) return HN4_OK;
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps ? caps->logical_block_size : 512;
+    
+    /* Ensure request is aligned to Block Size, AND Block Size is aligned to Sector Size */
+    if (!HN4_IS_ALIGNED(byte_len, block_size) || !HN4_IS_ALIGNED(block_size, ss)) {
+        return HN4_ERR_ALIGNMENT_FAIL;
+    }
+
+    void* buffer = NULL;
+    uint32_t buf_sz = 0;
+
+    /* Waterfall Allocator: Try big, fallback to small */
+    for (int i = 0; i < 3; i++) {
+        buffer = hn4_hal_mem_alloc(PREF_IO_SIZES[i]);
+        if (buffer) {
+            buf_sz = PREF_IO_SIZES[i];
+            break;
+        }
+    }
+    
+    if (!buffer) return HN4_ERR_NOMEM;
+    
+    memset(buffer, 0, buf_sz);
+    
+    HN4_LOG_VAL("Zeroing Region LBA", hn4_addr_to_u64(start_lba));
+
+    hn4_result_t res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, start_lba, buffer, byte_len, block_size);
+    
+    hn4_hal_mem_free(buffer);
+    return res;
+}
+
+/**
+ * _check_profile_compatibility
+ * 
+ * Enforces "Vibe-Check" logic to prevent profile misuse.
+ * Returns HN4_OK if compatible, error code otherwise.
+ */
+static hn4_result_t _check_profile_compatibility(
+    uint32_t profile_id, 
+    const hn4_hal_caps_t* caps, 
+    uint64_t target_capacity
+) {
+    /* 1. PICO Constraints */
+    if (profile_id == HN4_PROFILE_PICO) {
+        /* Rule: "The device is big (>= 1GB+)" -> PICO is for micro-targets */
+        if (target_capacity > 2 * HN4_SZ_GB) {
+            HN4_LOG_CRIT("PICO Profile mismatch: Volume too large (%llu bytes). Use GENERIC.", target_capacity);
+            return HN4_ERR_PROFILE_MISMATCH;
+        }
+
+        /* Rule: "Hardware sector size > 512B" -> PICO assumes 512B logic */
+        if (caps->logical_block_size > 512) {
+            /* Hard Fail on 4Kn drives for PICO profile */
+            HN4_LOG_CRIT("PICO Profile mismatch: HW sector > 512B. Use GENERIC profile.");
+            return HN4_ERR_PROFILE_MISMATCH;
+        }
+        
+        /* Rule: PICO is okay for NVM (RAM disks), but check ZNS */
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+            HN4_LOG_CRIT("PICO Profile mismatch: Zoned Storage (ZNS) not supported.");
+            return HN4_ERR_PROFILE_MISMATCH;
+        }
+    }
+
+    /* 2. ARCHIVE Constraints */
+    if (profile_id == HN4_PROFILE_ARCHIVE) {
+        /* Rule: "Not for RAM disks / NVM" */
+        if (caps->hw_flags & HN4_HW_NVM) {
+            HN4_LOG_CRIT("ARCHIVE Profile mismatch: Cannot use on NVM/RAM. ARCHIVE is for Cold Storage.");
+            return HN4_ERR_PROFILE_MISMATCH;
+        }
+
+        /* Rule: "Not for tiny volumes" */
+        if (target_capacity < 10 * HN4_SZ_GB) {
+            HN4_LOG_CRIT("ARCHIVE Profile mismatch: Volume too small (%llu bytes). Overhead too high.", target_capacity);
+            return HN4_ERR_PROFILE_MISMATCH;
+        }
+    }
+
+    return HN4_OK;
+}
+
+/* =========================================================================
+ * 3. GEOMETRY CALCULATION (THE MAP MAKER)
+ * ========================================================================= */
+
+static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
+                                   const hn4_hal_caps_t* caps,
+                                   hn4_superblock_t* sb_out) 
+{
+    uint32_t pid = params ? params->target_profile : HN4_PROFILE_GENERIC;
+    if (pid >= HN4_MAX_PROFILES) return HN4_ERR_INVALID_ARGUMENT;
+    
+    const hn4_profile_spec_t* spec = &PROFILE_SPECS[pid];
+    
+    uint64_t capacity_bytes;
+    uint64_t virt_cap = 0;
+
+    /* Issue 4: Careful math order for Virtual Overlays */
+    if (params && (params->mount_intent_flags & HN4_MNT_VIRTUAL)) {
+#ifdef HN4_USE_128BIT
+        virt_cap = params->override_capacity_bytes.lo;
+#else
+        virt_cap = params->override_capacity_bytes;
+#endif
+    }
+
+    /* Issue 5: Zone Alignment validation for ZNS */
+    if (virt_cap > 0) {
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+            if (!HN4_IS_ALIGNED(virt_cap, caps->zone_size_bytes)) {
+                 HN4_LOG_CRIT("Virtual capacity misaligned with ZNS Zone Size");
+                 return HN4_ERR_ALIGNMENT_FAIL;
+            }
+        }
+        capacity_bytes = virt_cap;
+    } else {
+#ifdef HN4_USE_128BIT
+        capacity_bytes = caps->total_capacity_bytes.lo;
+#else
+        capacity_bytes = caps->total_capacity_bytes;
+#endif
+        /* Issue 2: Hardware Optimization vs Portability */
+        /* We align down to Zone Size to ensure we don't straddle a partial zone at end of drive */
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+            capacity_bytes = HN4_ALIGN_DOWN(capacity_bytes, caps->zone_size_bytes);
+        }
+    }
+
+     hn4_result_t res = _check_profile_compatibility(pid, caps, capacity_bytes);
+    if (res != HN4_OK) return res;
+
+    /* --- NEW STEP: CAPACITY BOUNDS CHECK --- */
+    if (capacity_bytes < spec->min_cap) {
+        HN4_LOG_VAL("Capacity too small for profile", capacity_bytes);
+        return HN4_ERR_GEOMETRY;
+    }
+
+    /* Check Max Cap (Handle Unlimited for AI) */
+    if (spec->max_cap != HN4_CAP_UNLIMITED) {
+        if (capacity_bytes > spec->max_cap) {
+            HN4_LOG_VAL("Capacity too large for profile", capacity_bytes);
+            return HN4_ERR_GEOMETRY;
+        }
+    }
+
+    if (capacity_bytes < spec->min_cap || capacity_bytes > spec->max_cap) {
+        HN4_LOG_VAL("Capacity out of bounds for profile", capacity_bytes);
+        return HN4_ERR_GEOMETRY;
+    }
+
+    /* Resolve Block Size */
+    uint32_t bs = spec->default_block_size;
+    if (bs < caps->logical_block_size) bs = caps->logical_block_size;
+
+    /* Safety Belt for Division */
+    if (bs == 0) return HN4_ERR_GEOMETRY;
+    
+    /* Ensure BS is multiple of physical sector */
+    uint32_t ss = caps->logical_block_size;
+    if (ss == 0 || (bs % ss) != 0) return HN4_ERR_ALIGNMENT_FAIL;
+
+    sb_out->info.block_size = bs;
+    sb_out->info.total_capacity = hn4_addr_from_u64(capacity_bytes);
+
+    /* Alignment Target from Profile */
+    uint32_t align = spec->alignment_target;
+
+    /* 
+     * LAYOUT CALCULATION 
+     * All lba_* fields in Superblock must store SECTOR INDICES (LBA).
+     *
+     * INVARIANT: 
+     * Every region size calculated here MUST be aligned to 'bs' (Block Size).
+     * This guarantees that _zero_region_explicit() receives block-aligned lengths.
+     * Do NOT remove HN4_ALIGN_UP calls.
+     */
+    uint64_t offset = HN4_SB_SIZE;
+    
+    /* Issue 1: Align SB reservation to Block Size */
+    offset = HN4_ALIGN_UP(offset, bs);
+
+    /* Epoch Ring */
+    uint64_t epoch_sz = (pid == HN4_PROFILE_PICO) ? (2 * bs) : HN4_EPOCH_RING_SIZE;
+    epoch_sz = HN4_ALIGN_UP(epoch_sz, bs);
+    
+    /* Use from_sectors, as (offset/ss) yields a sector index */
+    sb_out->info.lba_epoch_start = hn4_lba_from_sectors(offset / ss); 
+    offset += epoch_sz;
+
+    /* Cortex (D0) */
+    /* Heuristic: 2% of disk for metadata, 5% for AI */
+    uint64_t cortex_sz = (capacity_bytes / 100) * 2;
+    if (pid == HN4_PROFILE_AI) cortex_sz = (capacity_bytes / 100) * 5;
+    if (cortex_sz < 65536) cortex_sz = 65536;
+    cortex_sz = HN4_ALIGN_UP(cortex_sz, bs);
+    
+    /* Use from_sectors */
+    sb_out->info.lba_cortex_start = hn4_lba_from_sectors(offset / ss);
+    offset += cortex_sz;
+
+    /* Bitmap */
+    uint64_t total_blocks = capacity_bytes / bs;
+    uint64_t bitmap_sz = HN4_ALIGN_UP((total_blocks + 7) / 8, bs);
+    
+    /* Use from_sectors */
+    sb_out->info.lba_bitmap_start = hn4_lba_from_sectors(offset / ss);
+    offset += bitmap_sz;
+
+    /* QMask (Quality Map) */
+    uint64_t qmask_sz = HN4_ALIGN_UP((total_blocks + 3) / 4, bs);
+    
+    /* Use from_sectors */
+    sb_out->info.lba_qmask_start = hn4_lba_from_sectors(offset / ss);
+    offset += qmask_sz;
+
+    /* Flux (D1) */
+    offset = HN4_ALIGN_UP(offset, align);
+    
+    /* Use from_sectors */
+    sb_out->info.lba_flux_start = hn4_lba_from_sectors(offset / ss);
+
+    /* Horizon (D1.5) / Stream (D2) & Chronicle */
+    uint64_t tail_rsv = (bs > HN4_SB_SIZE) ? bs : HN4_SB_SIZE;
+    
+    /* [MANUAL FIX] Reserve 10MB for Chronicle Audit Log */
+    uint64_t chronicle_sz = HN4_ALIGN_UP(10 * HN4_SZ_MB, bs);
+
+    /* Explicit Lower Bound Check before subtraction */
+    uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); // Metadata + Log + Tail
+    
+    if (capacity_bytes < min_required) {
+        HN4_LOG_ERR("Drive too small for layout. Need %llu bytes.", min_required);
+        return HN4_ERR_ENOSPC;
+    }
+
+    uint64_t chron_end_offset = HN4_ALIGN_DOWN(capacity_bytes - tail_rsv, bs);
+    
+    uint64_t chron_start_offset = chron_end_offset - chronicle_sz;
+
+    /* Initialize Superblock Chronicle Pointers */
+    /* Note: We divide by 'ss' (Sector Size) because these are LBA fields */
+    sb_out->info.journal_start = hn4_lba_from_sectors(chron_start_offset / ss);
+    sb_out->info.journal_ptr   = sb_out->info.journal_start; /* Head = Start */
+
+    /* Now calculate Horizon placement relative to Chronicle Start */
+    uint64_t min_horizon = bs * 4;
+    
+    if (offset + min_horizon > chron_start_offset) {
+        HN4_LOG_ERR("Format failed: Metadata consumes entire volume.");
+        return HN4_ERR_ENOSPC;
+    }
+    
+    uint64_t horizon_sz = (capacity_bytes / 100) * 10;
+    if (pid == HN4_PROFILE_ARCHIVE) horizon_sz = (capacity_bytes / 100) * 2;
+    horizon_sz = HN4_ALIGN_UP(horizon_sz, bs);
+    if (horizon_sz < min_horizon) horizon_sz = min_horizon;
+
+    /* Horizon ends where Chronicle starts */
+    uint64_t horizon_start = chron_start_offset - horizon_sz;
+    
+    /* Clamp overlap */
+    if (horizon_start <= offset) {
+        horizon_start = offset + 1024 * bs; 
+        /* [MANUAL FIX] Ensure we don't hit the Chronicle */
+        if (horizon_start + min_horizon > chron_start_offset) return HN4_ERR_ENOSPC;
+    }
+
+    sb_out->info.lba_horizon_start = hn4_lba_from_sectors(horizon_start / ss);
+    sb_out->info.lba_stream_start  = sb_out->info.lba_horizon_start;
+
+    return HN4_OK;
+}
+
+
+
+/* =========================================================================
+ * 4. PUBLIC API ENTRY POINT
+ * ========================================================================= */
+
+hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params) {
+    if (!dev) return HN4_ERR_INVALID_ARGUMENT;
+
+    /* Extract Caps */
+    struct hn4_hal_dev_layout { hn4_hal_caps_t caps; };
+    struct hn4_hal_dev_layout* ldev = (struct hn4_hal_dev_layout*)dev;
+    hn4_hal_caps_t* caps = &ldev->caps;
+
+    /* 
+     * Baseline Capacity Check 
+     * We snapshot the capacity now to detect race conditions if the device
+     * resizes dynamically during format (e.g., Virtual Disks).
+     */
+    hn4_size_t  baseline_cap;
+    uint32_t baseline_ss = caps->logical_block_size; 
+
+    /* 
+     * Direct assignment. 
+     * In 128-bit mode, both are 'hn4_u128_t' structs. 
+     * In 64-bit mode, both are 'uint64_t'. 
+     */
+    baseline_cap = caps->total_capacity_bytes;
+
+    /* SAFETY PRE-FLIGHT: Validate Wormhole Capacity BEFORE Sanitize */
+    if (params && (params->mount_intent_flags & HN4_MNT_VIRTUAL)) {
+        uint64_t vcap_check;
+    #ifdef HN4_USE_128BIT
+        /* If High bits are set, we are definitely > 100MB */
+        if (params->override_capacity_bytes.hi > 0) {
+            vcap_check = UINT64_MAX; 
+        } else {
+            vcap_check = params->override_capacity_bytes.lo;
+        }
+    #else
+        vcap_check = params->override_capacity_bytes;
+    #endif
+        /* Hard limit: 100MB minimum to prevent arithmetic underflows later */
+        if (vcap_check < (100ULL * 1024 * 1024)) {
+            HN4_LOG_CRIT("Wormhole Capacity too small (<100MB). Aborting.");
+            return HN4_ERR_GEOMETRY;
+        }
+    }
+    hn4_result_t res;
+    hn4_superblock_t sb_cpu;
+    
+    /* Pre-fill with deterministic pattern before clearing to catch leaks */
+    memset(&sb_cpu, 0x55, sizeof(sb_cpu)); 
+    memset(&sb_cpu, 0, sizeof(sb_cpu));
+
+    /* --- STEP 1: CALCULATE GEOMETRY --- */
+    res = _calc_geometry(params, caps, &sb_cpu);
+    if (res != HN4_OK) return res;
+
+    /* --- STEP 2: SANITIZE (THE NUKE) --- */
+    uint64_t total_cap = hn4_addr_to_u64(sb_cpu.info.total_capacity); 
+
+    /* FIX #4: Pre-flight ZNS Alignment Check */
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        /* Ensure the calculated capacity is strictly zone-aligned before we start wiping */
+        if (total_cap % caps->zone_size_bytes != 0) {
+            HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
+            return HN4_ERR_ALIGNMENT_FAIL;
+        }
+        
+        res = _sanitize_zns(dev, total_cap, caps->zone_size_bytes, caps->logical_block_size);
+    } else {
+        res = _sanitize_generic(dev, total_cap, caps->logical_block_size);
+    }
+    if (res != HN4_OK) {
+        HN4_LOG_ERR("Sanitization failed. Aborting format to preserve data safety.");
+        return res;
+    }
+
+    /* Re-verify Capacity Invariant */
+    uint64_t current_cap;
+    #ifdef HN4_USE_128BIT
+        current_cap = caps->total_capacity_bytes.lo;
+    #else
+        current_cap = caps->total_capacity_bytes;
+    #endif
+    
+    if (current_cap != baseline_cap || caps->logical_block_size != baseline_ss) {
+        HN4_LOG_CRIT("Device geometry changed during format! Aborting.");
+        return HN4_ERR_GEOMETRY;
+    }
+
+    /* --- STEP 3: POPULATE SUPERBLOCK --- */
+    sb_cpu.info.magic      = HN4_MAGIC_SB;
+    sb_cpu.info.version    = (6 << 16) | 6; /* v6.6 */
+    sb_cpu.info.endian_tag = HN4_ENDIAN_TAG_LE;
+    sb_cpu.info.magic_tail = HN4_MAGIC_TAIL;
+    sb_cpu.info.format_profile = params ? params->target_profile : HN4_PROFILE_GENERIC;
+    sb_cpu.info.device_type_tag = _resolve_device_type(caps->hw_flags, sb_cpu.info.format_profile);
+    sb_cpu.info.generation_ts = (uint64_t)hn4_hal_get_time_ns();
+    sb_cpu.info.last_mount_time = sb_cpu.info.generation_ts;
+    sb_cpu.info.state_flags = HN4_VOL_CLEAN;
+    sb_cpu.info.current_epoch_id = 1;
+    sb_cpu.info.copy_generation = 1;
+
+    /* 
+     * epoch_ring_block_idx MUST be a BLOCK INDEX, but lba_epoch_start is a SECTOR LBA.
+     * We must convert back to blocks for the ring pointer.
+     */
+    uint32_t bs = sb_cpu.info.block_size;
+    uint32_t ss = caps->logical_block_size;
+    if (ss == 0) ss = 512;
+
+    /* 
+     * Strict Geometry Check.
+     * If Block Size < Sector Size, or not a multiple, we cannot format safely.
+     */
+    if (bs < ss || (bs % ss) != 0) {
+        HN4_LOG_CRIT("Geometry Error: BS %u is not multiple of SS %u", bs, ss);
+        return HN4_ERR_GEOMETRY;
+    }
+
+    /* Verify Geometry Ratio */
+    if (ss == 0 || (bs % ss) != 0) return HN4_ERR_GEOMETRY;
+
+    uint32_t sectors_per_block = bs / ss;
+    uint64_t epoch_lba_val = hn4_addr_to_u64(sb_cpu.info.lba_epoch_start);
+
+    /* 
+     * 
+     * Explicitly document that we are storing a BLOCK INDEX into an LBA container.
+     * The Spec requires epoch_ring_block_idx to be Block-aligned
+     */
+    uint64_t ring_ptr_block_idx = epoch_lba_val / sectors_per_block;
+    
+    #ifdef HN4_USE_128BIT
+        sb_cpu.info.epoch_ring_block_idx.lo = ring_ptr_block_idx;
+        sb_cpu.info.epoch_ring_block_idx.hi = 0;
+    #else
+        sb_cpu.info.epoch_ring_block_idx = ring_ptr_block_idx;
+    #endif
+
+    /* 
+     * WORMHOLE PROTOCOL: PERSISTENCE & HARDWARE TRUST
+     */
+    if (params) {
+        /* 
+         * The Safety Interlock.
+         * We MUST write the intent to disk. If this remains 0, mount logic 
+         * will see a Duplicate UUID with Default Intent (0)
+         * and triggers a Split-Brain Panic.
+         */
+        sb_cpu.info.mount_intent = params->mount_intent_flags;
+
+        /* 
+         * Genesis Injection.
+         * Store the root permission overrides in compat_flags so the 
+         * first mount knows how to instantiate the Root Anchor.
+         */
+        sb_cpu.info.compat_flags = (uint64_t)params->root_perms_or;
+
+        /* Hardware Trust Check */
+        if (params->mount_intent_flags & HN4_MNT_WORMHOLE) {
+            /* 
+             * ENGINEERING NOTE: 
+             * Wormhole protocols rely on mathematical isomorphism. 
+             * If the HAL/Firmware lies about FLUSH completion (common in 
+             * consumer SSDs/USB bridges), the overlay state will desynchronize.
+             * We demand the HAL explicitly opt-in to STRICT_FLUSH to certify 
+             * honesty.
+             */
+
+            if (!(caps->hw_flags & HN4_HW_STRICT_FLUSH)) {
+                HN4_LOG_CRIT("Wormhole Error: Drive reports NO STRICT_FLUSH support.");
+                HN4_LOG_CRIT("Overlay safety cannot be guaranteed on this hardware.");
+                return HN4_ERR_HW_IO;
+            }
+        }
+    }
+
+    /* Issue 9 & 20: UUID Generation with Fallback */
+    if (params && params->clone_uuid) {
+        sb_cpu.info.volume_uuid = params->specific_uuid;
+    } else {
+        uint64_t r1 = hn4_hal_get_random_u64();
+        uint64_t r2 = hn4_hal_get_random_u64();
+        
+        if (HN4_UNLIKELY(r1 == 0 && r2 == 0)) {
+             HN4_LOG_WARN("PRNG returned 0. Mixing system entropy.");
+            /* 
+             * SECURITY NOTE: Deterministic Fallback
+             * This logic provides collision resistance for Volume IDs only.
+             * It is NOT cryptographically secure. On systems with fixed heap layouts
+             * and no RTC, this will generate predictable sequences.
+             */
+            r1 = HN4_POISON_PATTERN; 
+            r1 ^= (uintptr_t)dev; 
+            r1 ^= baseline_cap; 
+        }
+        r1 ^= sb_cpu.info.generation_ts;
+        sb_cpu.info.volume_uuid.lo = r1;
+
+        /* RFC 4122 Compliance: Set Version (7) AND Variant (10xx...) */
+        uint64_t uuid_hi = r2;
+        uuid_hi &= ~HN4_UUID_VER_MASK;      /* Clear Version bits */
+        uuid_hi |= HN4_UUID_VER_7;          /* Set Ver 7 */
+        uuid_hi &= ~(0xC000000000000000ULL); /* Clear Variant bits (Bit 63, 62) */
+        uuid_hi |=  (0x8000000000000000ULL); /* Set Variant 1 (10...) */
+        
+        /* MISSING ASSIGNMENT ADDED HERE */
+        sb_cpu.info.volume_uuid.hi = uuid_hi;
+    }
+
+    /* Label handling */
+    const char* label = (params && params->label) ? params->label : "HN4_UNNAMED";
+    strncpy((char*)sb_cpu.info.volume_label, label, 31);
+    sb_cpu.info.volume_label[31] = '\0';
+
+    /* --- STEP 4: ZERO METADATA REGIONS --- */
+    /* 
+     * REGION_BYTES must calculate using SECTOR SIZE because start/end are Sector LBAs.
+     * Difference in sectors * SectorSize = Bytes.
+     */
+     #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
+        uint64_t s_val = hn4_addr_to_u64(start_lba); \
+        uint64_t e_val = hn4_addr_to_u64(end_lba); \
+        if (e_val < s_val) { \
+             HN4_LOG_CRIT("Layout Regression: Region End < Start (%llu < %llu)", e_val, s_val); \
+             return HN4_ERR_GEOMETRY; \
+        } \
+        uint64_t len = (e_val - s_val) * ss; \
+        if ((res = _zero_region_explicit(dev, start_lba, len, bs)) != HN4_OK) return res; \
+    } while(0)
+
+    SAFE_ZERO_REGION(sb_cpu.info.lba_epoch_start,  sb_cpu.info.lba_cortex_start);
+    SAFE_ZERO_REGION(sb_cpu.info.lba_cortex_start, sb_cpu.info.lba_bitmap_start);
+    SAFE_ZERO_REGION(sb_cpu.info.lba_bitmap_start, sb_cpu.info.lba_qmask_start);
+    
+    #undef SAFE_ZERO_REGION
+    if ((res = _survey_silicon_cartography(dev, &sb_cpu)) != HN4_OK) {
+        HN4_LOG_CRIT("Silicon Survey Failed.");
+        return res;
+    }
+    #undef REGION_BYTES
+
+    sb_cpu.info.state_flags |= HN4_VOL_METADATA_ZEROED;
+
+    /* Required for Cortex to be mountable via hn4:// */
+    if ((res = hn4_anchor_write_genesis(dev, &sb_cpu)) != HN4_OK) {
+        HN4_LOG_CRIT("Root Anchor Injection Failed. Aborting.");
+        return res;
+    }
+
+     if ((res = hn4_epoch_write_genesis(dev, &sb_cpu)) != HN4_OK) {
+        HN4_LOG_CRIT("Genesis Epoch Write Failed. Aborting.");
+        return res;
+    }
+
+    /* 
+     * Ensure metadata zeroing hits the platter before we write the SB.
+     * Prevents a "Valid SB + Garbage Metadata" state on crash.
+     */
+    hn4_hal_barrier(dev);
+
+    /* --- STEP 5: COMMIT SUPERBLOCKS --- */
+    
+    /* 
+     * SB I/O must align to Block Size. 
+     * If BlockSize > 8KB, we must pad the write buffer.
+     */
+    uint32_t write_sz = HN4_ALIGN_UP(HN4_SB_SIZE, bs); 
+    void* sb_buf = hn4_hal_mem_alloc(write_sz);
+    if (!sb_buf) return HN4_ERR_NOMEM;
+
+    /* Zero buffer (padding safety) */
+    memset(sb_buf, 0, write_sz);
+
+   /* 
+    * Serialize to packed buffer.
+    * hn4_sb_to_disk handles Endian Swapping logic internally.
+    */
+    hn4_packed_sb_t* packed_sb = (hn4_packed_sb_t*)sb_buf;
+    hn4_sb_to_disk((hn4_superblock_t*)&sb_cpu, (hn4_superblock_t*)packed_sb); 
+
+    hn4_superblock_t* disk_view = (hn4_superblock_t*)packed_sb;
+    disk_view->raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, disk_view, HN4_SB_SIZE - 4);
+    disk_view->raw.sb_crc = hn4_cpu_to_le32(crc);
+
+    /* Calculate Cardinal Locations (SECTOR LBAs via _calc_geometry logic equivalent) */
+    uint64_t cap_bytes = hn4_addr_to_u64(sb_cpu.info.total_capacity);
+    uint64_t east_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 33, bs);
+    uint64_t west_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 66, bs);
+    uint64_t south_bytes = HN4_ALIGN_DOWN(cap_bytes - write_sz, bs);
+
+    /* Enforce Sector Alignment Invariant for all mirrors */
+    if ((east_bytes % ss != 0) || (west_bytes % ss != 0)) {
+        HN4_LOG_CRIT("Mirror Alignment Error: BS %u not multiple of SS %u", bs, ss);
+        return HN4_ERR_ALIGNMENT_FAIL;
+    }
+
+    /* South usually requires explicit down-alignment if BS is huge */
+    if (south_bytes % ss != 0) south_bytes = HN4_ALIGN_DOWN(south_bytes, ss);
+
+    hn4_addr_t lba_n = hn4_addr_from_u64(0);
+    hn4_addr_t lba_e = hn4_lba_from_sectors(east_bytes / ss);
+    hn4_addr_t lba_w = hn4_lba_from_sectors(west_bytes / ss);
+    hn4_addr_t lba_s = hn4_lba_from_sectors(south_bytes / ss);
+
+    /* Two-Phase Commit with Fault Tolerance */
+    /* 1. Primary (North) - MANDATORY */
+    res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
+    
+    if (res == HN4_OK) {
+        hn4_hal_barrier(dev);
+
+        /* 2. Mirrors (East/West) - MANDATORY */
+        if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
+        if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
+        
+        /* 
+         * 3. South Mirror - OPTIONAL (Best Effort)
+         * If this fails, we log it but DO NOT fail the function 'res'.
+         */
+        if (res == HN4_OK) {
+            hn4_result_t s_res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs);
+            
+            if (s_res != HN4_OK) {
+                HN4_LOG_WARN("South SB write failed. Volume is Degraded.");
+                
+                /* 1. Update CPU state */
+                sb_cpu.info.state_flags |= HN4_VOL_DEGRADED;
+                
+                /* 2. Re-serialize (Ensure packed_sb is valid cast of sb_buf) */
+                hn4_packed_sb_t* fix_buf = (hn4_packed_sb_t*)sb_buf;
+                hn4_sb_to_disk((hn4_superblock_t*)&sb_cpu, (hn4_superblock_t*)fix_buf);
+                
+                /* 3. Re-CRC */
+                hn4_superblock_t* disk = (hn4_superblock_t*)fix_buf;
+                disk->raw.sb_crc = 0;
+                uint32_t crc = hn4_crc32(0, disk, HN4_SB_SIZE - 4);
+                disk->raw.sb_crc = hn4_cpu_to_le32(crc);
+                
+                /* 4. Rewrite Mandatory Mirrors */
+                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
+                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
+                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
+            }
+        }
+        
+        hn4_hal_barrier(dev);
+    }
+    /* 
+     * Poison on Failure.
+     * If any part of the mandatory commit failed, we attempt to overwrite ALL SB locations
+     * with a specific pattern to prevent mount tools from detecting a "Half-Formatted" volume.
+     */
+    if (res != HN4_OK) {
+        HN4_LOG_CRIT("SB Commit Failed. Poisoning geometry.");
+        /* Fill with 0xDE... */
+        memset(sb_buf, 0xDE, write_sz); 
+       /* Double-Tap Poison: Head AND Tail */
+        uint32_t* p = (uint32_t*)sb_buf;
+        size_t last_idx = (write_sz / sizeof(uint32_t)) - 1;
+        p[0] = HN4_POISON_PATTERN;        /* Head Shot */
+        p[last_idx] = HN4_POISON_PATTERN; /* Tail Shot */
+        
+        /* Retry loop for poison to ensure it sticks on flaky media */
+        for (int i = 0; i < HN4_WRITE_RETRY_LIMIT; i++) {
+            hn4_result_t w_res = HN4_OK;
+    
+            //Accumulate write errors
+            if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            // South is best effort, usually ignored in failure path, but for poison we try hard:
+            hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs);
+
+            /* Require BOTH writes and barrier to succeed */
+            if (w_res == HN4_OK && hn4_hal_barrier(dev) == HN4_OK) break;
+        }
+    } else {
+        HN4_LOG_VAL("Format Complete. UUID High", sb_cpu.info.volume_uuid.hi);
+    }
+
+    hn4_hal_mem_free(sb_buf);
+    return res;
+}

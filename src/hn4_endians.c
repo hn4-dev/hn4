@@ -3,19 +3,12 @@
  * MODULE:      Endianness Normalization & Safety
  * SOURCE:      hn4_endians.c
  * VERSION:     4.2 (Reference Standard)
- *
- * COPYRIGHT:   (c) 2025 The Hydra-Nexus Team. All rights reserved.
- *
- * DESCRIPTION:
- * Defines the unified byte-order contract for the HN4 on-disk format (LE).
- * Provides bulk conversion routines optimized for instruction pipelining and
- * includes strict runtime sanity checks to ensure ABI compliance across
- * diverse CPU architectures.
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * IMPLEMENTATION:
- * 1. Bulk Processing: Cache-line optimized routines for array conversion.
- * 2. Manual Unrolling: 4-way unroll to maximize ALU throughput.
- * 3. Safety: Runtime validation of compile-time endianness assumptions.
+ * 1. Bulk Processing: Cache-line optimized routines.
+ * 2. Unrolling: 4-way unroll for ALU throughput.
+ * 3. Safety: Runtime validation of compile-time assumptions.
  */
 
 #include "hn4_endians.h"
@@ -140,7 +133,7 @@ void hn4_sb_to_cpu(hn4_superblock_t* sb) {
     sb->info.lba_stream_start = hn4_bswap128(sb->info.lba_stream_start);
     
     sb->info.current_epoch_id = hn4_bswap64(sb->info.current_epoch_id);
-    sb->info.epoch_ring_ptr = hn4_bswap128(sb->info.epoch_ring_ptr);
+    sb->info.epoch_ring_block_idx = hn4_bswap128(sb->info.epoch_ring_block_idx);
     sb->info.copy_generation = hn4_bswap64(sb->info.copy_generation);
     
     sb->info.sentinel_cursor = hn4_bswap128(sb->info.sentinel_cursor);

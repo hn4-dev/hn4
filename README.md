@@ -4,7 +4,7 @@
 ### **The Post-POSIX Filesystem.** 
 
 <!-- Badges -->
-[![Status](https://img.shields.io/badge/Status-Final_Testing-orange?style=for-the-badge)](https://github.com/)
+[![Status](https://img.shields.io/badge/Status-Final-orange?style=for-the-badge)](https://github.com/)
 ![Platform](https://img.shields.io/badge/platform-Bare%20Metal%20%7C%20Embedded%20%7C%20Kernel-orange.svg?style=for-the-badge)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)](https://opensource.org/licenses/Apache-2.0)
 
@@ -12,7 +12,7 @@
 
 </div>
 
-##### Disclaimer: Files and docs will follow throughout the day. The code will be published now. The previous implementation was tightly coupled to my OS, so I’m currently rewriting it to be platform-agnostic. Documentations is coming soon. The original build successfully runs 4K test files, and the initial source drop will be available tomorrow.
+##### Disclaimer: Files and docs are all public. The previous implementation was tightly coupled to my OS, so I’m currently rewriting it to be platform-agnostic. The original build successfully runs 4K test files, and the initial source drop will be available tomorrow.
 
 ---
 

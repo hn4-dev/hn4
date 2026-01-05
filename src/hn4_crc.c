@@ -3,19 +3,12 @@
  * MODULE:      Integrity Primitives (CRC32/CRC64)
  * SOURCE:      hn4_crc.c
  * VERSION:     Reference Optimized (Slice-by-8)
- *
- * COPYRIGHT:   (c) 2025 The Hydra-Nexus Team. All rights reserved.
- *
- * DESCRIPTION:
- * Provides high-throughput checksumming algorithms optimized for bare metal
- * execution. Implements Slice-by-8 processing with instruction pipelining
- * to saturate memory bandwidth while maintaining strict IEEE/ECMA compliance.
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * OPTIMIZATIONS:
- * 1. Slice-by-8 Strategy: Processes 8 bytes per step to minimize loop overhead.
- * 2. Instruction Pipelining: Interleaves load/calculate ops for superscalar execution.
- * 3. Hardware Prefetching: Explicitly pulls future cache lines to hide RAM latency.
- * 4. Unaligned Access: Utilizes compiler intrinsics for safe, single-instruction loads.
+ * 1. Slice-by-8 Strategy: Processes 8 bytes per step.
+ * 2. Instruction Pipelining: Interleaves load/calculate ops.
+ * 3. Prefetching: Explicitly pulls future cache lines.
  */
 
 #include "hn4_crc.h"

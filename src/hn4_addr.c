@@ -3,6 +3,7 @@
  * MODULE:      Address Primitives
  * SOURCE:      hn4_addr.c
  * STATUS:      HARDENED / REVIEWED
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * SAFETY CONTRACT:
  * 1. OVERFLOW: Operations checking for 64-bit truncation are noisy (LOG_CRIT).
@@ -79,4 +80,38 @@ hn4_addr_t hn4_lba_from_blocks(uint64_t blocks) {
 
 hn4_addr_t hn4_lba_from_sectors(uint64_t sectors) {
     return hn4_addr_from_u64(sectors);
+}
+
+int hn4_u128_cmp(hn4_u128_t a, hn4_u128_t b) {
+    if (a.hi > b.hi) return 1;
+    if (a.hi < b.hi) return -1;
+    if (a.lo > b.lo) return 1;
+    if (a.lo < b.lo) return -1;
+    return 0;
+}
+
+hn4_u128_t hn4_u128_sub(hn4_u128_t a, hn4_u128_t b) {
+    hn4_u128_t res;
+    res.lo = a.lo - b.lo;
+    /* Borrow logic: if result > start, we wrapped around */
+    uint64_t borrow = (res.lo > a.lo) ? 1 : 0;
+    res.hi = a.hi - b.hi - borrow;
+    return res;
+}
+
+hn4_u128_t hn4_u128_from_u64(uint64_t v) {
+    hn4_u128_t r = { .lo = v, .hi = 0 }; 
+    return r;
+}
+
+bool hn4_addr_try_u64(hn4_addr_t addr, uint64_t* out) {
+#ifdef HN4_USE_128BIT
+    /* Safety Check: If high bits are set, we cannot downcast */
+    if (HN4_UNLIKELY(addr.hi > 0)) return false;
+    *out = addr.lo;
+#else
+    /* Native 64-bit: Always fits */
+    *out = addr;
+#endif
+    return true;
 }

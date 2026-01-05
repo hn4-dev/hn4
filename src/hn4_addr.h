@@ -3,6 +3,7 @@
  * HEADER FILE: hn4_addr.h
  * MODULE:      Address Primitives
  * STATUS:      REFERENCE STANDARD (v4.2)
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * DESCRIPTION:
  * Helper definitions for abstracting 64-bit vs 128-bit addressing modes.
@@ -69,6 +70,18 @@ hn4_addr_t hn4_lba_from_blocks(uint64_t blocks);
  * Use this when the input is calculated via (byte_offset / sector_size).
  */
 hn4_addr_t hn4_lba_from_sectors(uint64_t sectors);
+
+int hn4_u128_cmp(hn4_u128_t a, hn4_u128_t b);
+hn4_u128_t hn4_u128_sub(hn4_u128_t a, hn4_u128_t b);
+hn4_u128_t hn4_u128_from_u64(uint64_t v);
+
+/**
+ * hn4_addr_try_u64
+ * Silent safe downcast. 
+ * Returns true if successful, false if address exceeds 64-bit range.
+ * Does NOT log critical errors (unlike hn4_addr_to_u64).
+ */
+bool hn4_addr_try_u64(hn4_addr_t addr, uint64_t* out);
 
 #ifdef __cplusplus
 }

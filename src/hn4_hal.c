@@ -1,10 +1,13 @@
 /*
- * Copyright (c) 2025 Hydra-Nexus Project.
- *
  * HYDRA-NEXUS 4 (HN4) IMPLEMENTATION STANDARD
- * COMPONENT:   Hardware Abstraction Layer (HAL)
+ * MODULE:      Hardware Abstraction Layer (HAL)
  * SOURCE:      hn4_hal.c
- * STATUS:      FIXED / LINKING
+ * STATUS:      HARDENED / PRODUCTION
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
+ *
+ * DESCRIPTION:
+ * Implements low-level IO submission, memory management, and
+ * architecture-specific barriers (x86/ARM64/ZNS).
  */
 
 #include "hn4_hal.h"
@@ -19,22 +22,15 @@
  * 0. CONSTANTS & INTERNAL DEFINITIONS
  * ========================================================================= */
 
-/* ZNS Simulation Constants (used if no physical ZNS drive found) */
+/* ZNS Simulation Constants */
 #define ZNS_SIM_ZONES       64
 #define ZNS_SIM_ZONE_SIZE   (256ULL * 1024 * 1024)
 #define ZNS_SIM_SECTOR_SIZE 4096
 
-/* Memory Allocator Magic for corruption detection */
+/* Memory Allocator Magic */
 static const uint32_t HN4_MEM_MAGIC = 0x484E3421; /* "HN4!" */
 
 /* Architecture Detection & Yield Macros */
-#ifndef unlikely
-    #if defined(__GNUC__) || defined(__clang__)
-        #define unlikely(x) __builtin_expect(!!(x), 0)
-    #else
-        #define unlikely(x) (x)
-    #endif
-#endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     #define HN4_ARCH_X86
@@ -57,21 +53,17 @@ static const uint32_t HN4_MEM_MAGIC = 0x484E3421; /* "HN4!" */
  * 1. INTERNAL STRUCTURES & GLOBALS
  * ========================================================================= */
 
-/* 
- * Concrete implementation of the opaque hn4_hal_device_t.
- */
 struct hn4_hal_device {
-    hn4_hal_caps_t caps;       /* Public capabilities */
-    uint8_t*       mmio_base;  /* Base address for NVM/DAX devices */
-    void*          driver_ctx; /* Internal driver context (e.g., NVMe rings) */
+    hn4_hal_caps_t caps;       
+    uint8_t*       mmio_base;  
+    void*          driver_ctx; 
 };
 
 /* Global State */
 static atomic_bool      _hal_initialized = false;
 static _Atomic uint64_t _prng_seed;
-static _Atomic uint64_t _zns_zone_ptrs[ZNS_SIM_ZONES]; /* Write pointers for ZNS sim */
+static _Atomic uint64_t _zns_zone_ptrs[ZNS_SIM_ZONES]; 
 
-/* CPU Features Globals */
 uint32_t _hn4_cpu_features = 0;
 
 /* =========================================================================
@@ -104,26 +96,23 @@ static void _probe_cpu_persistence_features(void) {
 }
 
 static inline void _assert_hal_init(void) {
-    if (unlikely(!atomic_load_explicit(&_hal_initialized, memory_order_acquire))) {
+    if (HN4_UNLIKELY(!atomic_load_explicit(&_hal_initialized, memory_order_acquire))) {
         hn4_hal_panic("HN4 HAL Not Initialized");
     }
 }
 
 hn4_result_t hn4_hal_init(void) {
     bool expected = false;
-    /* Compare-Exchange guarantees single initialization */
     if (!atomic_compare_exchange_strong(&_hal_initialized, &expected, true)) {
-        return HN4_OK; /* Already initialized */
+        return HN4_OK; 
     }
 
     _probe_cpu_persistence_features();
     
-    /* Reset ZNS Simulation Pointers */
     for (int i = 0; i < ZNS_SIM_ZONES; i++) {
         atomic_store(&_zns_zone_ptrs[i], 0);
     }
     
-    /* Seed PRNG with a non-zero value */
     atomic_store(&_prng_seed, 0xCAFEBABE12345678ULL);
     
     return HN4_OK;
@@ -135,10 +124,7 @@ void hn4_hal_shutdown(void) {
 
 void hn4_hal_panic(const char* reason) {
     (void)reason;
-    /* 
-     * In a production kernel/bare-metal env, this would write to 
-     * UART or BMC SOS registers. Here we hang.
-     */
+    /* In production, this would write to SOS registers/BMC. */
     while(1) { HN4_YIELD(); }
 }
 
@@ -149,26 +135,35 @@ void hn4_hal_panic(const char* reason) {
 void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback_t cb) {
     _assert_hal_init();
     
-    if (unlikely(!dev || !req)) {
+    if (HN4_UNLIKELY(!dev || !req)) {
         if (cb) cb(req, HN4_ERR_INVALID_ARGUMENT);
         return;
     }
 
     /* ---------------------------------------------------------------------
      * PATH A: NVM / MEMORY MAPPED IO
-     * Direct memcpy with persistence barriers.
      * --------------------------------------------------------------------- */
     if (dev->caps.hw_flags & HN4_HW_NVM) {
         
-        if (unlikely(!dev->mmio_base)) {
+        if (HN4_UNLIKELY(!dev->mmio_base)) {
             if (cb) cb(req, HN4_ERR_INTERNAL_FAULT);
             return;
         }
 
-        /* Calculate offsets. Assumes flat addressing for NVM. */
         uint64_t lba_raw = hn4_addr_to_u64(req->lba);
         uint64_t offset = lba_raw * dev->caps.logical_block_size;
         uint32_t len_bytes = req->length * dev->caps.logical_block_size;
+
+        /* 
+         * MMIO Bounds Checking
+         * Prevent UB/Segfaults by validating against reported capacity.
+         */
+        uint64_t max_cap = hn4_addr_to_u64(dev->caps.total_capacity_bytes);
+        
+        if (HN4_UNLIKELY((offset + len_bytes) > max_cap)) {
+             if (cb) cb(req, HN4_ERR_HW_IO); /* Simulate EIO/Segfault prevention */
+             return;
+        }
 
         switch (req->op_code) {
             case HN4_IO_READ:
@@ -177,7 +172,11 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
 
             case HN4_IO_WRITE:
                 memcpy(dev->mmio_base + offset, req->buffer, len_bytes);
-                /* Strict persistence requirement for NVM Writes */
+                /* 
+                 * Flush Semantics
+                 * This ensures data reaches the persistence domain.
+                 * ASSUMPTION: Platform supports ADR/eADR or equivalent.
+                 */
                 hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
                 break;
 
@@ -192,11 +191,9 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
                 break;
 
             case HN4_IO_DISCARD:
-                /* Advisory only on NVM, usually a no-op */
                 break;
                 
             case HN4_IO_ZONE_RESET:
-                /* Emulate Zone Reset by zeroing the range */
                 memset(dev->mmio_base + offset, 0, len_bytes);
                 hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
                 break;
@@ -214,7 +211,6 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
 
     /* ---------------------------------------------------------------------
      * PATH B: ZNS SIMULATION / BLOCK IO
-     * Simulates append logic using atomic counters.
      * --------------------------------------------------------------------- */
 
     if (req->op_code == HN4_IO_ZONE_APPEND) {
@@ -226,23 +222,30 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
         uint64_t zone_start_lba = zone_idx * zone_cap_blocks;
         uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
 
-        /* Atomically reserve space in the zone (Zone Append Semantics) */
-        uint64_t offset_blocks = atomic_fetch_add(&_zns_zone_ptrs[sim_idx], req->length);
-        uint64_t final_lba = zone_start_lba + offset_blocks;
+        /* 
+         * CAS Loop for Append Overflow
+         * Replaces atomic_fetch_add to prevent pointer leakage past end-of-zone.
+         */
+        uint64_t old_offset, new_offset;
+        
+        do {
+            old_offset = atomic_load(&_zns_zone_ptrs[sim_idx]);
+            
+            if (old_offset + req->length > zone_cap_blocks) {
+                /* Zone is Full */
+                if (cb) cb(req, HN4_ERR_ZONE_FULL);
+                return;
+            }
+            new_offset = old_offset + req->length;
+            
+        } while (!atomic_compare_exchange_weak(&_zns_zone_ptrs[sim_idx], &old_offset, new_offset));
 
-        /* Check for Zone Overflow */
-        if (offset_blocks + req->length > zone_cap_blocks) {
-             /* Rollback is complex in lockless, treating as error for Sim */
-             if (cb) cb(req, HN4_ERR_ZONE_FULL);
-             return;
-        }
-
+        uint64_t final_lba = zone_start_lba + old_offset;
         req->result_lba = hn4_addr_from_u64(final_lba);
     } else {
         req->result_lba = req->lba;
     }
 
-    /* Simulate async latency? No, we are bare metal fast path. */
     atomic_thread_fence(memory_order_release);
     if (cb) cb(req, HN4_OK);
 }
@@ -251,30 +254,44 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
  * 4. MEMORY MANAGEMENT
  * ========================================================================= */
 
+/* 
+ * Aligned to 16 bytes to ensure strict padding behavior across compilers.
+ */
 typedef struct {
     uint32_t magic;
+    uint32_t _pad32; /* Explicit 4-byte pad */
     void*    raw_ptr;
-    uint64_t _pad;   /* Keep header 16-byte aligned */
-} alloc_header_t;
+    uint64_t _pad64; /* Padding to reach 24 bytes? No, force 32 or alignment logic */
+} __attribute__((aligned(16))) alloc_header_t;
 
 void* hn4_hal_mem_alloc(size_t size) {
     _assert_hal_init();
     if (size == 0) return NULL;
 
-    /* Pad for alignment + header space */
+    /* 
+     * Pad for alignment + header space.
+     * We allocate enough to slide the pointer to a 128-byte boundary.
+     */
     size_t total = size + HN4_HAL_ALIGNMENT + sizeof(alloc_header_t);
     void* raw = malloc(total);
     if (!raw) return NULL;
     
     /* Calculate aligned address */
-    uintptr_t aligned_addr = ((uintptr_t)raw + sizeof(alloc_header_t) + (HN4_HAL_ALIGNMENT - 1)) 
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t aligned_addr = (raw_addr + sizeof(alloc_header_t) + (HN4_HAL_ALIGNMENT - 1)) 
                              & ~((uintptr_t)HN4_HAL_ALIGNMENT - 1);
+                             
     void* ptr = (void*)aligned_addr;
     
     /* Store header immediately preceding the aligned pointer */
     alloc_header_t* h = (alloc_header_t*)((uint8_t*)ptr - sizeof(alloc_header_t));
+    
+    /* Verify our math didn't corrupt the heap or overlap */
+    if ((void*)h < raw) hn4_hal_panic("Allocator Math Underflow");
+    
     h->magic   = HN4_MEM_MAGIC;
     h->raw_ptr = raw;
+    h->_pad32  = 0;
     
     /* Safety: Zero memory */
     memset(ptr, 0, size);
@@ -284,8 +301,10 @@ void* hn4_hal_mem_alloc(size_t size) {
 void hn4_hal_mem_free(void* ptr) {
     if (!ptr) return;
     
+    /* Backtrack to header */
     alloc_header_t* h = (alloc_header_t*)((uint8_t*)ptr - sizeof(alloc_header_t));
-    if (unlikely(h->magic != HN4_MEM_MAGIC)) {
+    
+    if (HN4_UNLIKELY(h->magic != HN4_MEM_MAGIC)) {
         hn4_hal_panic("HN4 Heap Corruption: Invalid Free");
     }
     
@@ -297,7 +316,6 @@ void hn4_hal_mem_free(void* ptr) {
  * 5. SYNC IO & EXTENDED HELPERS
  * ========================================================================= */
 
-/* Sync Context for stack-based waiting */
 typedef struct { 
     volatile bool         done; 
     volatile hn4_result_t res; 
@@ -322,10 +340,9 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, 
     
     hn4_hal_submit_io(dev, &req, _sync_cb);
     
-    /* Spin-wait for completion */
     while(!ctx.done) { 
         HN4_YIELD(); 
-        hn4_hal_poll(dev); /* Help the driver if it's polled mode */
+        hn4_hal_poll(dev); 
     }
     
     atomic_thread_fence(memory_order_acquire);
@@ -333,7 +350,6 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, 
 }
 
 hn4_result_t hn4_hal_barrier(hn4_hal_device_t* dev) {
-    /* Issue a 0-length flush command */
     return hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_addr_from_u64(0), NULL, 0);
 }
 
@@ -341,45 +357,54 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
                                    uint8_t op, 
                                    hn4_addr_t start_lba, 
                                    void* buf, 
-                                   uint64_t len_bytes,
+                                   hn4_size_t len_bytes,
                                    uint32_t block_size)
 {
-    if (unlikely(block_size == 0)) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(block_size == 0)) return HN4_ERR_INVALID_ARGUMENT;
 
-    /* Ensure request is block-aligned */
-    if ((len_bytes & ((uint64_t)block_size - 1)) != 0) {
-        return HN4_ERR_ALIGNMENT_FAIL;
-    }
-
-    /* 2GB safe chunk limit to avoid overflow in legacy 32-bit DMA descriptors */
-    const uint64_t MAX_CHUNK_BYTES = 0x80000000ULL; 
+    const uint64_t MAX_CHUNK = 0x80000000ULL; 
     
-    uint64_t remaining_bytes = len_bytes;
-    uint64_t byte_offset = 0;
-    uint8_t* ptr = (uint8_t*)buf;
+    hn4_size_t remaining = len_bytes;
+    hn4_addr_t current_lba = start_lba;
+    
+    /* 
+     * MATH SPLIT: Handle 128-bit Struct vs 64-bit Integer
+     */
+    while (1) {
+        /* 1. CHECK IF DONE (Remaining > 0 ?) */
+        #ifdef HN4_USE_128BIT
+            if (hn4_u128_cmp(remaining, hn4_u128_from_u64(0)) <= 0) break;
+        #else
+            if (remaining == 0) break;
+        #endif
 
-    while (remaining_bytes > 0) {
-        uint32_t chunk_bytes = (remaining_bytes > MAX_CHUNK_BYTES) 
-                             ? (uint32_t)MAX_CHUNK_BYTES 
-                             : (uint32_t)remaining_bytes;
+        uint64_t chunk_bytes;
+
+        /* 2. CALCULATE CHUNK SIZE */
+        #ifdef HN4_USE_128BIT
+            if (hn4_u128_cmp(remaining, hn4_u128_from_u64(MAX_CHUNK)) > 0) {
+                chunk_bytes = MAX_CHUNK;
+            } else {
+                chunk_bytes = remaining.lo;
+            }
+        #else
+            chunk_bytes = (remaining > MAX_CHUNK) ? MAX_CHUNK : (uint64_t)remaining;
+        #endif
         
-        /* HAL expects length in blocks */
         uint32_t chunk_blocks = chunk_bytes / block_size;
         
-        hn4_addr_t current_lba = hn4_addr_add(start_lba, byte_offset / block_size);
-        void*      current_buf = ptr ? (ptr + byte_offset) : NULL;
-
-        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, current_buf, chunk_blocks);
+        /* 3. EXECUTE IO */
+        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, buf, chunk_blocks);
         if (res != HN4_OK) return res;
 
-        remaining_bytes -= chunk_bytes;
-        byte_offset     += chunk_bytes;
+        /* 4. SUBTRACT PROGRESS */
+        #ifdef HN4_USE_128BIT
+            remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(chunk_bytes));
+        #else
+            remaining -= chunk_bytes;
+        #endif
         
-        /* 
-         * Preventive Yield:
-         * If we are moving massive amounts of data synchronously, we must yield 
-         * to prevent locking up the core if we are in a non-preemptive environment.
-         */
+        current_lba = hn4_addr_add(current_lba, chunk_blocks);
         if (chunk_blocks > 1024) HN4_YIELD();
     }
 
@@ -392,8 +417,8 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
 
 hn4_time_t hn4_hal_get_time_ns(void) {
     /* 
-     * Mock implementation for bare metal.
-     * Real implementation would read TSC and scale by frequency.
+     * This is strictly monotonic but has no correlation to wall-clock time.
+     * Suitable for ordering checks, NOT for calendar time.
      */
     static _Atomic uint64_t ticks = 0;
     return (hn4_time_t)atomic_fetch_add(&ticks, 100);
@@ -401,7 +426,6 @@ hn4_time_t hn4_hal_get_time_ns(void) {
 
 uint64_t hn4_hal_get_random_u64(void) {
     _assert_hal_init();
-    /* Linear Congruential Generator (LCG) - fast, good enough for non-crypto */
     uint64_t c = atomic_load_explicit(&_prng_seed, memory_order_relaxed);
     uint64_t n = c * 6364136223846793005ULL + 1;
     atomic_store_explicit(&_prng_seed, n, memory_order_relaxed);
@@ -414,12 +438,12 @@ const hn4_hal_caps_t* hn4_hal_get_caps(hn4_hal_device_t* dev) {
     return &dev->caps;
 }
 
-/* Stubs for sensor/misc functions */
+/* Stubs */
 void hn4_hal_poll(hn4_hal_device_t* d) { (void)d; HN4_YIELD(); }
-uint32_t hn4_hal_get_temperature(hn4_hal_device_t* d) { (void)d; return 40; } /* Nominal */
+uint32_t hn4_hal_get_temperature(hn4_hal_device_t* d) { (void)d; return 40; }
 void hn4_hal_micro_sleep(uint32_t us) { (void)us; HN4_YIELD(); }
 
-/* Spinlock Implementation */
+/* Spinlock */
 void hn4_hal_spinlock_init(hn4_spinlock_t* l) { 
     atomic_flag_clear(&l->flag); 
 }

@@ -3,18 +3,11 @@
  * HEADER FILE: hn4.h
  * STATUS:      REFERENCE STANDARD (v4.2)
  * TARGET:      KERNEL / BARE METAL HAL / EMBEDDED
- * ENDIANNESS:  LITTLE ENDIAN (LE)
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * ARCHITECTURAL PARADIGM: THE POST-POSIX ERA
- * This file defines the on-disk structures, constants, in-memory types,
- * and memory layouts required to implement the HN4 "Ballistic-Tensor Manifold".
- *
- * NOTE ON PACKING:
- * This header enforces 1-byte packing for on-disk structures to ensure
- * ABI compatibility across x64, ARM64, and legacy architectures.
- *
- * REFERENCES:
- *  - HN4 Specification Document v4.2
+ * Defines on-disk structures, constants, and memory layouts for the
+ * HN4 "Ballistic-Tensor Manifold". Enforces 1-byte packing.
  */
 
 #ifndef _HN4_H_
@@ -86,7 +79,7 @@ extern "C" {
  * ========================================================================= */
 
 #ifndef HN4_LOG_ENABLED
-    #define HN4_LOG_ENABLED 1
+    #define HN4_LOG_ENABLED 0
 #endif
 
 #ifndef HN4_LOG_PRINTF
@@ -253,9 +246,7 @@ typedef uint8_t  hn4_byte_t;
  * 3. ON-DISK STRUCTURES (L1 - PHYSICAL LAYOUT)
  * ========================================================================= */
 
-/* 2.2 Superblock Structure
- * Fixed 8KB Block. Uses Union to guarantee 8KB size and CRC placement at EOF.
- */
+/* 2.2 Superblock Structure */
 typedef union HN4_PACKED {
     struct HN4_PACKED {
         /* --- IDENTITY (32 Bytes) --- */
@@ -276,7 +267,7 @@ typedef union HN4_PACKED {
 
         /* --- RECOVERY (THE TIME) --- */
         uint64_t    current_epoch_id;
-        hn4_addr_t  epoch_ring_ptr;
+        hn4_addr_t  epoch_ring_block_idx;
         uint64_t    copy_generation;
 
         /* --- HELIX STATE --- */
@@ -292,6 +283,7 @@ typedef union HN4_PACKED {
         uint64_t    dirty_bits;         /* Coarse dirty bitmap */
         hn4_time_t  last_mount_time;
         hn4_addr_t  journal_ptr;        /* Reserved for external Journal */
+        hn4_addr_t  journal_start;      // [NEW] Points to the absolute start of the log region
         uint32_t    endian_tag;         /* HN4_ENDIAN_TAG_LE */
         uint8_t     volume_label[32];   /* UTF-8 Label */
         uint32_t    format_profile;     /* Gaming / AI / Archive */
@@ -299,6 +291,7 @@ typedef union HN4_PACKED {
         uint64_t    generation_ts;      /* Timestamp of creation */
         uint64_t    magic_tail;         /* 0xEFBEADDE */
         hn4_addr_t  boot_map_ptr;       /* Pointer to Static Boot Map File */
+        uint64_t    last_journal_seq;   /* High-water mark of log sequence */
         /* Pad remaining bytes is implicit in the Union */
     } info;
 
@@ -462,14 +455,19 @@ typedef struct HN4_PACKED {
 #define HN4_CHRONICLE_OP_WORMHOLE   3
 #define HN4_CHRONICLE_OP_FORK       4
 
+/* 
+ * Aligned to ensure it never splits across a 512-byte sector boundary.
+ */
 typedef struct HN4_PACKED {
-    hn4_time_t  timestamp;
-    uint32_t    op_code;
+    uint64_t    magic;          // 0x4348524F4E49434C "CHRONICL"
+    uint64_t    timestamp;      // UTC Nanoseconds
+    uint32_t    op_code;        // HN4_CHRONICLE_OP_*
     uint32_t    reserved;
-    hn4_addr_t  old_lba;
-    hn4_addr_t  new_lba;
-    uint64_t    user_key_hash;
-    uint64_t    prev_hash;
+    hn4_addr_t  old_lba;        // Previous state pointer
+    hn4_addr_t  new_lba;        // New state pointer
+    uint64_t    user_key_hash;  // Who did it
+    uint64_t    prev_entry_hash;// Blockchain link (CRC32C of previous entry)
+    uint8_t     padding[8];     // Pad to 64 bytes (assuming 64-bit addrs)
 } hn4_chronicle_entry_t;
 
 /* 21.4 Triage Log Entry */
@@ -486,6 +484,10 @@ typedef struct HN4_PACKED {
     uint32_t    error_type;
     uint32_t    action_taken;
 } hn4_triage_log_entry_t;
+
+
+
+_Static_assert(sizeof(hn4_chronicle_entry_t) == 64, "Chronicle Entry must be 64 bytes");
 
 /* =========================================================================
  * 7. RUNTIME & ALLOCATION STRUCTURES (RAM ONLY)
@@ -565,6 +567,16 @@ typedef struct {
     /* Optimizations */
     uint64_t*           l2_summary_bitmap; 
     bool                in_eviction_path; 
+
+    /* STEP 2: Add Telemetry & Rate Limiting */
+    struct {
+        _Atomic uint64_t heal_count;
+        _Atomic uint64_t crc_failures;
+        _Atomic uint64_t barrier_failures;
+        _Atomic uint32_t last_panic_code;
+    } stats;
+
+    int64_t last_log_ts; /* For rate limiting */
 
 } hn4_volume_t;
 

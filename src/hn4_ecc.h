@@ -1,8 +1,9 @@
 /*
- * HYDRA-NEXUS 4 (HN4) - ECC LOGIC
- * SOURCE FILE: hn4_ecc.h
+ * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
+ * MODULE:      ECC Logic
+ * HEADER:      hn4_ecc.h
  * STATUS:      OPTIMIZED / REVIEWED
- * ARCHITECT:   SENIOR ENG
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  */
 
 #ifndef HN4_ECC_H

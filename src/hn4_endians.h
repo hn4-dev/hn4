@@ -1,16 +1,12 @@
 /*
  * HYDRA-NEXUS 4 (HN4) IMPLEMENTATION STANDARD
  * HEADER FILE: hn4_endians.h
- * STATUS: REFERENCE STANDARD (v4.2)
+ * STATUS:      REFERENCE STANDARD (v4.2)
+ * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
- * PURPOSE: High-Performance, Type-Safe Endianness Normalization.
+ * PURPOSE:
+ * High-Performance, Type-Safe Endianness Normalization.
  * HN4 is natively LITTLE ENDIAN (LE).
- *
- * DESIGN SAFETY:
- * - Uses static inline functions (not macros) for type safety.
- * - Uses compiler intrinsics (BSWAP/REV) where available.
- * - Enforces 128-bit struct alignment and packing.
- * - Fails compilation on ambiguous endianness.
  */
 
 #ifndef _HN4_ENDIANS_H_
