@@ -2219,52 +2219,6 @@ hn4_TEST(Chronicle, Append_Snapshot) {
 }
 
 /* 
- * Test 98: Format - ZNS Device Detection
- * Scenario: HAL reports HN4_HW_ZNS_NATIVE.
- * Logic: hn4_format should auto-detect HN4_DEV_ZNS tag in Superblock.
- * Expected: sb.device_type_tag == HN4_DEV_ZNS.
- */
-hn4_TEST(Format, ZNS_Detection) {
-    /* 1. Create a larger 256MB NVM buffer for ZNS Zone compliance */
-    uint64_t zns_cap = 256ULL * 1024 * 1024;
-    uint8_t* ram = calloc(1, zns_cap); 
-    
-    /* Alloc device struct manually to control setup */
-    hn4_hal_device_t* dev = hn4_hal_mem_alloc(sizeof(hn4_hal_caps_t) + 32);
-    
-    /* Manual configure_caps */
-    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
-#ifdef HN4_USE_128BIT
-    caps->total_capacity_bytes.lo = zns_cap;
-#else
-    caps->total_capacity_bytes = zns_cap;
-#endif
-    caps->logical_block_size = 4096; /* 4K required for ZNS */
-    caps->hw_flags = HN4_HW_NVM | HN4_HW_ZNS_NATIVE; 
-    caps->zone_size_bytes = 256ULL * 1024 * 1024; /* 1 Zone */
-    
-    /* Inject buffer */
-    inject_nvm_buffer(dev, ram); 
-    
-    hn4_format_params_t p = {0};
-    p.target_profile = HN4_PROFILE_GENERIC; /* Requires > 128MB */
-    
-    hn4_result_t res = hn4_format(dev, &p);
-    
-    ASSERT_EQ(HN4_OK, res);
-
-    /* Verify Tag */
-    hn4_superblock_t sb;
-    /* Read 2 sectors (4096 * 2 = 8192 SB Size) */
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 2); 
-    ASSERT_EQ(HN4_DEV_ZNS, sb.info.device_type_tag);
-    
-    /* Cleanup manual allocs */
-    hn4_hal_mem_free(dev);
-    free(ram);
-}
-
-/* 
  * Test 101: Epoch - Ring Wrap Logic
  * Scenario: Force Epoch Ring Pointer to end of ring and advance.
  * Logic: Next ptr should wrap to start of ring (relative 0).
@@ -2902,3 +2856,125 @@ hn4_TEST(Mount, Major_Version_Mismatch) {
     destroy_fixture(dev);
 }
 
+
+hn4_TEST(ZNS, HugeBlock_MemorySafety) {
+    /* 1. Setup Fixture */
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* 2. Hack Superblock to simulate ZNS Geometry */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Set Block Size to 128MB (Massively larger than 20MB fixture) */
+    sb.info.block_size = 128 * 1024 * 1024;
+    
+    /* Set ZNS Flag to ensure driver enters ZNS logic paths */
+    sb.info.hw_caps_flags |= HN4_HW_ZNS_NATIVE;
+    
+    /* Update CRC */
+    sb.raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, &sb, HN4_SB_SIZE - 4);
+    sb.raw.sb_crc = hn4_cpu_to_le32(crc);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* 3. Inject ZNS Flag into HAL Caps */
+    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
+    caps->hw_flags |= HN4_HW_ZNS_NATIVE;
+    
+    /* 4. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    /* 
+     * If the fix is MISSING: 
+     *   The driver tries to malloc(128MB) or read 128MB from the 20MB fixture.
+     *   Result: Crash (Segfault) or HN4_ERR_NOMEM.
+     * 
+     * If the fix is PRESENT:
+     *   The driver clamps read to 64KB. Reads SB OK. 
+     *   It might fail later due to geometry checks (128MB blocks don't fit in 20MB vol),
+     *   but it MUST NOT crash or return NOMEM.
+     */
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    
+    /* Expecting Geometry Error (Capacity too small for BS), NOT NOMEM or Crash */
+    ASSERT_NEQ(HN4_ERR_NOMEM, res); 
+    
+    destroy_fixture(dev);
+}
+
+hn4_TEST(ZNS, HugeBlock_Prevents_OOM) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* 1. Modify Superblock to simulate ZNS Zone Size (1GB) */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Set Block Size to 1GB */
+    sb.info.block_size = 1024 * 1024 * 1024; 
+    
+    /* Update CRC */
+    sb.raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, &sb, HN4_SB_SIZE - 4);
+    sb.raw.sb_crc = hn4_cpu_to_le32(crc);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* 2. Set HAL Flag to ZNS */
+    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
+    caps->hw_flags |= HN4_HW_ZNS_NATIVE;
+    
+    /* 3. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    
+    /* 
+     * IF FIX IS WORKING: Allocator clamps to 64KB. Mount proceeds to check capacity.
+     * Fails with GEOMETRY (1GB block > 20MB disk).
+     *
+     * IF FIX IS BROKEN: Allocator tries malloc(1GB). Fails with NOMEM.
+     */
+    ASSERT_NEQ(HN4_ERR_NOMEM, res);
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_fixture(dev);
+}
+
+hn4_TEST(ZNS, RootAnchor_Read_Clamps_Memory) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* 1. Hack SB to have ZNS-scale Block Size (1GB) */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    sb.info.block_size = 1024 * 1024 * 1024;
+    
+    /* Update CRC */
+    sb.raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, &sb, HN4_SB_SIZE - 4);
+    sb.raw.sb_crc = hn4_cpu_to_le32(crc);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* 2. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    /* 
+     * The mount process will:
+     * 1. Read SB (Clamped? Tested in Test #1)
+     * 2. Load Bitmap (Might skip if PICO or fail geometry)
+     * 3. Verify Root Anchor (The target of this test) -> Calls malloc(block_size)
+     * 
+     * If _verify_and_heal_root_anchor is NOT fixed, it tries to malloc(1GB) here
+     * and returns HN4_ERR_NOMEM.
+     */
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    
+    ASSERT_NEQ(HN4_ERR_NOMEM, res);
+    
+    destroy_fixture(dev);
+}

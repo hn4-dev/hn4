@@ -146,10 +146,19 @@ static hn4_result_t _read_sb_at_lba(
      * We read HN4_ALIGN_UP(MAX(BS, SB_SIZE), Sector).
      */
 
-    uint32_t min_bytes = HN4_ALIGN_UP(HN4_SB_SIZE, dev_sector_size);
-    uint32_t target_bs = (known_block_size > 0) ? HN4_ALIGN_UP(known_block_size, dev_sector_size) : 0;
+   /* 
+     * Read logic must encompass the Superblock structure.
+     * FIX: Clamp read size. Even if Block Size is huge (ZNS), we only need the SB.
+     */
 
-    uint32_t read_bytes = HN4_MAX(min_bytes, target_bs);
+    uint32_t min_bytes = HN4_ALIGN_UP(HN4_SB_SIZE, dev_sector_size);
+    
+    // FIX: Do not expand buffer to Block Size if it exceeds reasonable bounds (e.g. 64KB)
+    uint32_t read_bytes = min_bytes;
+    if (known_block_size > 0 && known_block_size <= 65536) {
+        read_bytes = HN4_MAX(min_bytes, HN4_ALIGN_UP(known_block_size, dev_sector_size));
+    }
+
     uint32_t sectors = read_bytes / dev_sector_size;
 
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, lba, io_buf, sectors);
@@ -485,6 +494,13 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     /* 2. Write Mirrors */
     for (int i=1; i<4; i++) {
         if (target_blocks[i] == HN4_OFFSET_INVALID) continue;
+
+        /* 
+         * FIX: ZNS SAFETY CHECK
+         * Skip mirrors on ZNS to prevent "Write Pointer Violation" errors.
+         * Only the Primary SB (North) allows in-place updates in Conventional Zones.
+         */
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) continue;
 
         hn4_addr_t lba;
         if (_phys_lba_from_block(target_blocks[i], bs, sector_sz, cap, &lba) != HN4_OK) continue;
@@ -890,11 +906,19 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     hn4_addr_t cortex_lba = vol->sb.info.lba_cortex_start;
 
-    /* 2. Read Root Anchor Candidate (1 Block) */
-    void* io_buf = hn4_hal_mem_alloc(bs);
+    /* 2. Read Root Anchor Candidate */
+
+    /* 
+     * In ZNS mode, bs is ~1.7GB. We only need the first sector to check the Root Anchor.
+     */
+    uint32_t alloc_sz = (bs > 65536) ? 65536 : bs;
+    // Ensure we allocate at least one sector
+    if (alloc_sz < ss) alloc_sz = ss;
+
+    void* io_buf = hn4_hal_mem_alloc(alloc_sz);
     if (!io_buf) return HN4_ERR_NOMEM;
 
-    uint32_t sector_count = bs / ss;
+    uint32_t sector_count = alloc_sz / ss;
     if (sector_count == 0) sector_count = 1;
 
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, cortex_lba, io_buf, sector_count);

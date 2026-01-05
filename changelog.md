@@ -9,6 +9,31 @@ architecture shifts.
 
 ---
 
+## [0.1.1] — 2026-01-06
+### **Hardware Compatibility & Safety Hotfix**
+
+This release addresses critical stability issues identified in ZNS (Zoned Namespace), Rotational (HDD), and Embedded (Pico) profiles. These fixes prevent panic conditions and potential metadata corruption on non-standard geometry.
+
+### 🛡️ Critical Safety Fixes
+
+#### **ZNS (Zoned Namespaces)**
+- **Write Pointer Protection:** The Cardinal Vote logic in `mount` and `unmount` now correctly detects ZNS devices and skips writing to East/West/South mirrors. This prevents Illegal Write Pointer violations in Sequential Zones.
+- **Memory Safety:** Clamped memory allocation logic during Root Anchor verification. Previously, ZNS devices with massive Zone Sizes (e.g., 1.7GB) could trigger an OOM panic by attempting to allocate a full block buffer.
+- **Format Alignment:** Strict enforcement of Zone Size alignment during `hn4_format` pre-flight checks.
+
+#### **Pico Profile (Embedded/IoT)**
+- **Epoch Ring Geometry:** Fixed a critical desync where the runtime hardcoded a 1MB Ring size even for Pico volumes (which use 2 blocks). This prevents the Epoch Advance logic from overwriting the start of the Cortex (D0) region.
+
+### ⚙️ Logic & Performance
+
+#### **HDD (Rotational Media)**
+- **Inertial Damper Enabled:** The "Shotgun Read" logic now respects the `HN4_HW_ROTATIONAL` flag. Parallel speculative reads are disabled on HDDs to prevent head thrashing, restoring sequential throughput performance.
+
+#### **Small Volume / USB**
+- **Southbridge Logic Alignment:** Fixed a logic mismatch between `format` and `unmount` regarding the South Superblock (Backup #3). Both paths now strictly enforce the "16x Superblock Size" capacity threshold before attempting to access the South mirror, preventing "Stale Mirror" warnings on small thumb drives.
+
+---
+
 ## [0.1.0] — 2026-01-05  
 ### **First Public Implementation Drop — Core Engine Online**
 

@@ -226,10 +226,20 @@ static hn4_result_t _broadcast_superblock(
         /* Skip if 128-bit fallback zeroed them out */
         if (i > 0 && targets[i] == 0) continue; 
 
+        /* 
+         * On ZNS devices, the East/West/South mirrors reside in Sequential Zones.
+         * We cannot overwrite them in place (Write Pointer Violation).
+         * We only update North (LBA 0), which is assumed to be in a Conventional Zone.
+         */
+        if ((caps->hw_flags & HN4_HW_ZNS_NATIVE) && i > SB_LOC_NORTH) {
+            slot_ok[i] = false; // Mark as skipped/failed safely
+            continue;
+        }
+
         /* Convert Block Index -> Sector LBA using abstract helper */
         hn4_addr_t phys_lba;
         
-#ifdef HN4_USE_128BIT
+    #ifdef HN4_USE_128BIT
         /* Manually construct LBA: block_idx * (bs/ss) */
         /* Assuming targets[i] fits in u64 as calculated above */
         uint64_t lba_val = targets[i] * (bs / ss);

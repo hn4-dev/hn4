@@ -425,7 +425,19 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     ring_curr_blk_idx  = ring_curr_blk;
 #endif
 
-    uint64_t ring_len_blks = (HN4_RING_SIZE_BYTES + bs - 1) / bs;
+    /* 
+     * Pico Profile uses a tiny ring (2 blocks).
+     * We must check the profile to determine the ring bounds, 
+     * otherwise we overwrite the Cortex (D0) region.
+     */
+    uint64_t target_sz = HN4_RING_SIZE_BYTES; /* Default 1MB */
+    if (sb->info.format_profile == HN4_PROFILE_PICO) {
+        target_sz = 2 * bs;
+    }
+
+    uint64_t ring_len_blks = (target_sz + bs - 1) / bs;
+    
+    /* Calculate Topology Bounds */
     
     /* Calculate Topology Bounds */
     /* NOTE: We only validate bounds against Volume Capacity here. */

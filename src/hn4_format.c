@@ -117,7 +117,7 @@ static const hn4_profile_spec_t PROFILE_SPECS[] = {
     { 1   * HN4_SZ_GB,  16 * HN4_SZ_TB,  16384,    65536,           1, "GAMING"  },
     
     /* [2] AI (Tensor Tunnel - UNLIMITED CAPACITY) */
-    { 10  * HN4_SZ_GB,  HN4_CAP_UNLIMITED, 1048576, 2 * HN4_SZ_MB,   1, "AI"      },
+    { 1   * HN4_SZ_TB,  HN4_CAP_UNLIMITED, 67108864, 67108864,      1, "AI"      },
     
     /* [3] ARCHIVE (Tape/Cold - Capped at 18 EiB) */
     { 10  * HN4_SZ_GB,  18 * HN4_SZ_EB,  67108864, 67108864,        1, "ARCHIVE" },
@@ -474,6 +474,32 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
 
     /* Resolve Block Size */
     uint32_t bs = spec->default_block_size;
+
+    /* 
+     * FIX [Spec 13.2]: ZNS Macro-Blocking.
+     * If the device is ZNS, the Logical Block Size MUST match the Physical Zone Size.
+     * We override the profile default to prevent random write errors.
+     */
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        if (caps->zone_size_bytes == 0) {
+            HN4_LOG_CRIT("ZNS Format Error: Device reported 0-byte Zone Size.");
+            return HN4_ERR_GEOMETRY;
+        }
+        
+        /* 
+         * Verify Zone Size fits in 32-bit block_size field. 
+         * Most Zones are ~256MB to 2GB. Max uint32 is 4GB.
+         */
+        if (caps->zone_size_bytes > 0xFFFFFFFFULL) {
+            HN4_LOG_CRIT("ZNS Error: Zone Size exceeds 4GB limit of HN4 v1 Block Engine.");
+            return HN4_ERR_GEOMETRY;
+        }
+
+        bs = (uint32_t)caps->zone_size_bytes;
+        HN4_LOG_VAL("ZNS Mode Enabled. Block Size locked to Zone Size", bs);
+    }
+
+    /* Standard Safety Checks */
     if (bs < caps->logical_block_size) bs = caps->logical_block_size;
 
     /* Safety Belt for Division */
@@ -512,9 +538,18 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     offset += epoch_sz;
 
     /* Cortex (D0) */
-    /* Heuristic: 2% of disk for metadata, 5% for AI */
+    /* 
+     * Cortex (D0)
+     * Heuristic: 2% of disk for metadata.
+     * Note: AI Profile (64MB blocks) actually needs LESS metadata ratio, 
+     * but we keep 2% reserve for Vector Embeddings (Spec 8.6).
+     */
     uint64_t cortex_sz = (capacity_bytes / 100) * 2;
-    if (pid == HN4_PROFILE_AI) cortex_sz = (capacity_bytes / 100) * 5;
+    
+    /* PICO on Floppy (1.44MB) needs minimal Cortex to save space for data */
+    if (pid == HN4_PROFILE_PICO && capacity_bytes < 100 * HN4_SZ_MB) {
+        cortex_sz = (capacity_bytes / 100) * 1; 
+    }
     if (cortex_sz < 65536) cortex_sz = 65536;
     cortex_sz = HN4_ALIGN_UP(cortex_sz, bs);
     
@@ -917,9 +952,12 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         
         /* 
          * 3. South Mirror - OPTIONAL (Best Effort)
-         * If this fails, we log it but DO NOT fail the function 'res'.
+         * "The Small Volume Desync".
+         * Only write South if capacity >= 16x SB Size. Matches unmount logic.
          */
-        if (res == HN4_OK) {
+        bool write_south = (cap_bytes >= ((uint64_t)write_sz * 16));
+
+        if (res == HN4_OK && write_south) {
             hn4_result_t s_res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs);
             
             if (s_res != HN4_OK) {
