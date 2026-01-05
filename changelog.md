@@ -9,6 +9,31 @@ architecture shifts.
 
 ---
 
+## [0.1.2] — 2026-01-07
+### **ZNS Logic Hardening & Test Suite Expansion**
+
+This release fixes a logic error in the Cardinal Vote unmount sequence for Zoned Namespaces and expands the test suite to cover catastrophic edge cases, geometry underflows, and security bounds.
+
+### 🛡️ Core Logic Fixes
+
+#### **ZNS (Zoned Namespaces)**
+- **Quorum Relaxation:** Fixed a logic bug in `hn4_unmount` where the Cardinal Vote quorum required 2 successful writes (North + 1 Mirror). Since ZNS devices physically prevent rewriting mirror locations in Sequential Zones, the quorum logic now accepts "North-Only" success for devices with the `HN4_HW_ZNS_NATIVE` flag. This fixes the false-positive `HN4_ERR_HW_IO` during ZNS unmount.
+
+### 🧪 Test Ecosystem & Verification
+
+#### **New Safety Verification Tests**
+Added regression tests for extreme boundary conditions:
+- **`Geometry.Bitmap_Coverage_Underflow`**: Ensures mount fails if the allocated Bitmap region is physically too small for the reported volume capacity.
+- **`Geometry.QMask_Coverage_Underflow`**: Validates Silicon Cartography (Q-Mask) region bounds against capacity inflation attacks.
+- **`Security.Journal_Ptr_OutOfBounds`**: Verifies that the Chronicle Journal Pointer triggers a Panic state if it points outside valid log boundaries.
+- **`Liability.Prevention_Of_Catastrophic_Rollback`**: The "Class Action" Test. Ensures the driver prioritizes a high-generation PANIC Superblock over a low-generation CLEAN Superblock, preventing accidental data reversion to ancient states.
+
+#### **Test Infrastructure Fixes**
+- **Huge Block Alignment:** Fixed test fixture geometry in `GeometryLogic.HugeBlockSizeCompatibility` to correctly align the Epoch Ring Start LBA when testing 1MB and 256MB block sizes.
+- **ZNS Capacity Mocking:** Updated `HardwareProfile.ZnsNativeMirrorSkip` fixture to provide sufficient capacity (10GB) for ZNS Zone simulation, preventing artificial geometry errors during test execution.
+
+---
+
 ## [0.1.1] — 2026-01-06
 ### **Hardware Compatibility & Safety Hotfix**
 

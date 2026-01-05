@@ -280,8 +280,14 @@ static hn4_result_t _broadcast_superblock(
     }
     
     bool north_valid = slot_ok[SB_LOC_NORTH];
-    bool quorum_met = (north_valid && total_success >= 2) || (!north_valid && total_success >= 3);
+    bool quorum_met;
 
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        quorum_met = north_valid; 
+    } else {
+        /* Standard: North + 1 Mirror OR 3 Mirrors */
+        quorum_met = (north_valid && total_success >= 2) || (!north_valid && total_success >= 3);
+    }
     return quorum_met ? HN4_OK : HN4_ERR_HW_IO;
 }
 
@@ -407,3 +413,4 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     HN4_LOG_VAL("Unmount Complete. Status", final_res);
     return final_res;
 }
+

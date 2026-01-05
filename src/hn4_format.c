@@ -453,7 +453,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
      hn4_result_t res = _check_profile_compatibility(pid, caps, capacity_bytes);
     if (res != HN4_OK) return res;
 
-    /* --- NEW STEP: CAPACITY BOUNDS CHECK --- */
+    /* --- CAPACITY BOUNDS CHECK --- */
     if (capacity_bytes < spec->min_cap) {
         HN4_LOG_VAL("Capacity too small for profile", capacity_bytes);
         return HN4_ERR_GEOMETRY;

@@ -2978,3 +2978,90 @@ hn4_TEST(ZNS, RootAnchor_Read_Clamps_Memory) {
     
     destroy_fixture(dev);
 }
+
+/*
+ * Test 666: The "Class Action" Scenario (Catastrophic Rollback Prevention)
+ * 
+ * SCENARIO: 
+ * A High-Frequency Trading firm uses HN4. They have a primary Superblock (North)
+ * at Generation 5,000,000. Due to a cosmic ray, North gets flagged as HN4_VOL_PANIC.
+ * However, there exists a stale South Superblock from "Format Day" (Generation 1).
+ * 
+ * THE DANGER:
+ * A naive "Self-Healing" algorithm might look at North, see "PANIC", reject it,
+ * look at South, see "CLEAN (Gen 1)", accept it, and "HEAL" North by overwriting
+ * it with Generation 1.
+ * 
+ * RESULT:
+ * 5 million generations of financial data are instantly reverted to an empty disk.
+ * The firm sues Hydra-Nexus for $500M.
+ * 
+ * EXPECTED BEHAVIOR:
+ * The driver must prioritize the *highest generation* even if it is in a PANIC state,
+ * mounting it Read-Only for data extraction, rather than rolling back to a "Clean"
+ * but ancient history.
+ */
+hn4_TEST(Liability, Prevention_Of_Catastrophic_Rollback) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* 1. Setup the "Ancient" South Backup (Generation 1, Clean) */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    sb.info.copy_generation = 1;
+    sb.info.state_flags = HN4_VOL_CLEAN;
+    
+    /* Write South (at end of disk) */
+    uint64_t cap = FIXTURE_SIZE;
+    uint64_t south_off = (cap - HN4_SB_SIZE) & ~4095ULL;
+    write_sb(dev, &sb, south_off/512);
+    
+    /* 2. Setup the "Modern" North Primary (Generation 5M, Panic) */
+    sb.info.copy_generation = 5000000;
+    sb.info.state_flags = HN4_VOL_PANIC; /* The cosmic ray bitflip */
+    sb.info.last_mount_time += 999999;   /* Much newer */
+    
+    write_sb(dev, &sb, 0);
+    
+    /* 3. Destroy East/West to force the binary choice: North vs South */
+    uint8_t* poison = calloc(1, HN4_SB_SIZE);
+    memset(poison, 0xAA, HN4_SB_SIZE);
+    
+    uint32_t bs = FIXTURE_BLK;
+    uint64_t east_off = (((cap / 100) * 33) + bs - 1) & ~((uint64_t)bs - 1);
+    uint64_t west_off = (((cap / 100) * 66) + bs - 1) & ~((uint64_t)bs - 1);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, east_off/512, poison, HN4_SB_SIZE/512);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, west_off/512, poison, HN4_SB_SIZE/512);
+    free(poison);
+    
+    /* 4. The Critical Moment (Mount) */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    
+    /* 
+     * VERDICT:
+     * If the active generation is 1, we just lost the lawsuit.
+     * The driver MUST select Gen 5,000,000 (North), even if it forces RO.
+     */
+    
+    /* Assert mount succeeded (Panic state is mountable-RO) */
+    ASSERT_EQ(HN4_OK, res);
+    
+    /* Assert we are Read-Only (due to Panic) */
+    ASSERT_TRUE(vol->read_only);
+    
+    /* THE BIG ASSERTION: We must be on the timeline of Gen 5M, NOT Gen 1 */
+    if (vol->sb.info.copy_generation == 1) {
+        /* Fail manually with message */
+        ASSERT_EQ(5000000, vol->sb.info.copy_generation); 
+    }
+    
+    ASSERT_EQ(5000000, vol->sb.info.copy_generation);
+    
+    /* Cleanup */
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}

@@ -2197,33 +2197,6 @@ hn4_TEST(LogicVerify, QMask_Size_Math) {
  */
 
 /* 
- * TEST: Gaming Profile on 4Kn Sector
- * Gaming defaults to 16KB. 16KB is a multiple of 4KB.
- * Expected: 16,384 bytes.
- */
-hn4_TEST(BlockSizeLogic, Gaming_Profile_4Kn) {
-    uint64_t cap = 2 * HN4_SZ_GB; /* Reduced from 50GB */
-    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= HN4_HW_NVM;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GAMING;
-    
-    hn4_result_t res = hn4_format(dev, &params);
-    ASSERT_EQ(HN4_OK, res);
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    ASSERT_EQ(16384, sb->info.block_size); /* 16KB */
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-
-/* 
  * TEST: USB Profile on Standard Sector
  * USB defaults to 64KB (Optimization for FAT32/ExFAT style allocation units).
  * Expected: 65,536 bytes.
@@ -2592,55 +2565,6 @@ hn4_TEST(ZNS_EdgeCase, Metadata_Overflow_ENOSPC) {
 
 
 /* 
- * Test Z7: ZNS Layout Stride Verification
- * Verifies that metadata regions align perfectly to Zone Boundaries.
- * If BlockSize is forced to ZoneSize (Macro-Blocking), then LBA pointers
- * must increment by exactly (ZoneSize / SectorSize).
- */
-hn4_TEST(ZNS_Logic, Region_Stride_Alignment) {
-    uint64_t cap = 8 * HN4_SZ_GB;
-    uint64_t zone_sz = 256 * HN4_SZ_MB;
-    uint32_t ss = 4096;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    /* Calculate Sectors per Zone */
-    uint64_t sectors_per_zone = zone_sz / ss;
-    
-    /* 
-     * In ZNS Macro-Blocking:
-     * Zone 0: Superblock
-     * Zone 1: Epoch Ring (Start)
-     */
-    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
-    
-    /* Epoch start must be exactly at the start of the second zone */
-    ASSERT_EQ(sectors_per_zone, epoch_lba);
-    
-    /* Cortex must start at the next zone boundary after Epoch Ring ends */
-    /* Epoch Ring is usually 1 Block (Zone) in this mode unless configured larger */
-    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
-    
-    ASSERT_TRUE((cortex_lba % sectors_per_zone) == 0);
-    ASSERT_TRUE(cortex_lba > epoch_lba);
-
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-/* 
  * Test Z3: ZNS Layout Integrity (Metadata Stride)
  * 
  * SCENARIO:
@@ -2884,5 +2808,797 @@ hn4_TEST(ProfileLogic, AI_Tensor_Spec_Compliance) {
         ASSERT_EQ(67108864, sb->info.block_size);
     }
     
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST 4: Pico vs ZNS Incompatibility
+ * Scenario: Attempt to use Pico profile on a ZNS device.
+ * Spec: Pico does not support ZNS due to logic overhead.
+ * Expected: HN4_ERR_PROFILE_MISMATCH.
+ */
+hn4_TEST(ProfileLogic, Pico_ZNS_Incompatible) {
+    uint64_t cap = 1 * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.zone_size_bytes = 128 * HN4_SZ_MB;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_PICO;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_ERR_PROFILE_MISMATCH, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * FIXED TEST: Pico Profile Upper Bound (2GB)
+ * SAFETY: Does NOT allocate 2GB RAM. Validates logic only.
+ */
+hn4_TEST(ProfileBounds, Pico_2GB_Logic_Only) {
+    uint64_t cap = 2ULL * 1024 * 1024 * 1024; /* 2 GB */
+    
+    /* Create fixture but DO NOT allocate mmio_base (save RAM) */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512); 
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* 
+     * IMPORTANT: Do NOT set HN4_HW_NVM.
+     * This forces the HAL mock to skip memcpy() operations,
+     * preventing segfaults/swapping while still running format logic.
+     */
+    mdev->caps.hw_flags = 0; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_PICO;
+    
+    /* Should succeed logically (2GB is valid 32-bit limit) */
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_OK, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: Pico Max Limit Check (Exact 2GB)
+ * RATIONALE: Pico profile is capped at exactly 2GB. 
+ *            This test validates that the boundary condition (== 2GB) is accepted.
+ * SAFETY: Logic-only test (No RAM allocation).
+ */
+hn4_TEST(PicoBounds, Exact_2GB_Success) {
+    /* Exact 2GB limit */
+    uint64_t cap = 2ULL * 1024 * 1024 * 1024; 
+    
+    /* 512B sectors required for Pico. 4Kn would fail profile check independent of size. */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* 
+     * IMPORTANT: Disable HN4_HW_NVM.
+     * This ensures the HAL mock does NOT attempt to memcpy/write to `mmio_base`.
+     * We leave `mmio_base` NULL to guarantee 0 memory usage.
+     */
+    mdev->caps.hw_flags = 0; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_PICO;
+    params.label = "PicoLimitTest";
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_OK, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: Pico Max Limit Check (2GB + 1 Sector)
+ * RATIONALE: Pico profile must reject volumes strictly larger than 2GB.
+ *            This prevents misuse on large drives where metadata overhead might scale poorly.
+ * SAFETY: Logic-only test (No RAM allocation).
+ */
+hn4_TEST(PicoBounds, Over_2GB_Fail) {
+    /* 2GB + 512 Bytes (One Sector Over) */
+    uint64_t cap = (2ULL * 1024 * 1024 * 1024) + 512;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Disable NVM */
+    mdev->caps.hw_flags = 0;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_PICO;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect Profile Mismatch due to size limit violation */
+    ASSERT_EQ(HN4_ERR_PROFILE_MISMATCH, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: Gaming Profile Min Capacity Check
+ * RATIONALE: Gaming Profile (16KB Blocks) requires minimum 1GB capacity.
+ *            Test ensures 900MB is rejected to prevent high metadata ratio/slack issues.
+ * SAFETY: Logic-only test (No RAM allocation).
+ */
+hn4_TEST(GameProfile, MinCap_Underflow_Fail) {
+    /* 900 MB (Under 1GB limit) */
+    uint64_t cap = 900ULL * 1024 * 1024;
+    
+    /* Gaming allows 4K sectors */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Disable NVM */
+    mdev->caps.hw_flags = 0;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GAMING;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect Geometry error due to min_cap check in _calc_geometry */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: USB Profile Block Size Default
+ * RATIONALE: The USB profile is optimized for Flash Translation Layers (FTL).
+ *            It MUST default to 64KB (65536 bytes) blocks on standard media.
+ * SETUP: 128MB Capacity (Min valid for USB), 512B Sectors.
+ * SAFETY: Allocates 128MB RAM to inspect the Superblock content.
+ */
+hn4_TEST(USBProfile, BlockSize_64KB_Default) {
+    uint64_t cap = 128 * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Allocate backing store to verify the written Block Size */
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    memset(mdev->mmio_base, 0, cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM; /* Enable Writes */
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_USB;
+    params.label = "USB_Stick_Test";
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_OK, res);
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* Verify Block Size is exactly 64KB */
+    ASSERT_EQ(65536, sb->info.block_size);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: Geometry Alignment Mismatch (SAS/NetApp Legacy)
+ * RATIONALE: Formatter must fail if Profile Block Size is not a multiple of Sector Size.
+ * SCENARIO: Generic Profile (4096B BS) on 520B Sector Hardware.
+ * MATH: 4096 % 520 = 456 (Non-Zero Remainder).
+ * SAFETY: Logic-only test (No RAM allocation).
+ */
+hn4_TEST(GeometryLogic, Sector_520B_Misalignment) {
+    uint64_t cap = 1 * HN4_SZ_GB;
+    /* 520B Sectors (Common in enterprise SAS drives) */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 520);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Disable NVM to prevent IO attempts */
+    mdev->caps.hw_flags = 0; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC; /* Defaults to 4096B */
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect ALIGNMENT_FAIL because 4096 is not divisible by 520 */
+    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: USB Profile Capacity Underflow
+ * RATIONALE: USB Profile requires a minimum of 128MB to accommodate 64KB blocks 
+ *            and necessary metadata structures effectively.
+ * SCENARIO: Attempting to format a 64MB volume as USB.
+ * SAFETY: Logic-only test (No RAM allocation).
+ */
+hn4_TEST(USBProfile, MinCap_Underflow_Fail) {
+    uint64_t cap = 64 * HN4_SZ_MB; /* Below 128MB limit */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Disable NVM */
+    mdev->caps.hw_flags = 0;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_USB;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect Geometry error due to capacity < min_cap (128MB) */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/*
+ * TEST: ZNS Zone Size 32-bit Overflow
+ * RATIONALE: The HN4 Block Engine uses a 32-bit integer for `block_size`.
+ *            ZNS Mode forces Block Size = Zone Size (Macro-Blocking).
+ *            If a device reports a Zone Size > 4GB (UINT32_MAX), the formatter
+ *            MUST fail gracefully instead of truncating the size.
+ * SCENARIO: Zone Size = 8GB.
+ * EXPECTED: HN4_ERR_GEOMETRY.
+ */
+hn4_TEST(ZNSEdge, ZoneSize_8GB_Overflow) {
+    uint64_t cap = 64 * HN4_SZ_GB;
+    uint64_t zone_sz = 8ULL * HN4_SZ_GB; /* 8GB > 4GB Limit */
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = zone_sz; /* 64-bit value passed to caps */
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: ZNS Priority Over Profile Defaults
+ * RATIONALE: Even if a specific profile (e.g., GAMING) requests a specific 
+ *            Block Size (e.g., 16KB), the ZNS Hardware constraint (Macro-Blocking) 
+ *            must take precedence.
+ * SCENARIO: Profile = GAMING (16KB BS). Hardware = ZNS (64MB Zone).
+ * EXPECTED: Formatter overrides Block Size to 64MB.
+ */
+hn4_TEST(ZNS_Logic, Profile_BlockSize_Override) {
+    uint64_t cap = 10 * HN4_SZ_GB;
+    uint64_t zone_sz = 64 * HN4_SZ_MB;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    
+    /* Enable NVM and ZNS */
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GAMING; /* Normally asks for 16KB */
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* 
+     * Verify Block Size is 64MB (Zone Size), NOT 16KB (Profile Default).
+     * ZNS constraints are physical and immutable.
+     */
+    ASSERT_EQ((uint32_t)zone_sz, sb->info.block_size);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+
+hn4_TEST(ZNS_Layout, Zone_Boundary_Strictness) {
+    /* 4GB Drive, 256MB Zones */
+    uint64_t cap = 4ULL * HN4_SZ_GB;
+    uint32_t zone_sz = 256 * 1024 * 1024;
+    uint32_t ss = 4096;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* 
+     * In ZNS Mode:
+     * Zone 0: Superblock (LBA 0)
+     * Zone 1: Epoch Ring (LBA = ZoneSize / SectorSize)
+     * Zone 2: Cortex (LBA = ZoneSize * 2 / SectorSize)
+     */
+    uint64_t sectors_per_zone = zone_sz / ss;
+    
+    /* Check Epoch Start LBA */
+    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
+    ASSERT_EQ(sectors_per_zone, epoch_lba);
+    
+    /* Check Cortex Start LBA */
+    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
+    ASSERT_EQ(sectors_per_zone * 2, cortex_lba);
+    
+    /* Verify Block Size matches Zone Size exactly */
+    ASSERT_EQ(zone_sz, sb->info.block_size);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(ZNS_Layout, Insufficient_Zones_Failure) {
+    /* 
+     * Scenario: 1GB Drive with 512MB Zones.
+     * Total Zones = 2.
+     * Layout Needs: Zone 0 (SB), Zone 1 (Epoch), Zone 2 (Cortex)... 
+     * This physically cannot fit.
+     */
+    uint64_t cap = 1ULL * HN4_SZ_GB;
+    uint32_t zone_sz = 512 * 1024 * 1024;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Must fail because metadata requires at least ~5 zones for minimal layout */
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * Test Z7: ZNS Layout Stride Verification
+ * Verifies that metadata regions align perfectly to Zone Boundaries.
+ * If BlockSize is forced to ZoneSize (Macro-Blocking), then LBA pointers
+ * must increment by exactly (ZoneSize / SectorSize).
+ */
+hn4_TEST(ZNS_Logic, Region_Stride_Alignment) {
+    uint64_t cap = 8 * HN4_SZ_GB;
+    uint64_t zone_sz = 256 * HN4_SZ_MB;
+    uint32_t ss = 4096;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* Calculate Sectors per Zone */
+    uint64_t sectors_per_zone = zone_sz / ss;
+    
+    /* 
+     * In ZNS Macro-Blocking:
+     * Zone 0: Superblock
+     * Zone 1: Epoch Ring (Start)
+     */
+    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
+    
+    /* Epoch start must be exactly at the start of the second zone */
+    ASSERT_EQ(sectors_per_zone, epoch_lba);
+    
+    /* Cortex must start at the next zone boundary after Epoch Ring ends */
+    /* Epoch Ring is usually 1 Block (Zone) in this mode unless configured larger */
+    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
+    
+    ASSERT_TRUE((cortex_lba % sectors_per_zone) == 0);
+    ASSERT_TRUE(cortex_lba > epoch_lba);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: Gaming Profile on 4Kn Sector
+ * Gaming defaults to 16KB. 16KB is a multiple of 4KB.
+ * Expected: 16,384 bytes.
+ */
+hn4_TEST(BlockSizeLogic, Gaming_Profile_4Kn) {
+    uint64_t cap = 2 * HN4_SZ_GB; /* Reduced from 50GB */
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GAMING;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_OK, res);
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    ASSERT_EQ(16384, sb->info.block_size); /* 16KB */
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/*
+ * TEST: ZNS Starvation (Deadlock Prevention)
+ * RATIONALE: If the drive is small but Zones are huge, we run out of Zones 
+ *            for mandatory metadata (SB, Epoch, Cortex, Bitmap, QMask).
+ *            Formatter MUST fail with ENOSPC, not loop forever.
+ * SCENARIO: 128MB Drive, 64MB Zones. (Only 2 Zones available).
+ */
+hn4_TEST(ZNS_Safety, InsufficientZones_Fail) {
+    uint64_t cap = 128ULL * HN4_SZ_MB;
+    uint32_t zone_sz = 64 * 1024 * 1024; /* 64MB Zones */
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* No need to alloc full RAM if we expect early failure, 
+       but we alloc small to be safe against segfaults. */
+    mdev->mmio_base = hn4_hal_mem_alloc(cap); 
+    
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    /* 
+     * Layout Requirements:
+     * Z0: SB
+     * Z1: Epoch
+     * Z2: Cortex ... (Oops, we only have Z0 and Z1)
+     * Expected: HN4_ERR_ENOSPC
+     */
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/*
+ * TEST: ZNS Layout Stride (RAM Safe)
+ * FIX: Increased capacity to 512MB.
+ * WHY: The formatter requires ~10 Zones minimum (1 SB, 1 Epoch, 1 Cortex, 
+ *      1 Bitmap, 1 QMask, 1 Chronicle, 4 Horizon). 
+ *      256MB (8 Zones) was physically too small, causing ENOSPC.
+ *      512MB (16 Zones) allows the layout to fit comfortably.
+ */
+hn4_TEST(ZNS_Layout, StrictZoneStride_512MB) {
+    uint64_t cap = 512ULL * HN4_SZ_MB;
+    uint32_t zone_sz = 32 * 1024 * 1024; /* 32MB Zones */
+    uint32_t ss = 4096;
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Allocate backing store */
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    memset(mdev->mmio_base, 0, cap);
+    
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* Verify Block Size was forced to Zone Size */
+    ASSERT_EQ(zone_sz, sb->info.block_size);
+    
+    /* Calculate Sectors per Zone */
+    uint64_t sectors_per_zone = zone_sz / ss;
+    
+    /* 
+     * VERIFY STRIDE ALIGNMENT:
+     * Zone 0: Superblock (LBA 0)
+     * Zone 1: Epoch Ring (Start)
+     */
+    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
+    ASSERT_EQ(sectors_per_zone, epoch_lba);
+    
+    /* 
+     * Zone 2: Cortex Start
+     * The Epoch Ring reserves exactly 1 Block (Zone) in this configuration.
+     */
+    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
+    ASSERT_EQ(sectors_per_zone * 2, cortex_lba);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(KernelSafety, Wormhole_Zero_Capacity) {
+    uint64_t phys_cap = 1ULL * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(phys_cap, 4096);
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    params.mount_intent_flags = HN4_MNT_VIRTUAL;
+    /* User "forgot" to set override_capacity_bytes, so it is 0 */
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Should fail fast, not crash on divide-by-zero later */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(KernelSafety, ZNS_Virtual_Misalignment) {
+    uint64_t phys_cap = 4ULL * HN4_SZ_GB;
+    uint32_t zone_sz = 128 * 1024 * 1024; /* 128MB Zones */
+    
+    hn4_hal_device_t* dev = create_device_fixture(phys_cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    params.mount_intent_flags = HN4_MNT_VIRTUAL;
+    
+    /* 
+     * Virtual Request: 500MB.
+     * 500 % 128 != 0.
+     * This implies a partial zone at the end, which violates ZNS append logic.
+     */
+#ifdef HN4_USE_128BIT
+    params.override_capacity_bytes.lo = 500ULL * HN4_SZ_MB;
+#else
+    params.override_capacity_bytes = 500ULL * HN4_SZ_MB;
+#endif
+
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
+    
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(KernelSafety, Label_Stack_Smashing) {
+    uint64_t cap = 128ULL * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    /* 
+     * 40 chars. Exceeds 32-byte struct field.
+     * If the driver uses strcpy, it crashes.
+     * If it uses strncpy without forcing [31]=0, printing it leaks stack.
+     */
+    params.label = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"; 
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* Verify truncation and null termination */
+    ASSERT_EQ(0, sb->info.volume_label[31]);
+    ASSERT_EQ('A', sb->info.volume_label[30]);
+    
+    /* Manual check that we didn't write past the buffer */
+    /* This assumes the struct packing places format_profile next */
+    /* In a real kernel debugger we'd check canaries */
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(Integrity, Struct_Magic_Tail) {
+    /* 128MB Memory Backed Device */
+    uint64_t cap = 128ULL * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+    /* 
+     * Spec defines HN4_MAGIC_TAIL as 0xEFBEADDE.
+     * This field ensures the write didn't cut off the end of the struct.
+     */
+    ASSERT_EQ(HN4_MAGIC_TAIL, sb->info.magic_tail);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(Logic, Archive_Tape_Fallback) {
+  uint64_t cap = 20ULL * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* 
+     * Disable NVM to force "Tape/HDD" detection logic.
+     * WARNING: This disables the Mock HAL's memory write capability.
+     */
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags = 0; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_ARCHIVE;
+    
+    /* Assert Logic Success */
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    /* 
+     * Cannot assert sb->info.device_type_tag == HN4_DEV_TAPE
+     * because the mock HAL did not write to RAM.
+     */
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(AI_Profile, MinCap_Underflow) {
+    /* 
+     * AI Minimum is 1TB.
+     * We create a device that is 1TB - 4KB.
+     */
+    uint64_t cap = (1ULL * HN4_SZ_TB) - 4096;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_AI;
+    
+    /* Should fail with GEOMETRY error due to min_cap check */
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(AI_Profile, Macro_Block_Stride_Alignment) {
+    /* 2TB Drive (Valid for AI) */
+    /* 2TB Drive (Valid for AI) */
+    uint64_t cap = 2ULL * HN4_SZ_TB;
+    uint32_t ss = 4096;
+    
+    /* Create fixture WITHOUT backing RAM */
+    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* 
+     * CRITICAL: Do NOT set HN4_HW_NVM.
+     * Do NOT alloc mmio_base.
+     * This puts the Mock HAL into "No-Op" mode. 
+     * It simulates a successful write without touching memory.
+     */
+    mdev->mmio_base = NULL;
+    mdev->caps.hw_flags = 0; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_AI;
+    
+    /* 
+     * If the geometry calculation was wrong (e.g. 32-bit overflow), 
+     * this would return HN4_ERR_GEOMETRY or HN4_ERR_ENOSPC.
+     * Success means the math worked.
+     */
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    /* We cannot inspect the Superblock struct because we didn't write it to RAM. */
+    
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(EdgeCase, Root_Perms_Sanitization) {
+    uint64_t cap = 128 * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    /* Inject Valid Flags (ENCRYPTED) + Garbage High Bits (0xF0000000) */
+    params.root_perms_or = HN4_PERM_ENCRYPTED | 0xF0000000;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    /* Locate Root Anchor */
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+#ifdef HN4_USE_128BIT
+    uint64_t ctx_lba = sb->info.lba_cortex_start.lo;
+#else
+    uint64_t ctx_lba = sb->info.lba_cortex_start;
+#endif
+    hn4_anchor_t* root = (hn4_anchor_t*)(mdev->mmio_base + (ctx_lba * 4096));
+    
+    /* Verify Valid bit persisted */
+    ASSERT_TRUE(root->permissions & HN4_PERM_ENCRYPTED);
+    
+    /* Verify Garbage bits were stripped (Mask 0xF0000000 should be gone) */
+    /* Defined bits roughly occupy 0x0000007F */
+    ASSERT_EQ(0, (root->permissions & 0xF0000000));
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+hn4_TEST(Epoch, Ring_Topology_Reset) {
+    uint64_t cap = 128 * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+#ifdef HN4_USE_128BIT
+    uint64_t start_lba = sb->info.lba_epoch_start.lo;
+    uint64_t cortex_lba = sb->info.lba_cortex_start.lo;
+    uint64_t ring_ptr = sb->info.epoch_ring_block_idx.lo;
+#else
+    uint64_t start_lba = sb->info.lba_epoch_start;
+    uint64_t cortex_lba = sb->info.lba_cortex_start;
+    uint64_t ring_ptr = sb->info.epoch_ring_block_idx;
+#endif
+
+    /* 1. Pointer Reset: Head must point to Start */
+    ASSERT_EQ(start_lba, ring_ptr);
+    
+    /* 2. Size Check: Cortex must start exactly 1MB (256 blocks) after Epoch */
+    /* Note: HN4_EPOCH_RING_SIZE is 1MB. 1MB / 4KB = 256 Blocks. */
+    uint64_t ring_len_blocks = cortex_lba - start_lba;
+    
+    /* Allow for alignment padding, but must be at least 256 blocks */
+    ASSERT_TRUE(ring_len_blocks >= 256);
+    
+    /* Verify first Epoch Header (ID 1) is written at Start */
+    hn4_epoch_header_t* head = (hn4_epoch_header_t*)(mdev->mmio_base + (start_lba * 4096));
+    ASSERT_EQ(1, head->epoch_id);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
     destroy_device_fixture(dev);
 }
