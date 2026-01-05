@@ -5,7 +5,6 @@
 
 <!-- Badges -->
 [![Status](https://img.shields.io/badge/Status-Final_Testing-orange?style=for-the-badge)](https://github.com/)
-[![Release](https://img.shields.io/badge/Release-~5_Days-success?style=for-the-badge)](https://github.com/)
 ![Platform](https://img.shields.io/badge/platform-Bare%20Metal%20%7C%20Embedded%20%7C%20Kernel-orange.svg?style=for-the-badge)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=for-the-badge)](https://opensource.org/licenses/Apache-2.0)
 
@@ -13,7 +12,7 @@
 
 </div>
 
-##### Disclaimer: The code will be published tomorrow. The previous implementation was tightly coupled to my OS, so I’m currently rewriting it to be platform-agnostic. Documentation will also be released. The original build successfully runs 4K test files, and the initial source drop will be available tomorrow.
+##### Disclaimer: Files and docs will follow throughout the day. The code will be published now. The previous implementation was tightly coupled to my OS, so I’m currently rewriting it to be platform-agnostic. Documentations is coming soon. The original build successfully runs 4K test files, and the initial source drop will be available tomorrow.
 
 ---
 
