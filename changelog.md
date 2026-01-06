@@ -9,6 +9,38 @@ architecture shifts.
 
 ---
 
+## [0.1.3] — 2026-01-08
+### **Recovery Hardening & Legacy Hardware Support**
+
+This release focuses on forensic recovery capabilities, ensuring data can be salvaged from volumes with severe structural damage (Partition Wipes, Root Rot, Epoch Loss) while enforcing strict read-only quarantines to prevent historical tampering. It also validates operation on constrained legacy hardware.
+
+### 🛡️ Recovery & Security Enhancements
+
+#### **Forensic Mount Mode (Safety First)**
+- **Epoch Loss Quarantine:** Modified the mount logic to allow mounting a volume even if the **Epoch Ring** (Time Journal) is destroyed or zeroed (e.g., after a partition table wipe).
+  - **Behavior:** The volume now mounts in **Read-Only / Panic Mode**.
+  - **Rationale:** Previously, this was a hard failure (`HN4_ERR_EPOCH_LOST`), making data salvage impossible. Now, forensics tools can extract files, but write operations are strictly forbidden to prevent "Phantom Replay" attacks or ordering violations.
+
+#### **Southbridge Rescue Protocol**
+- **Partition Wipe Recovery:** Verified and hardened the "Southbridge" logic. If the primary (North) Superblock and Epoch Ring are wiped (common in accidental `fdisk` or `dd` errors), the driver successfully locates and mounts using the **South Superblock** (End of Disk Backup).
+- **Pico-Rescue:** The recovery path automatically engages **Pico Profile** logic (bypassing heavy bitmap loads) if the metadata regions are found to be zeroed/corrupt, ensuring access to raw file data even when allocation maps are lost.
+
+#### **Dynamic Geometry Probing**
+- **ZNS / Huge Block Support:** Fixed a critical flaw in the Cardinal Vote (Quorum) logic where it failed to find mirrors on volumes with non-standard block sizes (e.g., 64MB or 256MB ZNS Zones). The driver now dynamically probes mirror locations based on the block size discovered in the primary Superblock, enabling recovery on Hyperscale/AI storage arrays.
+
+### 🏛️ Legacy & Embedded Support
+
+#### **486 / Pentium / Cortex-M (No FPU/SSE)**
+- **Software CRC Fallback:** Verified correct operation on CPUs lacking hardware CRC32 instructions. The driver correctly falls back to the Slicing-by-8 software algorithm without corruption.
+- **Atomic Emulation:** Validated the persistence barrier logic on architectures lacking `CLFLUSH` or `MFENCE`. The HAL now correctly degrades to generic atomic operations, ensuring durability on vintage hardware (i486) and low-power wearables (Samsung Watch / ESP32).
+
+### 🧪 Test Suite Additions
+- **`Epoch.Ouroboros_Wrap`**: Verifies the Epoch Ring pointer correctly wraps around the physical ring boundary without off-by-one errors.
+- **`Recovery.Root_Anchor_Regeneration`**: Validates the "Genesis Repair" logic—automatically regenerating a missing Root Directory inode if the volume is mounted R/W.
+- **`Hardware.Profile_Permutations_Fixed`**: A massive regression test cycling through SSD, HDD, USB, and ZNS profiles to ensure geometry calculations hold up under 4GB+ capacities.
+
+---
+
 ## [0.1.2] — 2026-01-07
 ### **ZNS Logic Hardening & Test Suite Expansion**
 

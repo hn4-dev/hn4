@@ -246,6 +246,16 @@ static hn4_result_t _execute_cardinal_vote(
 #endif
 
     /* 1. North Probe */
+
+    hn4_result_t res_north = _read_sb_at_lba(dev, lba0, sector_sz, 0, probe_buf, &cand);
+    
+    /* Capture Poison/Wipe Error immediately */
+    if (res_north == HN4_ERR_WIPE_PENDING) {
+        hn4_hal_mem_free(probe_buf);
+        hn4_hal_mem_free(heal_buf);
+        return HN4_ERR_WIPE_PENDING;
+    }
+
     if (_read_sb_at_lba(dev, lba0, sector_sz, 0, probe_buf, &cand) == HN4_OK) {
         memcpy(&best_sb, &cand, sizeof(cand));
         found_valid = true;
@@ -1048,7 +1058,6 @@ static hn4_result_t _verify_and_heal_root_anchor(
  * ========================================================================= */
 
 HN4_SUCCESS(return == HN4_OK)
-HN4_SUCCESS(return == HN4_OK)
 hn4_result_t hn4_mount(
     HN4_IN hn4_hal_device_t* dev,
     HN4_IN const hn4_mount_params_t* params,
@@ -1122,6 +1131,19 @@ hn4_result_t hn4_mount(
             vol->taint_counter += 10;
             res = HN4_OK; 
             break;
+        case HN4_ERR_EPOCH_LOST:
+            HN4_LOG_CRIT("SECURITY: Epoch Ring Lost. Temporal ordering undefined.");
+            HN4_LOG_CRIT("Forcing READ-ONLY Quarantine to prevent write phantom/replay.");
+            
+            /* 1. Mark State as Unsafe */
+            vol->sb.info.state_flags |= HN4_VOL_PANIC;
+            
+            /* 2. FORCE Read-Only (Non-negotiable) */
+            force_ro = true;
+            
+            /* 3. Return OK to allow data extraction */
+            res = HN4_OK;
+            break;
         default: 
             goto cleanup; /* Fatal */
     }
@@ -1184,9 +1206,15 @@ hn4_result_t hn4_mount(
     /* --- PHASE 2: STATE ANALYSIS --- */
     uint32_t st = vol->sb.info.state_flags;
     
-    switch (st & (HN4_VOL_PANIC | HN4_VOL_TOXIC | HN4_VOL_LOCKED)) {
+    switch (st & (HN4_VOL_PANIC | HN4_VOL_TOXIC | HN4_VOL_LOCKED | HN4_VOL_PENDING_WIPE)) {
         case 0: break; /* OK */
+        case HN4_VOL_PENDING_WIPE:
+            HN4_LOG_CRIT("Mount Denied: Volume marked for Secure Wipe.");
+            res = HN4_ERR_WIPE_PENDING;
+            goto cleanup;
         case HN4_VOL_LOCKED: 
+        case (HN4_VOL_LOCKED | HN4_VOL_PENDING_WIPE):
+            /* LOCKED always wins */
             res = HN4_ERR_VOLUME_LOCKED; 
             goto cleanup;
         default: 
@@ -1194,18 +1222,60 @@ hn4_result_t hn4_mount(
             force_ro = true;
     }
 
-    if ((st & HN4_VOL_CLEAN) && (st & HN4_VOL_DIRTY)) {
-        HN4_LOG_ERR("Invalid Flags (Clean+Dirty). Forcing RO+Taint.");
-        force_ro = true;
-        vol->taint_counter++;
+   /* ----- HARD FAIL CHECKS (not part of state_flags) ----- */
+
+    if (vol->sb.info.incompat_flags != 0) {
+        HN4_LOG_CRIT("Mount Denied: Unknown Incompatible Features (0x%llx)",
+                     (unsigned long long)vol->sb.info.incompat_flags);
+        res = HN4_ERR_VERSION_INCOMPAT;
+        goto cleanup;
     }
 
+    if (!(st & HN4_VOL_METADATA_ZEROED)) {
+        HN4_LOG_CRIT("Mount Denied: Metadata not certified zeroed.");
+        res = HN4_ERR_UNINITIALIZED;
+        goto cleanup;
+    }
+
+    /* ----- FLAG POLICY SWITCH ----- */
+
+    switch (st & (HN4_VOL_CLEAN | HN4_VOL_DIRTY))
+    {
+        case 0:
+            /* Neither clean nor dirty? Weird but legal on fresh format */
+            break;
+        case HN4_VOL_CLEAN:
+            /* ok */
+            break;
+        case HN4_VOL_DIRTY:
+            /* ok — normal mounted volume */
+            break;
+        case (HN4_VOL_CLEAN | HN4_VOL_DIRTY):
+            HN4_LOG_ERR("Invalid Flags (Clean+Dirty). Forcing RO+Taint.");
+            force_ro = true;
+            vol->taint_counter++;
+            break;
+    }
+
+    /* ----- TAINT → RO ESCALATION ----- */
+
     if (vol->taint_counter >= HN4_TAINT_THRESHOLD_RO) {
-        HN4_LOG_WARN("Taint Threshold Exceeded (%u). Forcing RO.", vol->taint_counter);
+        HN4_LOG_WARN("Taint Threshold Exceeded (%u). Forcing RO.",
+                     vol->taint_counter);
+        force_ro = true;
+    }
+
+    /* ----- RO-COMPAT FEATURES → FORCE RO ONLY ----- */
+
+    if (vol->sb.info.ro_compat_flags != 0) {
+        HN4_LOG_WARN("Detected unknown RO-Compat features (0x%llx). "
+                     "Forcing Read-Only.",
+                     (unsigned long long)vol->sb.info.ro_compat_flags);
         force_ro = true;
     }
 
     /* --- PHASE 4: PERSISTENCE (DIRTY BIT) --- */
+
     if (!force_ro) {
         if (st & HN4_VOL_CLEAN) {
             vol->taint_counter /= 2;

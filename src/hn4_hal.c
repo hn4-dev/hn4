@@ -353,6 +353,10 @@ hn4_result_t hn4_hal_barrier(hn4_hal_device_t* dev) {
     return hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_addr_from_u64(0), NULL, 0);
 }
 
+/*
+ * FIXED: hn4_hal_sync_io_large
+ * Prevents Deadlock/OOM by enforcing alignment and advancing pointers.
+ */
 hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev, 
                                    uint8_t op, 
                                    hn4_addr_t start_lba, 
@@ -360,51 +364,85 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
                                    hn4_size_t len_bytes,
                                    uint32_t block_size)
 {
-    if (HN4_UNLIKELY(block_size == 0)) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(!dev || block_size == 0)) return HN4_ERR_INVALID_ARGUMENT;
 
-    const uint64_t MAX_CHUNK = 0x80000000ULL; 
-    
+    /* 
+     * SAFEGUARD #1: Alignment Check
+     * If the total length is not a multiple of the block size, we cannot 
+     * subdivide it safely without a read-modify-write buffer. 
+     * Fail fast to prevent infinite loops at the tail.
+     */
+#ifdef HN4_USE_128BIT
+    /* Assumption: block_size is power-of-2 or small enough that .lo check works for now */
+    if ((len_bytes.lo % block_size) != 0) return HN4_ERR_ALIGNMENT_FAIL;
+#else
+    if ((len_bytes % block_size) != 0) return HN4_ERR_ALIGNMENT_FAIL;
+#endif
+
+    /* SAFEGUARD #2: Max Chunk (2GB) must be aligned to block_size */
+    const uint64_t MAX_RAW_CAP = 0x80000000ULL; 
+    /* Round down to nearest block multiple */
+    const uint64_t SAFE_CHUNK_CAP = (MAX_RAW_CAP / block_size) * block_size;
+
     hn4_size_t remaining = len_bytes;
     hn4_addr_t current_lba = start_lba;
-    
-    /* 
-     * MATH SPLIT: Handle 128-bit Struct vs 64-bit Integer
-     */
-    while (1) {
-        /* 1. CHECK IF DONE (Remaining > 0 ?) */
-        #ifdef HN4_USE_128BIT
-            if (hn4_u128_cmp(remaining, hn4_u128_from_u64(0)) <= 0) break;
-        #else
-            if (remaining == 0) break;
-        #endif
+    uint8_t*   buf_cursor = (uint8_t*)buf; /* Fix: typed pointer for arithmetic */
 
+    while (1) {
+        /* 1. Check if done */
+#ifdef HN4_USE_128BIT
+        if (remaining.hi == 0 && remaining.lo == 0) break;
+#else
+        if (remaining == 0) break;
+#endif
+
+        /* 2. Calculate Chunk Size (Bytes) */
         uint64_t chunk_bytes;
 
-        /* 2. CALCULATE CHUNK SIZE */
-        #ifdef HN4_USE_128BIT
-            if (hn4_u128_cmp(remaining, hn4_u128_from_u64(MAX_CHUNK)) > 0) {
-                chunk_bytes = MAX_CHUNK;
-            } else {
-                chunk_bytes = remaining.lo;
-            }
-        #else
-            chunk_bytes = (remaining > MAX_CHUNK) ? MAX_CHUNK : (uint64_t)remaining;
-        #endif
-        
-        uint32_t chunk_blocks = chunk_bytes / block_size;
-        
-        /* 3. EXECUTE IO */
-        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, buf, chunk_blocks);
+#ifdef HN4_USE_128BIT
+        if (remaining.hi > 0 || remaining.lo > SAFE_CHUNK_CAP) {
+            chunk_bytes = SAFE_CHUNK_CAP;
+        } else {
+            chunk_bytes = remaining.lo;
+        }
+#else
+        chunk_bytes = (remaining > SAFE_CHUNK_CAP) ? SAFE_CHUNK_CAP : (uint64_t)remaining;
+#endif
+
+        /* 3. Convert to Blocks */
+        uint32_t chunk_blocks = (uint32_t)(chunk_bytes / block_size);
+
+        /* 
+         * SAFEGUARD #3: Zero-Block Trap
+         * If we have remaining data but calculated 0 blocks to transfer,
+         * we are in an infinite loop (Zeno's Paradox). ABORT.
+         */
+        if (chunk_blocks == 0) {
+            HN4_LOG_CRIT("HAL Deadlock Detected: Remaining bytes < Block Size");
+            return HN4_ERR_INTERNAL_FAULT;
+        }
+
+        /* 4. Execute IO */
+        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, (void*)buf_cursor, chunk_blocks);
         if (res != HN4_OK) return res;
 
-        /* 4. SUBTRACT PROGRESS */
-        #ifdef HN4_USE_128BIT
-            remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(chunk_bytes));
-        #else
-            remaining -= chunk_bytes;
-        #endif
+        /* 5. Advance State */
+        uint64_t bytes_transferred = (uint64_t)chunk_blocks * block_size;
         
+        /* Advance Buffer (Fixes Bug #2) */
+        buf_cursor += bytes_transferred;
+
+        /* Advance LBA */
         current_lba = hn4_addr_add(current_lba, chunk_blocks);
+
+        /* Decrement Remaining */
+#ifdef HN4_USE_128BIT
+        remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(bytes_transferred));
+#else
+        remaining -= bytes_transferred;
+#endif
+
+        /* Yield on large transfers to prevent watchdog timeouts */
         if (chunk_blocks > 1024) HN4_YIELD();
     }
 
