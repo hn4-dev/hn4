@@ -885,7 +885,103 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
     return HN4_OK;
 }
 
+/* 
+ * AI Topology Loader & Sanitizer 
+ * Enforces strict boundaries on hardware-reported affinity regions.
+ */
+static hn4_result_t _load_topology_resources(
+    HN4_IN hn4_hal_device_t* dev, 
+    HN4_INOUT hn4_volume_t* vol
+) {
+    /* Only valid for AI Profile */
+    if (vol->sb.info.format_profile != HN4_PROFILE_AI) return HN4_OK;
 
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    if (!caps) return HN4_ERR_INTERNAL_FAULT;
+
+    uint32_t ss = caps->logical_block_size;
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = (bs / ss > 0) ? (bs / ss) : 1;
+    
+    /* Calculate Volume Bounds in Sectors */
+    uint64_t cap_sectors;
+    if (!_addr_to_u64_checked(caps->total_capacity_bytes, &cap_sectors)) {
+        /* If capacity > 64-bit, clamp for validation safety or fail */
+        cap_sectors = UINT64_MAX; 
+    } else {
+        cap_sectors /= ss;
+    }
+
+    /* 
+     * STEP 1: Query Dimension
+     * Call HAL to get the number of affinity regions (PCIe/NUMA nodes).
+     */
+    uint32_t count = hn4_hal_get_topology_count(dev);
+    if (count == 0) return HN4_OK; /* No topology data available */
+
+    /* 
+     * STEP 2: Allocate Memory
+     * We use the size of the underlying struct defined in hn4_volume_t.
+     */
+    size_t map_size = count * sizeof(*vol->topo_map);
+    vol->topo_map = hn4_hal_mem_alloc(map_size);
+    if (!vol->topo_map) return HN4_ERR_NOMEM;
+
+    /* 
+     * STEP 3: Load Data
+     * Pull the raw topology table from the HAL/Firmware.
+     */
+    hn4_result_t res = hn4_hal_get_topology_data(dev, vol->topo_map, map_size);
+    if (res != HN4_OK) {
+        hn4_hal_mem_free(vol->topo_map);
+        vol->topo_map = NULL;
+        return res;
+    }
+    
+    vol->topo_count = count;
+
+    /* 
+     * STEP 4: Critical Validation Loop
+     * If any entry is invalid, we disable AI optimization globally to prevent 
+     * allocator crashes or data corruption.
+     */
+    for (uint32_t i = 0; i < vol->topo_count; i++) {
+        uint64_t start = vol->topo_map[i].lba_start;
+        uint64_t len   = vol->topo_map[i].lba_len;
+        
+        /* 4.1 Alignment Check (Must match Block Size) */
+        if ((start % spb != 0) || (len % spb != 0)) {
+            HN4_LOG_WARN("AI Topo Invalid: Region %u not block aligned (Start %llu Len %llu BS %u)", 
+                            i, (unsigned long long)start, (unsigned long long)len, bs);
+            goto Fail;
+        }
+
+        /* 4.2 Bounds Check (Must fit in Volume) */
+        if ((start + len) > cap_sectors || (start + len) < start) {
+            HN4_LOG_WARN("AI Topo Invalid: Region %u OOB (End %llu > Cap %llu)", 
+                            i, (unsigned long long)(start + len), (unsigned long long)cap_sectors);
+            goto Fail;
+        }
+
+        /* 4.3 Sanity Check (Empty Regions) */
+        if (len == 0) {
+            HN4_LOG_WARN("AI Topo Invalid: Region %u has zero length", i);
+            goto Fail;
+        }
+    }
+    
+    return HN4_OK;
+
+Fail:
+    /* Fallback: Free map and disable optimization. Volume mounts as Generic. */
+    if (vol->topo_map) {
+        hn4_hal_mem_free(vol->topo_map);
+        vol->topo_map = NULL;
+    }
+    vol->topo_count = 0;
+    HN4_LOG_WARN("AI Topology Map validation failed. Falling back to Standard Allocator.");
+    return HN4_OK; /* Non-fatal to mount, just degrades performance */
+}
 
 /* =========================================================================
  * ROOT ANCHOR VERIFICATION & HEALING (NEW LOGIC)
@@ -1289,7 +1385,7 @@ hn4_result_t hn4_mount(
     }
 
     /* --- PHASE 5: RESOURCE LOADING --- */
-    res = _load_bitmap_resources(dev, vol);
+   res = _load_bitmap_resources(dev, vol);
     if (res != HN4_OK) {
         if (!force_ro) {
             HN4_LOG_CRIT("Bitmap Load Failed in RW. Abort.");
@@ -1317,6 +1413,14 @@ hn4_result_t hn4_mount(
             res = HN4_OK; 
         }
     }
+
+    /* Load and Validate AI Topology Map (Path-Aware Striping) */
+    res = _load_topology_resources(dev, vol);
+    /* 
+     * Note: Topology load failure is handled internally by disabling the 
+     * optimization (returns OK), so we don't abort the mount.
+     */
+    (void)res; 
 
     res = _verify_and_heal_root_anchor(dev, vol, force_ro);
     if (res != HN4_OK) {

@@ -568,6 +568,15 @@ typedef struct {
     uint64_t*           l2_summary_bitmap; 
     bool                in_eviction_path; 
 
+    /* AI Topology Map (Path-Aware Striping) */
+    struct {
+        uint32_t gpu_id;         /* PCI ID of the GPU */
+        uint32_t affinity_weight;/* 0=SameSwitch, 1=SameNuma, 2=Remote */
+        uint64_t lba_start;      /* Start of NVMe Namespace physically close */
+        uint64_t lba_len;        /* Length of that Namespace */
+    } *topo_map;                 /* Array of mapped accelerators */
+    uint32_t topo_count;
+
     /* STEP 2: Add Telemetry & Rate Limiting */
     struct {
         _Atomic uint64_t heal_count;

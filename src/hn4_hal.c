@@ -495,3 +495,136 @@ void hn4_hal_spinlock_acquire(hn4_spinlock_t* l) {
 void hn4_hal_spinlock_release(hn4_spinlock_t* l) { 
     atomic_flag_clear_explicit(&l->flag, memory_order_release); 
 }
+
+/* =========================================================================
+ * 7. AI CONTEXT SIMULATION
+ * ========================================================================= */
+
+#define HN4_GPU_ID_NONE 0xFFFFFFFFU
+
+/*
+ * THREAD SAFETY CONTRACT:
+ * 1. Affinity is strictly Thread-Local. Changing it in Thread A does NOT affect Thread B.
+ * 2. If the compiler does not support TLS (_Thread_local), AI Affinity is DISABLED 
+ *    (Always returns HN4_GPU_ID_NONE) to prevent race conditions.
+ * 3. Atomic stores are used to prevent compiler reordering/caching issues.
+ */
+
+#if defined(__STDC_NO_THREADS__) && !defined(_MSC_VER)
+    /* 
+     * FIX #1 & #6: Unsafe Fallback Removed. 
+     * If we cannot guarantee thread isolation, we default to CPU mode.
+     */
+    #define HN4_NO_TLS_SUPPORT 1
+#elif defined(_MSC_VER)
+    #define HN4_TLS_ATTR __declspec(thread)
+#else
+    #define HN4_TLS_ATTR _Thread_local
+#endif
+
+#ifndef HN4_NO_TLS_SUPPORT
+    /* FIX #2: Atomic ensures consistency against interrupts/signals */
+    static HN4_TLS_ATTR _Atomic uint32_t _tl_gpu_context_id = HN4_GPU_ID_NONE;
+#endif
+
+/**
+ * hn4_hal_sim_set_gpu_context (TEST/SIMULATION ONLY)
+ * 
+ * Sets the affinity for the CURRENT thread.
+ * 
+ * SAFETY:
+ * - Returns immediately if TLS is unsupported.
+ * - Warns if setting HN4_GPU_ID_NONE (Use clear instead).
+ */
+void hn4_hal_sim_set_gpu_context(uint32_t gpu_id) {
+#ifdef HN4_NO_TLS_SUPPORT
+    (void)gpu_id;
+    /* Silently ignore setting affinity on unsafe platforms */
+    return; 
+#else
+    /* FIX #3: Semantic validation */
+    if (gpu_id == HN4_GPU_ID_NONE) {
+        /* User should use clear, but we handle it safely */
+        atomic_store_explicit(&_tl_gpu_context_id, HN4_GPU_ID_NONE, memory_order_relaxed);
+        return;
+    }
+    
+    atomic_store_explicit(&_tl_gpu_context_id, gpu_id, memory_order_release);
+#endif
+}
+
+/**
+ * hn4_hal_sim_clear_gpu_context
+ * 
+ * FIX #9: Resets the thread context to CPU mode. 
+ * MUST be called before thread returns to a pool.
+ */
+void hn4_hal_sim_clear_gpu_context(void) {
+#ifndef HN4_NO_TLS_SUPPORT
+    atomic_store_explicit(&_tl_gpu_context_id, HN4_GPU_ID_NONE, memory_order_release);
+#endif
+}
+
+/**
+ * hn4_hal_get_calling_gpu_id
+ *
+ * Retrieves the PCI ID or unique index of the Accelerator bound to this thread.
+ * Used by the Allocator to calculate Affinity Bias (Path-Aware Striping).
+ *
+ * CONTRACT:
+ * - Allocator MUST validate the returned ID against the loaded Topology Map.
+ * - Receiving an ID does not guarantee the device exists or is online.
+ * 
+ * @return HN4_GPU_ID_NONE (0xFFFFFFFF) if CPU context or TLS unavailable.
+ * @return GPU_ID if the thread is an accelerator worker.
+ */
+uint32_t hn4_hal_get_calling_gpu_id(void) {
+#ifdef HN4_NO_TLS_SUPPORT
+    return HN4_GPU_ID_NONE;
+#else
+    return atomic_load_explicit(&_tl_gpu_context_id, memory_order_acquire);
+#endif
+    
+    /* 
+     * FIX #7: PRODUCTION NOTE (Illustration Only)
+     * In a real kernel, this logic is highly specific to the OS/Vendor stack.
+     * Example (Linux/NVIDIA):
+     * 
+     *   struct task_struct *t = current;
+     *   // 1. Check if Kernel Thread (No GPU context possible)
+     *   if (t->flags & PF_KTHREAD) return HN4_GPU_ID_NONE;
+     *   
+     *   // 2. Query Vendor Driver (Hypothetical API)
+     *   // This usually requires GPL symbols or proprietary shims.
+     *   return nvidia_p2p_get_current_context_id();
+     */
+}
+
+/* =========================================================================
+ * 8. AI TOPOLOGY DISCOVERY (SIMULATION STUBS)
+ * ========================================================================= */
+
+uint32_t hn4_hal_get_topology_count(hn4_hal_device_t* dev) {
+    (void)dev;
+    /* 
+     * PRODUCTION NOTE: 
+     * Queries ACPI SRAT (System Resource Affinity Table) or PCIe Root Complex.
+     * 
+     * FIX #5: Returns 0 by default. Allocator logic handles 0 gracefully 
+     * by disabling AI optimization.
+     */
+    return 0; 
+}
+
+hn4_result_t hn4_hal_get_topology_data(hn4_hal_device_t* dev, void* buffer, size_t buf_len) {
+    (void)dev;
+    (void)buffer;
+    (void)buf_len;
+    
+    /* 
+     * PRODUCTION NOTE:
+     * Populates the buffer with {GPU_ID, Weight, LBA_Start, LBA_Len}.
+     * Ensure buffer is cast to correct structure defined in volume header.
+     */
+    return HN4_OK;
+}

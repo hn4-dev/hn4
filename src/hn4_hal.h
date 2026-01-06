@@ -205,6 +205,26 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
                                    hn4_size_t len_bytes,
                                    uint32_t block_size);
 
+/**
+ * hn4_hal_get_calling_gpu_id
+ * 
+ * Returns the PCI ID or unique index of the GPU/Accelerator context 
+ * triggering the current syscall. Returns 0xFFFFFFFF if CPU context.
+ */
+uint32_t hn4_hal_get_calling_gpu_id(void);
+
+/**
+ * hn4_hal_get_topology_count
+ * Returns the number of Affinity Regions (NUMA nodes / PCIe Switches) available.
+ */
+uint32_t hn4_hal_get_topology_count(hn4_hal_device_t* dev);
+
+/**
+ * hn4_hal_get_topology_data
+ * Fills the provided buffer with the Affinity Map (hn4_volume_t::topo_map format).
+ */
+hn4_result_t hn4_hal_get_topology_data(hn4_hal_device_t* dev, void* buffer, size_t buf_len);
+
 #ifdef __cplusplus
 }
 #endif

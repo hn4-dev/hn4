@@ -9,6 +9,139 @@ architecture shifts.
 
 ---
 
+
+##  [0.1.4] — 2026-01-09
+### Allocator Physics, Fragmentation Resilience & Consistency Guarantees
+
+This release focuses on the allocator as a mathematical system — not a best-effort heuristic. I introduced physics-style validation, fragmentation stress tests, concurrency fuzzing, and hard safety invariants so that allocation, free, and saturation behavior remain correct — even under pathological workloads.
+
+The outcome: allocator decisions are now formally test-verified rather than assumed.
+
+### 🧠 Allocator Physics & Scatter Logic
+
+HN4’s allocator deliberately fragments writes to exploit device-level parallelism. This release validates that scatter math remains correct across vector modes and collision-escape logic.
+
+Ballistic Trajectory Validation
+
+Verified the fundamental trajectory equation
+LBA = FluxStart + φ(G,V,N)
+including prime-vector scatter spacing and φ-alignment behavior.
+
+Ensures Block(N+1) is not adjacent unless intended.
+
+Gravity-Assist Teleportation (Collision Escape)
+
+Validated K≥4 vector mutation paths, ensuring the allocator “teleports” away from local density wells instead of clustering.
+
+Confirmed non-linear jumps and forward-progress guarantees.
+
+### 🧩 Fragmentation Resilience
+
+Real disks fragment. This release proves HN4 continues allocating safely and predictably when the world looks like Swiss cheese.
+
+Checkerboard Stress Simulation
+
+Create contiguous allocations
+
+Free every other block
+
+Re-allocate repeatedly
+
+Verify:
+
+no probe-loop starvation
+
+no double-alloc
+
+no free-leak
+
+logical vs physical allocation parity holds
+
+### 🌅 Event Horizon Saturation Logic
+
+Validated the 90% saturation safety rail:
+
+When usage ≥ threshold, ballistic allocation halts
+
+The volume transitions to Horizon Append Mode
+
+A sticky runtime flag prevents oscillation
+
+Writes become log-structured & predictable
+
+Metadata integrity takes precedence over throughput
+
+This ensures latency remains bounded under extreme pressure instead of degrading into chaos.
+
+### ⚙️ ZNS Sequential-Write Enforcement
+
+For HN4_DEV_ZNS devices:
+
+Vector stride (V) is now forced to 1
+
+Ensures sequential-only allocation semantics
+
+Prevents illegal randomization into Zoned Write Pointers
+
+This applies uniformly across allocator entry points.
+
+### 🔍 Consistency Invariants — Now Enforced
+
+We added a hard-audit invariant that must always hold:
+
+used_blocks == popcount(bitmap)
+
+Every fuzz run ends with a full bitmap scan to validate that logical counters and physical reality agree.
+
+If they ever diverge, tests fail.
+So far — they don’t.
+
+### 🔥 Concurrency Storm Fuzzing (Deterministic & Portable)
+
+New Monte-Carlo allocator fuzzing:
+
+16 concurrent threads
+
+Allocate / Free / Horizon-Append mixes
+
+Deterministic portable RNG
+
+Immediate correctness checks
+
+End-state bitmap reconciliation
+
+Panic + taint flag monitoring
+
+Goal: prove allocator correctness under real-world scheduler chaos — not just cleanroom conditions.
+
+Result:
+No double-alloc, no ghost frees, no panic triggers, no accounting drift.
+
+### 🧪 Cartography & Epoch Safety (Complementary Suite)
+
+Additional verification landed:
+
+Quality-Tier Enforcement
+
+Metadata rejects Bronze
+
+Gold accepted universally
+
+Toxic is globally banned
+
+Epoch Drift Detection
+
+Future-epoch toxicity
+
+rollback detection
+
+ring wrap correctness
+
+CRC validation paths
+
+These tests reinforce anti-rollback durability guarantees.
+
+
 ## [0.1.3] — 2026-01-08
 ### **Recovery Hardening & Legacy Hardware Support**
 
