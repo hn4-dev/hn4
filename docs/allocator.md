@@ -237,9 +237,41 @@ This ensures that at $P=0.95$, where $\epsilon \approx 36\%$, the system does no
 
 ---
 
-## 11. Performance Visualizations
+## 11. Profile-Specific Behaviors (AI, HDD, NVM)
 
-### 11.1 Tail-Latency vs. Occupancy
+### 11.1 AI / Tensor Tunnel (`HN4_PROFILE_AI`)
+The Void Engine treats AI workloads as a distinct class of physics problem. Neural network training involves massive, contiguous matrix ingestion where seek latency is fatal to GPU throughput.
+
+*   **Topology Awareness:** The allocator queries the HAL for the **PCIe Switch Topology**. It identifies which NVMe Namespaces are "closest" (least hops) to the requesting GPU.
+*   **Affinity Window:** Instead of probing the entire disk ($0 \dots MAX$), the allocator restricts its search window to the specific LBA range mapped to the local NUMA node.
+    *   *Result:* Data is physically placed on the flash chips closest to the tensor cores consuming it.
+*   **Quality Enforcement:** The allocator aggressively checks the **Q-Mask**. It rejects "Bronze" (slow/worn) blocks for AI data, guaranteeing consistent streaming bandwidth.
+
+### 11.2 Rotational Media (`HN4_DEV_HDD`)
+Hard Drives are mechanical. Random access is physically expensive (Seek Time). The Ballistic Allocator, which defaults to scattering data for entropy, must be restrained.
+
+*   **Inertial Damper:** The allocator forces the Orbit Vector $V$ to `1` (Sequential).
+*   **Orbit Lock:** It disables the K-Shell search ($k=1 \dots 12$). If the primary sequential slot is taken, it fails immediately to Horizon rather than "shotgunning" across the platter.
+*   **Warm Locality:** When allocating a new file, it biases the Gravity Center ($G$) to be within 32 blocks of the *previous* allocation. This keeps the drive head in the same cylinder, minimizing seek latency during write bursts.
+
+### 11.3 Zoned Namespaces (`HN4_DEV_ZNS`)
+ZNS drives forbid random writes within a zone. Writes must be strictly sequential relative to the Zone Write Pointer.
+
+*   **Zone Lock:** The allocator maps logical blocks directly to physical Zone Append commands.
+*   **Macro-Blocking:** The logical block size is elevated to match the Zone Size (e.g., 256MB). This turns the "Block Allocator" into a "Zone Allocator."
+*   **V-Force:** Like HDD, $V$ is forced to `1`. Random writes are mathematically impossible in this mode; the allocator acts as a log-structured append engine.
+
+### 11.4 NVM / Storage Class Memory (`HN4_HW_NVM`)
+Memory-speed storage requires the removal of all software bottlenecks.
+
+*   **Atomic Bypass:** The allocator detects if the CPU supports atomic bit-test-and-set instructions (BTS/BTR on x86). If so, it replaces the complex CAS loop with single-instruction hardware atomics.
+*   **Cache Line Alignment:** Allocations are padded to align with CPU cache lines (64 bytes), preventing "False Sharing" where two threads fight over the same cache line for different allocations.
+
+---
+
+## 12. Performance Visualizations
+
+### 12.1 Tail-Latency vs. Occupancy
 This graph demonstrates the $O(1)$ behavior of the Void Engine compared to a traditional $O(N)$ linear scanner (Ext4/FAT). Note the "Cliff" at 90% where Horizon Fallback caps latency.
 
 ```text
@@ -261,7 +293,7 @@ Latency (µs)
   0        25       50       75       90       100
 ```
 
-### 11.2 Cold Start Entropy Distribution
+### 12.2 Cold Start Entropy Distribution
 Visualizing the distribution of Genesis allocations ($K=0$) across the address space. Ideally uniform.
 `.` = Empty Block, `X` = Allocated Block.
 
@@ -271,7 +303,7 @@ LBA 0                                                LBA MAX
 [XXXXXX...................XXXXXX..................XXXXXX.] (Clustered - Bad)
 ```
 
-### 11.3 Anchor Fairness (K-Depth Histogram)
+### 12.3 Anchor Fairness (K-Depth Histogram)
 How many probes did it take to find a slot? Ideally, 99% of allocs succeed at $K=0$.
 
 ```text
@@ -286,7 +318,7 @@ Count
      0    1    2    3    4    8   12
 ```
 
-### 11.4 GC Overhead vs. Horizon Debt
+### 12.4 GC Overhead vs. Horizon Debt
 As the Horizon fills, Scavenger CPU usage increases linearly to pay down the fragmentation debt.
 
 ```text
@@ -304,7 +336,7 @@ CPU %
   0             50                    90            100
 ```
 
-### 11.5 Allocation Jitter (Thread Contention)
+### 12.5 Allocation Jitter (Thread Contention)
 Latency variation under high concurrency (64 threads).
 The NVM.2 path (Lock-Free) shows significantly less jitter than Standard (CAS Loop).
 
@@ -320,7 +352,7 @@ Time (ms)
   +--------------------------------------------------> Time
 ```
 
-### 11.6 Reorder-Crash Consistency Replay
+### 12.6 Reorder-Crash Consistency Replay
 Simulating power loss during allocation.
 `W` = Write, `B` = Bitmap Update.
 `SEQ_CST` ensures `B` is visible before `W` is acknowledged as safe.
@@ -341,7 +373,7 @@ Replay:    Bitmap shows 'Free'. Metadata points to block.
 Result:    DOUBLE ALLOC RISK (Fatal).
 ```
 
-### 11.7 Long-Term Fragmentation Map
+### 12.7 Long-Term Fragmentation Map
 Visualizing fragmentation after 1 year of random writes/deletes.
 White = Free, Black = Used.
 
@@ -355,7 +387,7 @@ White = Free, Black = Used.
 [█░█░██░░█░█░░███░░█░░██░█░░█░██░░█] (High Entropy / Uniform Wear)
 ```
 
-### 11.8 Worst-Case Multi-Anchor Collision
+### 12.8 Worst-Case Multi-Anchor Collision
 Scenario: 100 files all hashing to the same $G$ and $V$.
 Allocator behavior:
 
@@ -371,11 +403,11 @@ File 6: Gravity Assist (Teleport to Random G'')
 Result: Local cluster forms, then explodes outward. No infinite loop.
 ```
 
-## 12. Metric Drift & Safety Instrumentation
+## 13. Metric Drift & Safety Instrumentation
 
 In a non-journaled system like HN4, power failure during an allocation creates a small window of incoherency between the **Allocation Map** (Physical Truth) and the **Usage Counter** (Logical Stat). This is called "Metric Drift".
 
-### 12.1 The "Impossible Free" Detector
+### 13.1 The "Impossible Free" Detector
 The allocator instruments the Free Path to detect drift actively. If the kernel attempts to free a block, but the global usage counter is already 0 (or less than the free count), an **Underflow Event** has occurred.
 
 **Behavior:**
@@ -383,7 +415,7 @@ The allocator instruments the Free Path to detect drift actively. If the kernel 
 2.  **Tainting:** The volume is atomically marked `HN4_VOL_DIRTY`.
 3.  **Resolution:** The next mount (or background Scavenger) observes the Dirty flag and performs a **Convergent Bitmap Audit**, re-summing the population count from the physical bitmap to restore truth.
 
-### 12.2 Crash Consistency Replay
+### 13.2 Crash Consistency Replay
 The engine relies on strict ordering to ensure safety during drift:
 1.  **Claim First:** Bits are set in the bitmap (`SEQ_CST` fence).
 2.  **Write Second:** Data is written to media.
