@@ -248,6 +248,20 @@ static hn4_result_t _broadcast_superblock(
 #else
         phys_lba = targets[i] * (bs / ss);
 #endif
+
+        /* FIX: ZNS requires Zone Reset before Overwrite (Spec 13.2) */
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+            /* 
+             * For ZNS, Block Size = Zone Size.
+             * Resetting the "Sector LBA" resets the whole Zone/Block.
+             * Safety: We only do this because we have 3 other mirrors.
+             */
+            hn4_result_t rst = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, phys_lba, NULL, 0);
+            if (rst != HN4_OK) {
+                slot_ok[i] = false;
+                continue;
+            }
+        }
         
         hn4_result_t io_res = hn4_hal_sync_io(dev, HN4_IO_WRITE, phys_lba, io_buf, sectors_per_sb);
         

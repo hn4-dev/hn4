@@ -14,6 +14,7 @@
 
 #include "hn4.h"
 #include "hn4_hal.h"
+#include "hn4_annotations.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -41,6 +42,18 @@ extern "C" {
  * @return      HN4_OK on success, error code on failure.
  */
 hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superblock_t* sb);
+
+
+/**
+ * hn4_write_anchor_atomic
+ * Persists a modified Anchor to the Cortex.
+ * Handles Read-Modify-Write if anchor size < sector size.
+ */
+hn4_result_t hn4_write_anchor_atomic(
+    HN4_IN hn4_volume_t* vol, 
+    HN4_IN hn4_anchor_t* anchor
+);
+
 
 #ifdef __cplusplus
 }

@@ -15,9 +15,14 @@
 
 #include "hn4.h"
 #include "hn4_errors.h"
-#include <stdatomic.h>
 #include <stddef.h>
 #include <stdbool.h>
+
+#if defined(__STDC_NO_ATOMICS__)
+    #error "HN4 requires C11 Atomics support. Please enable C11 mode or link -latomic."
+#else
+    #include <stdatomic.h>
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -42,7 +47,7 @@ extern uint32_t _hn4_cpu_features;
 #define HN4_CPU_X86_CLWB        (1 << 2)
 
 #define HN4_CACHE_LINE_SIZE     64
-
+#define HN4_GPU_ID_NONE 0xFFFFFFFFU
 /**
  * hn4_hal_nvm_persist
  * Inline primitive to flush CPU caches to persistent domain.
@@ -84,11 +89,6 @@ void  hn4_hal_mem_free(void* ptr);
 /* =========================================================================
  * 4. CONCURRENCY PRIMITIVES
  * ========================================================================= */
-
-typedef struct {
-    atomic_flag flag;
-    uint32_t    pad; 
-} hn4_spinlock_t;
 
 void hn4_hal_spinlock_init(hn4_spinlock_t* lock);
 void hn4_hal_spinlock_acquire(hn4_spinlock_t* lock);

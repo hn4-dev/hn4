@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdatomic.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -201,6 +202,7 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_VOL_METADATA_ZEROED (1 << 13)
 #define HN4_VOL_NEEDS_UPGRADE   (1 << 14)
 #define HN4_VOL_PENDING_WIPE    (1 << 15)
+#define HN4_VOL_RUNTIME_SATURATED (1U << 30)
 
 /* Anchor Flags (anchor.data_class bits 8-63 overlay/expansion) */
 #define HN4_FLAG_VALID          (1ULL << 8)
@@ -209,7 +211,7 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_FLAG_DUBIOUS        (1ULL << 11)
 #define HN4_FLAG_PINNED         (1ULL << 12)
 #define HN4_FLAG_TTL            (1ULL << 13)
-#define HN4_FLAG_SHRED          (1ULL << 14)
+#define HN4_FLAG_SHRfED          (1ULL << 14)
 #define HN4_FLAG_SEQUENTIAL     (1ULL << 15) /* Force V=1 */
 #define HN4_FLAG_VECTOR         (1ULL << 16) /* Vector Embedding present */
 #define HN4_HINT_HORIZON        (1ULL << 17) /* Redirect D1->D1.5 */
@@ -217,6 +219,10 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_HINT_COMPRESSED     (1ULL << 19)
 #define HN4_HINT_ENCRYPTED      (1ULL << 20)
 #define HN4_HINT_BOOT           (1ULL << 21) /* Force allocation in Hot Zone (0-1GB) */
+#define HN4_FLAG_NANO           (1ULL << 22) /* Data resides in Cortex Slots */
+
+/* Add to On-Disk Structures */
+#define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" - Magic for data slots */
 
 /* Format Profiles (sb.format_profile) */
 #define HN4_PROFILE_GENERIC     0
@@ -513,12 +519,25 @@ typedef struct {
 typedef struct HN4_PACKED HN4_ALIGNED(16) {
     uint64_t    data;       /* 64 Bits of Map */
     uint8_t     ecc;        /* 8 Bits Hamming Code */
-    uint8_t     _pad[7];    /* Align to 16 bytes */
+    uint8_t     reserved;   /* Alignment */
+    uint16_t    ver_lo;     /* Version Counter Low */
+    uint32_t    ver_hi;     /* Version Counter High (48-bit Total) */
 } hn4_armored_word_t;
 
 /* Ghost Hints */
 #define HN4_GHOST_DISABLE_PREFETCH  (1 << 0)
 #define HN4_GHOST_FORCE_STREAM      (1 << 1)
+
+#if defined(__STDC_NO_ATOMICS__)
+    #error "HN4 requires C11 Atomics support. Please enable C11 mode or link -latomic."
+#else
+    #include <stdatomic.h>
+#endif
+
+typedef struct {
+    atomic_flag flag;
+    uint32_t    pad; 
+} hn4_spinlock_t;
 
 /* The Synapse Handle (Open File Context) */
 typedef struct {
@@ -563,10 +582,13 @@ typedef struct {
     _Atomic uint64_t    horizon_write_head;
     _Atomic uint32_t    taint_counter; /* Session error tracker */
     _Atomic uint64_t    toxic_blocks;  /* Tracks blocks lost to physical rot */
-
+    _Atomic uint64_t    last_alloc_g;  /* Tracks last successful Gravity Center for locality */
+ 
+    uint64_t            cortex_search_head;  /* Cursor for Nano-Allocator */
     /* Optimizations */
     uint64_t*           l2_summary_bitmap; 
     bool                in_eviction_path; 
+    hn4_spinlock_t      l2_lock;       /* Protects L2 bitmap for System volumes */
 
     /* AI Topology Map (Path-Aware Striping) */
     struct {
@@ -664,6 +686,25 @@ typedef struct {
     /* Wormhole: Spatial Overlay (Virtual Geometry) */
     hn4_size_t  override_capacity_bytes;
 } hn4_format_params_t;
+
+
+/* =========================================================================
+ * FIXED NANO STRUCTURES & CONSTANTS
+ * ========================================================================= */
+#define HN4_CORTEX_SLOT_SIZE    128
+#define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" */
+#define HN4_MAGIC_NANO_PENDING  0x504E4447   /* "PNDG" */
+#define HN4_NANO_FLAG_COMMITTED (1U << 0)
+
+typedef struct HN4_PACKED {
+    uint32_t magic;         /* 0x00 */
+    uint32_t header_crc;    /* 0x04 */
+    uint64_t payload_len;   /* 0x08 */
+    uint64_t version;       /* 0x10 (Fix 9) */
+    uint32_t data_crc;      /* 0x18 */
+    uint32_t flags;         /* 0x1C */
+    uint8_t  data[];        /* 0x20 */
+} hn4_nano_header_t;
 
 /* =========================================================================
  * 9. STATIC ASSERTIONS (BARE METAL SAFETY)

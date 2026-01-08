@@ -15,6 +15,8 @@
 extern "C" {
 #endif
 
+#define HN4_LBA_INVALID         UINT64_MAX
+
 /* =========================================================================
  * 1. MATHEMATICAL MACROS (Duplicated in format/mount/unmount)
  * ========================================================================= */

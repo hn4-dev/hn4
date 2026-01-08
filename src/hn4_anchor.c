@@ -18,6 +18,7 @@
 #include "hn4_crc.h"
 #include "hn4_endians.h"
 #include "hn4_errors.h"
+#include "hn4_annotations.h"
 #include <string.h>
 
 /* 
@@ -181,4 +182,108 @@ hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superbloc
 
     /* Mandatory Barrier: Ensure Root hits media before SB points to it */
     return hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_addr_from_u64(0), NULL, 0);
+}
+
+/**
+ * hn4_write_anchor_atomic
+ * 
+ * Persists an in-memory Anchor to the on-disk Cortex table.
+ * 
+ * SAFETY:
+ * 1. CHECKSUM: Updates the CRC32C before writing.
+ * 2. LOCATION: Uses the Cortex Hash equation to find the physical block.
+ * 3. ATOMICITY: Issues a single block write (4KB aligned).
+ * 
+ * @param vol     Volume context.
+ * @param anchor  The modified anchor to persist.
+ * @return        HN4_OK on success.
+ */
+hn4_result_t hn4_write_anchor_atomic(
+    HN4_IN hn4_volume_t* vol, 
+    HN4_IN hn4_anchor_t* anchor
+)
+{
+    if (!vol || !anchor) return HN4_ERR_INVALID_ARGUMENT;
+    if (vol->read_only) return HN4_ERR_ACCESS_DENIED;
+
+    /* 1. Recalculate Checksum (Strict Mode: No Inline Buffer in CRC for consistency with Genesis?) */
+    /* Spec 8.1: Checksum covers 0x00 to 0x60 (offset of checksum field). Inline buffer is excluded in some contexts? */
+    /* Correction: Genesis uses Split-CRC. We must match that. */
+    
+    anchor->checksum = 0;
+    
+    /* CRC Head (0x00 to 0x5F) */
+    uint32_t crc = hn4_crc32(0, anchor, offsetof(hn4_anchor_t, checksum));
+    
+    /* CRC Tail (Inline Buffer) - Chained */
+    crc = hn4_crc32(crc, anchor->inline_buffer, sizeof(anchor->inline_buffer));
+    
+    anchor->checksum = hn4_cpu_to_le32(crc);
+
+    /* 2. Locate Physical LBA (Cortex Mapping) */
+    /* LBA = Cortex_Start + (Hash(SeedID) % Cortex_Size_In_Anchors) */
+    
+    /* Calculate Cortex Geometry */
+    uint32_t bs = vol->vol_block_size;
+    uint32_t ss = 512; /* Assumed min sector for LBA calc if not available */
+    
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    if (caps) ss = caps->logical_block_size;
+
+    hn4_addr_t cortex_start = vol->sb.info.lba_cortex_start;
+    hn4_addr_t cortex_end   = vol->sb.info.lba_bitmap_start;
+    
+    uint64_t start_val = hn4_addr_to_u64(cortex_start);
+    uint64_t end_val   = hn4_addr_to_u64(cortex_end);
+    
+    /* Valid region check */
+    if (end_val <= start_val) return HN4_ERR_GEOMETRY;
+    
+    uint64_t region_bytes = (end_val - start_val) * ss;
+    uint64_t total_slots  = region_bytes / sizeof(hn4_anchor_t);
+    
+    if (total_slots == 0) return HN4_ERR_GEOMETRY;
+
+    /* Hash the ID */
+    hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
+    /* Simple XOR fold hash for reference implementation */
+    uint64_t hash = seed.lo ^ seed.hi; 
+    
+    uint64_t slot_idx = hash % total_slots;
+    
+    /* Calculate Physical Sector LBA */
+    uint64_t byte_offset = slot_idx * sizeof(hn4_anchor_t);
+    uint64_t sector_offset = byte_offset / ss;
+    uint64_t byte_in_sector = byte_offset % ss;
+    
+    hn4_addr_t write_lba = hn4_addr_add(cortex_start, sector_offset);
+
+    /* 
+     * 3. Read-Modify-Write (RMW) 
+     * Since anchors are 128 bytes but sectors are 512/4096 bytes, we cannot write just the anchor.
+     * We must read the sector, update the slot, and write back.
+     */
+    void* io_buf = hn4_hal_mem_alloc(ss);
+    if (!io_buf) return HN4_ERR_NOMEM;
+
+    /* Read */
+    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, io_buf, 1);
+    if (res != HN4_OK) {
+        hn4_hal_mem_free(io_buf);
+        return res;
+    }
+
+    /* Modify */
+    memcpy((uint8_t*)io_buf + byte_in_sector, anchor, sizeof(hn4_anchor_t));
+
+    /* Write */
+    res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, 1);
+    
+    /* Barrier to ensure metadata persistence */
+    if (res == HN4_OK) {
+        hn4_hal_barrier(vol->target_device);
+    }
+
+    hn4_hal_mem_free(io_buf);
+    return res;
 }

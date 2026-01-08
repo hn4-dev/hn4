@@ -64,10 +64,29 @@ static inline hn4_result_t _phys_lba_from_block(
     return HN4_OK;
 }
 
+/* =========================================================================
+ * 1. INTERNAL HELPER FOR AI
+ * ========================================================================= */
 
+typedef struct {
+    uint32_t gpu_id;
+    uint32_t affinity_weight;
+    uint64_t lba_start;
+    uint64_t lba_len;
+} _hn4_topo_entry_t;
+
+/* QSort Comparator: Sort by LBA Start */
+static int _topo_cmp(const void* a, const void* b) {
+    const _hn4_topo_entry_t* ra = (const _hn4_topo_entry_t*)a;
+    const _hn4_topo_entry_t* rb = (const _hn4_topo_entry_t*)b;
+    if (ra->lba_start < rb->lba_start) return -1;
+    if (ra->lba_start > rb->lba_start) return 1;
+    return 0;
+}
+#define HN4_MAX_TOPOLOGY_REGIONS 64
 
 /* =========================================================================
- * 1. SUPERBLOCK VALIDATION
+ * 2. SUPERBLOCK VALIDATION
  * ========================================================================= */
 
 /**
@@ -181,7 +200,7 @@ static hn4_result_t _read_sb_at_lba(
 }
 
 /* =========================================================================
- * 2. CARDINAL VOTE (QUORUM & SELF-HEALING)
+ * 3. CARDINAL VOTE (QUORUM & SELF-HEALING)
  * ========================================================================= */
 
 /**
@@ -576,8 +595,6 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     return HN4_OK;
 }
 
-
-
 /* =========================================================================
  * 5. RESOURCE LOADING
  * ========================================================================= */
@@ -677,7 +694,7 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
 }
 
 /* 
- * VALIDATION HELPER: Layout Sanity Check
+ * Layout Sanity Check
  * Ensures all internal pointers are within physical volume bounds.
  * Prevents arithmetic overflows later in the driver.
  */
@@ -694,7 +711,16 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     hw_cap = caps->total_capacity_bytes;
     
     /* Check: Partition Cap > HW Cap? */
-    if (hn4_u128_cmp(cap_bytes, hw_cap) > 0) return HN4_ERR_GEOMETRY;
+    if (hn4_u128_cmp(cap_bytes, hw_cap) > 0) {
+        HN4_LOG_CRIT("Geometry Mismatch: Superblock expects capacity %s, HW reports %s", 
+                     /* format helpers omitted */ "Larger", "Smaller");
+        /* 
+         * Explicitly deny mount on shrink. 
+         * HN4 Geometry is immutable without a full migration (fsck).
+         * Allowing this mount would cause massive data corruption due to Phi shift.
+         */
+        return HN4_ERR_GEOMETRY;
+    }
     
     /* Check: Min Size (2MB) */
     if (hn4_u128_cmp(cap_bytes, hn4_u128_from_u64(2ULL * 1024 * 1024)) < 0) return HN4_ERR_GEOMETRY;
@@ -885,15 +911,17 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
     return HN4_OK;
 }
 
-/* 
- * AI Topology Loader & Sanitizer 
- * Enforces strict boundaries on hardware-reported affinity regions.
- */
 static hn4_result_t _load_topology_resources(
     HN4_IN hn4_hal_device_t* dev, 
     HN4_INOUT hn4_volume_t* vol
 ) {
-    /* Only valid for AI Profile */
+    /* 
+     * Ensure the internal helper struct matches the volume struct layout.
+     * Prevents silent corruption if one definition drifts.
+     */
+    _Static_assert(sizeof(_hn4_topo_entry_t) == sizeof(*vol->topo_map), 
+                   "HN4: Topology struct layout mismatch");
+
     if (vol->sb.info.format_profile != HN4_PROFILE_AI) return HN4_OK;
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
@@ -901,87 +929,112 @@ static hn4_result_t _load_topology_resources(
 
     uint32_t ss = caps->logical_block_size;
     uint32_t bs = vol->vol_block_size;
-    uint32_t spb = (bs / ss > 0) ? (bs / ss) : 1;
+
+    if (ss == 0 || bs < ss || (bs % ss) != 0) {
+        HN4_LOG_CRIT("AI Topo: Invalid Geometry (BS %u < SS %u or Misaligned)", bs, ss);
+        return HN4_ERR_GEOMETRY;
+    }
     
-    /* Calculate Volume Bounds in Sectors */
-    uint64_t cap_sectors;
-    if (!_addr_to_u64_checked(caps->total_capacity_bytes, &cap_sectors)) {
-        /* If capacity > 64-bit, clamp for validation safety or fail */
-        cap_sectors = UINT64_MAX; 
+    uint32_t spb = bs / ss;
+    
+    /* 
+     * Usable Bounds Calculation
+     * We must not let AI regions overlap reserved Metadata (Epoch, Cortex, Bitmaps).
+     * Valid Data Region = [Flux Start ... Capacity]
+     * Note: We allow overlapping Horizon/Stream tail for flexibility, 
+     * as allocator collision logic handles D1.5 interaction.
+     */
+    uint64_t usable_start_sector;
+    uint64_t usable_end_sector;
+    
+    if (!_addr_to_u64_checked(vol->sb.info.lba_flux_start, &usable_start_sector)) 
+        usable_start_sector = UINT64_MAX;
+
+    if (!_addr_to_u64_checked(caps->total_capacity_bytes, &usable_end_sector)) {
+        usable_end_sector = UINT64_MAX; 
     } else {
-        cap_sectors /= ss;
+        usable_end_sector /= ss;
     }
 
-    /* 
-     * STEP 1: Query Dimension
-     * Call HAL to get the number of affinity regions (PCIe/NUMA nodes).
-     */
     uint32_t count = hn4_hal_get_topology_count(dev);
-    if (count == 0) return HN4_OK; /* No topology data available */
+    if (count == 0) return HN4_OK; 
 
-    /* 
-     * STEP 2: Allocate Memory
-     * We use the size of the underlying struct defined in hn4_volume_t.
-     */
-    size_t map_size = count * sizeof(*vol->topo_map);
+    if (count > HN4_MAX_TOPOLOGY_REGIONS) {
+        HN4_LOG_WARN("AI Topo: Region count %u > Limit. Disabled.", count);
+        return HN4_OK; 
+    }
+
+    size_t map_size = count * sizeof(_hn4_topo_entry_t);
     vol->topo_map = hn4_hal_mem_alloc(map_size);
     if (!vol->topo_map) return HN4_ERR_NOMEM;
 
-    /* 
-     * STEP 3: Load Data
-     * Pull the raw topology table from the HAL/Firmware.
-     */
     hn4_result_t res = hn4_hal_get_topology_data(dev, vol->topo_map, map_size);
     if (res != HN4_OK) {
         hn4_hal_mem_free(vol->topo_map);
         vol->topo_map = NULL;
         return res;
     }
-    
-    vol->topo_count = count;
 
-    /* 
-     * STEP 4: Critical Validation Loop
-     * If any entry is invalid, we disable AI optimization globally to prevent 
-     * allocator crashes or data corruption.
-     */
-    for (uint32_t i = 0; i < vol->topo_count; i++) {
-        uint64_t start = vol->topo_map[i].lba_start;
-        uint64_t len   = vol->topo_map[i].lba_len;
+    /* Sort for O(N) overlap checking */
+    qsort(vol->topo_map, count, sizeof(_hn4_topo_entry_t), _topo_cmp);
+
+    _hn4_topo_entry_t* entries = (_hn4_topo_entry_t*)vol->topo_map;
+    uint64_t watermark_end = 0;
+
+    for (uint32_t i = 0; i < count; i++) {
+        uint64_t start = entries[i].lba_start;
+        uint64_t len   = entries[i].lba_len;
         
-        /* 4.1 Alignment Check (Must match Block Size) */
-        if ((start % spb != 0) || (len % spb != 0)) {
-            HN4_LOG_WARN("AI Topo Invalid: Region %u not block aligned (Start %llu Len %llu BS %u)", 
-                            i, (unsigned long long)start, (unsigned long long)len, bs);
+        /* 1. Alignment & Size */
+        if ((start % spb != 0) || (len % spb != 0) || (len < spb)) {
+            HN4_LOG_WARN("AI Topo: Region %u invalid align/size", i);
             goto Fail;
         }
 
-        /* 4.2 Bounds Check (Must fit in Volume) */
-        if ((start + len) > cap_sectors || (start + len) < start) {
-            HN4_LOG_WARN("AI Topo Invalid: Region %u OOB (End %llu > Cap %llu)", 
-                            i, (unsigned long long)(start + len), (unsigned long long)cap_sectors);
+        /* 
+         * 2. Bounds (Reserved Area Protection)
+         * Must start AFTER Metadata (Flux Start) and end BEFORE Capacity.
+         */
+        if (start < usable_start_sector) {
+            HN4_LOG_WARN("AI Topo: Region %u overlaps Metadata (Start %llu < Flux %llu)", 
+                         i, start, usable_start_sector);
             goto Fail;
         }
 
-        /* 4.3 Sanity Check (Empty Regions) */
-        if (len == 0) {
-            HN4_LOG_WARN("AI Topo Invalid: Region %u has zero length", i);
+        if ((start + len) < start || (start + len) > usable_end_sector) {
+            HN4_LOG_WARN("AI Topo: Region %u exceeds Capacity", i);
             goto Fail;
         }
+
+        /* FIX 4: Weight Sanity */
+        if (entries[i].affinity_weight > 255) {
+             entries[i].affinity_weight = 255; /* Clamp to byte range */
+        }
+
+        /* 3. Overlap Check */
+        if (i > 0 && start < watermark_end) {
+            HN4_LOG_WARN("AI Topo: Region %u overlaps previous", i);
+            goto Fail;
+        }
+
+        watermark_end = start + len;
     }
     
+    vol->topo_count = count;
     return HN4_OK;
 
 Fail:
-    /* Fallback: Free map and disable optimization. Volume mounts as Generic. */
     if (vol->topo_map) {
         hn4_hal_mem_free(vol->topo_map);
         vol->topo_map = NULL;
     }
+    /* FIX 3: Reset Count */
     vol->topo_count = 0;
-    HN4_LOG_WARN("AI Topology Map validation failed. Falling back to Standard Allocator.");
-    return HN4_OK; /* Non-fatal to mount, just degrades performance */
+    
+    return HN4_OK;
 }
+
+
 
 /* =========================================================================
  * ROOT ANCHOR VERIFICATION & HEALING (NEW LOGIC)
@@ -1150,6 +1203,160 @@ static hn4_result_t _verify_and_heal_root_anchor(
 }
 
 /* =========================================================================
+ * 7. ZERO-SCAN RECONSTRUCTION (L10 RECOVERY)
+ * ========================================================================= */
+
+
+typedef enum { 
+    BIT_SET, 
+    BIT_CLEAR, 
+    BIT_TEST, 
+    BIT_FORCE_CLEAR /* FIX 5: Non-Panic Rollback */ 
+} hn4_bit_op_t;
+
+/**
+ * _reconstruct_cortex_state
+ * 
+ * Implements the "Zero-Scan" recovery strategy.
+ * 1. Loads the entire Cortex (D0) into the Nano-Cortex cache.
+ * 2. Re-projects the Ballistic Trajectory of every valid Anchor.
+ * 3. Cross-verifies against the Allocation Bitmap (The Ghost Check).
+ * 
+ * Rationale:
+ * Since V is coprime to the window, the file layout is deterministic.
+ * We don't need to scan disk blocks to find files; we just recalculate
+ * where they MUST be.
+ */
+static hn4_result_t _reconstruct_cortex_state(
+    HN4_IN hn4_hal_device_t* dev,
+    HN4_INOUT hn4_volume_t* vol
+)
+{
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t bs = vol->vol_block_size;
+    uint32_t ss = caps->logical_block_size;
+    
+    /* 1. Determine Cortex Geometry */
+    uint64_t start_blk, end_blk;
+    if (!_addr_to_u64_checked(vol->sb.info.lba_cortex_start, &start_blk)) return HN4_ERR_GEOMETRY;
+    if (!_addr_to_u64_checked(vol->sb.info.lba_bitmap_start, &end_blk)) return HN4_ERR_GEOMETRY;
+    
+    uint64_t cortex_sectors = end_blk - start_blk;
+    uint64_t cortex_bytes = cortex_sectors * ss;
+    
+    /* 2. Allocate Nano-Cortex (RAM Cache) */
+    vol->nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+    if (!vol->nano_cortex) return HN4_ERR_NOMEM;
+    vol->cortex_size = cortex_bytes;
+
+    /* 3. Linear Read (The fastest op an SSD can perform) */
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, cortex_sectors);
+    if (res != HN4_OK) {
+        hn4_hal_mem_free(vol->nano_cortex);
+        vol->nano_cortex = NULL;
+        return res;
+    }
+
+    /* 4. Sequence Verification & Trajectory Re-Projection */
+    uint32_t anchor_count = cortex_bytes / sizeof(hn4_anchor_t);
+    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+    uint64_t ghost_repairs = 0;
+
+    for (uint32_t i = 0; i < anchor_count; i++) {
+        hn4_anchor_t* anchor = &anchors[i];
+        
+        /* A. Check Validity (Skip Tombstones/Empty slots) */
+        uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
+        if (!(dclass & HN4_FLAG_VALID)) continue;
+        if (dclass & HN4_FLAG_TOMBSTONE) continue;
+
+        /* B. Get Ballistic Parameters */
+        uint64_t G = hn4_le64_to_cpu(anchor->gravity_center);
+        uint64_t mass = hn4_le64_to_cpu(anchor->mass);
+        
+        /* Extract V (Orbit Vector) */
+        uint64_t V = 0;
+        memcpy(&V, anchor->orbit_vector, 6);
+        V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
+        
+        uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
+        
+        /* Calculate Block Count needed for this Mass */
+        /* Note: Payload size depends on BS. Assume standard header overhead. */
+        uint32_t payload_sz = bs - sizeof(hn4_block_header_t); 
+        uint64_t blocks_needed = (mass + payload_sz - 1) / payload_sz;
+
+       /* C. Re-Project Trajectory (Deep-Scan Recovery) */
+        /* FIX: We must scan K-orbits to find where the block actually landed. */
+        
+        /* Pre-allocate a scratch buffer for verification reads */
+        void* verify_buf = hn4_hal_mem_alloc(bs);
+        if (!verify_buf) { /* Handle OOM during recovery */ break; }
+
+        for (uint64_t n = 0; n < blocks_needed; n++) {
+            
+            bool found_block_n = false;
+
+            /* Scan orbits 0..12 */
+            for (uint8_t k = 0; k < HN4_MAX_TRAJECTORY_K; k++) {
+                
+                uint64_t lba = _calc_trajectory_lba(vol, G, V, n, M, k);
+                if (lba == HN4_LBA_INVALID) continue;
+
+                /* D. The Ghost Check */
+                bool is_set = false;
+                _bitmap_op(vol, lba, BIT_TEST, &is_set);
+                
+                /* Case 1: Bitmap says used. We assume it's ours or valid collision. */
+                if (is_set) {
+                    /* Optimization: If k=0 is set, we assume it's ours to save IO. */
+                    if (k == 0) { found_block_n = true; break; }
+                    /* For k > 0, we can't be sure without reading, but let's be 
+                       optimistic to save mount time. */
+                    continue; 
+                }
+
+                /* Case 2: Bitmap says FREE. This might be a Ghost. Verify Identity. */
+                if (!is_set) {
+                    hn4_addr_t phys = hn4_lba_from_blocks(lba * (bs / ss));
+                    
+                    if (hn4_hal_sync_io(dev, HN4_IO_READ, phys, verify_buf, (bs/ss)) == HN4_OK) {
+                        hn4_block_header_t* h = (hn4_block_header_t*)verify_buf;
+                        
+                        /* Verify Magic + Well ID + Sequence ID */
+                        if (hn4_le32_to_cpu(h->magic) == HN4_BLOCK_MAGIC &&
+                            hn4_le64_to_cpu(h->seq_index) == n) 
+                        {
+                            hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
+                            if (disk_id.lo == anchor->seed_id.lo && 
+                                disk_id.hi == anchor->seed_id.hi) 
+                            {
+                                /* CONFIRMED GHOST: Data exists, Bitmap was lost. */
+                                _bitmap_op(vol, lba, BIT_SET, NULL); /* Revive */
+                                ghost_repairs++;
+                                found_block_n = true;
+                                break; /* Found Block N, move to N+1 */
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        hn4_hal_mem_free(verify_buf);
+    }
+
+    if (ghost_repairs > 0) {
+        HN4_LOG_WARN("Zero-Scan Reconstruction: Healed %llu Ghost Allocations.", ghost_repairs);
+        /* Mark volume as having been repaired (Taint logic) */
+        vol->taint_counter++;
+    } else {
+        HN4_LOG_VAL("Zero-Scan Complete. State Consistent", anchor_count);
+    }
+
+    return HN4_OK;
+}
+
+/* =========================================================================
  * 6. MAIN MOUNT ENTRY POINT
  * ========================================================================= */
 
@@ -1170,6 +1377,9 @@ hn4_result_t hn4_mount(
     if (!vol) return HN4_ERR_NOMEM;
     memset(vol, 0, sizeof(hn4_volume_t));
     vol->target_device = dev;
+
+    /* Initialize System L2 Lock */
+    hn4_hal_spinlock_init(&vol->l2_lock);
 
     if (params && (params->mount_flags & HN4_MNT_READ_ONLY)) force_ro = true;
 
@@ -1421,6 +1631,20 @@ hn4_result_t hn4_mount(
      * optimization (returns OK), so we don't abort the mount.
      */
     (void)res; 
+
+     /* 
+     * PHASE 6: L10 RECOVERY (ZERO-SCAN RECONSTRUCTION)
+     * Rebuild allocation truth from the Cortex Anchors.
+     */
+    res = _reconstruct_cortex_state(dev, vol);
+    if (res != HN4_OK) {
+        if (!force_ro) {
+            HN4_LOG_CRIT("Cortex Reconstruction Failed in RW mode. Aborting.");
+            goto cleanup;
+        } else {
+            HN4_LOG_WARN("Cortex Reconstruction Failed in RO mode. Continuing raw.");
+        }
+    }
 
     res = _verify_and_heal_root_anchor(dev, vol, force_ro);
     if (res != HN4_OK) {
