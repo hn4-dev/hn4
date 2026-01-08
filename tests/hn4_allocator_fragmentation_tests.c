@@ -106,7 +106,7 @@ hn4_TEST(FragmentationMath, BallisticScatterVerify) {
     
     /* 
      * 1. REPLICATE GEOMETRY (Phi Calculation) 
-     * We need to know the domain size to predict if V=17 is valid.
+     * We need to know the domain size to predict the stride behavior.
      */
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t bs = vol->vol_block_size;
@@ -128,14 +128,29 @@ hn4_TEST(FragmentationMath, BallisticScatterVerify) {
     uint64_t phi = (total_blocks - flux_aligned) / S;
 
     /* 
-     * 2. DETERMINE EXPECTED STRIDE
-     * Apply the same safety logic as hn4_allocator.c:
-     * If V and Phi share a factor, V is forced to 1.
+     * 2. DETERMINE EXPECTED STRIDE (UPDATED FOR RESONANCE DAMPENER)
+     * Replicate the logic from _calc_trajectory_lba (Fix 2).
+     * We must apply Anti-Even Degeneracy and the perturbation loop.
      */
-    uint64_t expected_V = V % phi;
-    if (expected_V == 0 || _test_gcd(expected_V, phi) != 1) {
-        expected_V = 1; /* Fallback active */
+    uint64_t effective_V = V | 1; /* Force Odd */
+    uint64_t term_v = effective_V % phi;
+
+    /* Dampener Loop Simulation */
+    if (term_v == 0 || _test_gcd(term_v, phi) != 1) {
+        uint64_t attempts = 0;
+        do {
+            term_v += 2;
+            if (term_v >= phi) term_v = 3; /* Wrap logic */
+            attempts++;
+        } while (_test_gcd(term_v, phi) != 1 && attempts < 32);
+
+        /* Ultimate fallback if dampener fails */
+        if (_test_gcd(term_v, phi) != 1) {
+            term_v = 1;
+        }
     }
+    
+    uint64_t expected_stride = term_v;
 
     /* Calculate LBA for Block 0 and Block 1 */
     uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, M, 0);
@@ -152,11 +167,10 @@ hn4_TEST(FragmentationMath, BallisticScatterVerify) {
         diff = (lba_1 + phi) - lba_0;
     }
     
-    ASSERT_EQ(expected_V, diff);
+    ASSERT_EQ(expected_stride, diff);
     
     /* Verify Flux Offset logic (Spec 6.1) */
-    /* lba_0 should be >= Flux Start (assumed 100) + G (1000) */
-    /* Using flux_aligned from calc above is more robust */
+    /* LBA should land relative to the aligned flux start plus the randomized G offset */
     ASSERT_TRUE(lba_0 >= (flux_aligned + (G % phi)));
 
     cleanup_frag_fixture(vol);
@@ -966,36 +980,48 @@ hn4_TEST(PhysicsFailure, Orbital_Resonance_Mitigation) {
     hn4_volume_t* vol = create_frag_fixture();
     
     /* Mock Geometry: Total=1000, Start=0 -> Phi=1000 */
-    /* Ensure Block Size matches capacity calc */
+    /* Ensure Block Size matches capacity calc so logic holds */
     vol->vol_block_size = 4096;
     vol->vol_capacity_bytes = 1000 * 4096;
     vol->sb.info.lba_flux_start = 0;
     
     /* 
      * Use V=5. 
-     * It is Odd, but divides 1000.
+     * It is Odd, but divides 1000 (Phi).
+     * GCD(5, 1000) = 5. This triggers the Resonance Dampener.
      */
     uint64_t G = 0;
     uint64_t V = 5;
     
-    /* Calculate LBA at N=0 and N=200 (The Old Cycle Point) */
+    /* Calculate LBA at N=0 and N=200 (The Old Cycle Point: 200*5 = 1000 = 0 mod 1000) */
     uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
     uint64_t lba_check = _calc_trajectory_lba(vol, G, V, 200, 0, 0);
     
     /* 
-     * OLD BEHAVIOR (Bug): (0 + 200*5) % 1000 = 0.
-     * NEW BEHAVIOR (Fix): V forced to 1. (0 + 200*1) % 1000 = 200.
-     * 
-     * Verify resonance was MITIGATED (No Wrap).
+     * VERIFY RESONANCE MITIGATION
+     * Old Bug: (0 + 200*5) % 1000 = 0 (Collision with lba_0).
+     * Fixed: V becomes 7. (0 + 200*7) % 1000 = 400 (No collision).
      */
     ASSERT_NEQ(lba_0, lba_check);
     
     /* 
-     * Verify the fallback stride is 1.
-     * If V was still 5, lba_1 would be 5. With fallback, it is 1.
+     * VERIFY DAMPENER LOGIC (Not Linear Fallback)
+     * The allocator loop tries V+2, V+4... until coprime.
+     * V=5 (Fail) -> V=7 (Coprime with 1000).
+     * 
+     * If V had fallen back to 1 (Linear), stride would be 1.
+     * Since it damped to 7, stride is 7.
      */
     uint64_t lba_1 = _calc_trajectory_lba(vol, G, V, 1, 0, 0);
-    ASSERT_EQ(1ULL, lba_1 - lba_0);
+    
+    /* 
+     * We calculate the delta. Note: lba_1 could wrap if G was high, 
+     * but here G=0, so lba_1 - lba_0 is the raw effective V.
+     */
+    uint64_t effective_stride = lba_1 - lba_0;
+
+    /* Assert we preserved ballistic properties (7) rather than collapsing to linear (1) */
+    ASSERT_EQ(7ULL, effective_stride); 
     
     cleanup_frag_fixture(vol);
 }

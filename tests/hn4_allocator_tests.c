@@ -435,38 +435,56 @@ hn4_TEST(MathVerification, BallisticScatter) {
     uint64_t phi = (total_blocks - flux_aligned) / S;
 
     /* 
-     * 2. Calculate Expected Stride based on new Safety Logic 
-     * If V and Phi share factors, the allocator forces V=1 to prevent aliasing.
+     * 2. Calculate Expected Stride based on Resonance Dampener Logic 
+     * We must apply Anti-Even Degeneracy and the perturbation loop
+     * used in _calc_trajectory_lba (Fix 2).
      */
-    uint64_t effective_V = V % phi;
-    if (effective_V == 0 || test_gcd(effective_V, phi) != 1) {
-        effective_V = 1; /* Fallback occurred */
-    }
+    uint64_t input_V = V | 1; /* Anti-Even Degeneracy */
+    uint64_t term_v = input_V % phi;
 
-    /* Calculate LBA for Block 0 and Block 1 */
+    /* Replicate the Dampener Loop */
+    if (term_v == 0 || test_gcd(term_v, phi) != 1) {
+        uint64_t attempts = 0;
+        do {
+            term_v += 2;
+            if (term_v >= phi) term_v = 3; /* Wrap logic from allocator */
+            attempts++;
+        } while (test_gcd(term_v, phi) != 1 && attempts < 32);
+
+        /* Ultimate fallback if dampener fails */
+        if (test_gcd(term_v, phi) != 1) term_v = 1;
+    }
+    
+    uint64_t expected_stride = term_v;
+
+    /* Calculate LBA for Block 0 and Block 1 using actual engine */
     uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, M, 0);
     uint64_t lba_1 = _calc_trajectory_lba(vol, G, V, 1, M, 0);
     
     /* 
      * 3. Verify Stride
-     * Handle modulo wrapping (though unlikely for N=1) 
-     * The difference should match our calculated effective_V.
+     * Handle modulo wrapping around the Phi domain.
+     * The physical difference (in fractal units) must match our calculated stride.
      */
-    uint64_t diff;
-    if (lba_1 >= lba_0) {
-        diff = lba_1 - lba_0;
+    uint64_t diff_fractal;
+    uint64_t blk_0_rel = (lba_0 - flux_aligned) / S;
+    uint64_t blk_1_rel = (lba_1 - flux_aligned) / S;
+
+    if (blk_1_rel >= blk_0_rel) {
+        diff_fractal = blk_1_rel - blk_0_rel;
     } else {
         /* Wrapped around Phi */
-        diff = (lba_1 + phi) - lba_0;
+        diff_fractal = (blk_1_rel + phi) - blk_0_rel;
     }
 
-    ASSERT_EQ(effective_V, diff);
+    ASSERT_EQ(expected_stride, diff_fractal);
     
     /* Verify Flux Offset is applied (LBA > Flux Start) */
-    ASSERT_TRUE(lba_0 >= 100);
+    ASSERT_TRUE(lba_0 >= flux_aligned);
 
     cleanup_alloc_fixture(vol);
 }
+
 /*
  * Test: Gravity Assist Shift (Fixed)
  * Strategy: Use N=1.

@@ -770,7 +770,7 @@ typedef enum {
     BIT_SET, 
     BIT_CLEAR, 
     BIT_TEST, 
-    BIT_FORCE_CLEAR /* FIX 5: Non-Panic Rollback */ 
+    BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
 } hn4_bit_op_t;
 
 HN4_HOT
@@ -1049,16 +1049,18 @@ hn4_result_t _bitmap_op(
 
     /* Side Effects (Counters, L2, Dirty Flags) */
     if (logic_change) {
+        /* GHOST BIT PROTECTION */
+        /* Mark Dirty BEFORE touching L2 to ensure flusher sees intent immediately */
+        if (op != BIT_FORCE_CLEAR && !vol->in_eviction_path) {
+            /* UPGRADE: Use seq_cst to prevent Store-Store reordering on ARM64 */
+            atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_seq_cst);
+        }
+
+        /* Update Usage Counters and L2 Bitmap (The "Commit") */
         _update_counters_and_l2(vol, block_idx, (op == BIT_SET));
         
-        /* 
-         * SILENT ROLLBACK: 
-         * FORCE_CLEAR is used during transaction aborts. 
-         * It does not dirty the volume state (clean cleanup).
-         */
-        if (op != BIT_FORCE_CLEAR && !vol->in_eviction_path) {
-            atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_release);
-        }
+        /* Ensure the L2 update is visible globally */
+        atomic_thread_fence(memory_order_seq_cst);
     }
     
     return heal_event_pending ? HN4_INFO_HEALED : HN4_OK;
@@ -1191,19 +1193,37 @@ _alloc_cortex_run(
         uint64_t byte_offset = current_slot * HN4_CORTEX_SLOT_SIZE;
         uint64_t sector_offset = byte_offset / sector_size;
         hn4_addr_t io_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, sector_offset);
-        
-        /* Reliability: Check Quality Mask for the underlying physical media */
-        if (_check_quality_compliance(vol, hn4_addr_to_u64(io_lba), HN4_ALLOC_METADATA) != HN4_OK) {
-            /* Underlying media is Toxic/Bronze; skip this batch */
+
+        /* 
+        * 1. Pre-calculate I/O Geometry 
+        * We need the total sector count to verify the Tail of the batch.
+        * Hoisted this calculation ABOVE the check to avoid variable duplication.
+        */
+
+        uint32_t read_bytes = (uint32_t)((batch_slots * HN4_CORTEX_SLOT_SIZE + sector_size - 1) & ~(sector_size - 1));
+        uint32_t sectors_to_read = read_bytes / sector_size;
+
+        /* 
+        * 2. Conservative Extent Check (Head + Tail)
+        * Verify that the entire physical range of this batch is safe.
+        */
+
+        uint64_t start_lba_val = hn4_addr_to_u64(io_lba);
+        uint64_t end_lba_val   = start_lba_val + sectors_to_read - 1;
+
+        if (_check_quality_compliance(vol, start_lba_val, HN4_ALLOC_METADATA) != HN4_OK ||
+        _check_quality_compliance(vol, end_lba_val,   HN4_ALLOC_METADATA) != HN4_OK) 
+
+        {
+            /* Underlying media is Toxic/Bronze at Head OR Tail; skip entire batch */
             current_slot += batch_slots;
             slots_checked += batch_slots;
             free_run_length = 0;
             continue;
+
         }
 
-        /* Align read to sector boundaries */
-        uint32_t read_bytes = (uint32_t)((batch_slots * HN4_CORTEX_SLOT_SIZE + sector_size - 1) & ~(sector_size - 1));
-        uint32_t sectors_to_read = read_bytes / sector_size;
+        /* 3. Execute I/O (Variables already defined) */
 
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, io_buffer, sectors_to_read) != HN4_OK) {
             status = HN4_ERR_HW_IO;
@@ -1673,11 +1693,24 @@ _calc_trajectory_lba(
      * Enforce Coprimality: If Phi has changed (Resize), V might share factors.
      * This destroys injectivity. If not coprime, fallback to Linear (V=1).
      */
-    uint64_t term_n = N % phi;
+   uint64_t term_n = N % phi;
     uint64_t term_v = effective_V % phi;
     
+    /* RESONANCE DAMPENER (Prevent Prime Collapse) */
     if (HN4_UNLIKELY(term_v == 0 || _gcd(term_v, phi) != 1)) {
-        term_v = 1; 
+        /* 
+         * Do not collapse to 1 immediately. Perturb V to find nearest coprime.
+         * This preserves ballistic distribution on resized volumes.
+         */
+        uint64_t attempts = 0;
+        do {
+            term_v += 2; /* Keep parity odd to avoid even-number resonance */
+            if (term_v >= phi) term_v = 3; /* Wrap around avoiding 0/1/2 */
+            attempts++;
+        } while (_gcd(term_v, phi) != 1 && attempts < 32);
+
+        /* Ultimate fallback only if dampener fails */
+        if (_gcd(term_v, phi) != 1) term_v = 1;
     }
     
     /* Calculate Offset: (N * V) % Phi */
@@ -2091,18 +2124,15 @@ hn4_alloc_genesis(
     
                             if (gcd_res == 1) break; 
 
-                            /* Case B: Math Stall (Policy Fix) */
+                            /* Case B: Math Stall */
 
                             if (gcd_res == 0) {
 
                                 /* Telemetry: Record that we hit a CPU stall / infinite loop protection */
-
                                 HN4_LOG_WARN("GCD Math Stall detected. Forcing Linear Trajectory (V=1).");
-
                                 V = 1;
 
                                 break; /* Abort retries immediately */
-
                             }
 
                             /* Case C: Factor Collision (Standard Retry) */
