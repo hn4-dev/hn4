@@ -661,8 +661,8 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
         return HN4_ERR_GEOMETRY;
     }
 
-    uint64_t cur_idx = start_idx;
-    size_t words_filled = 0;
+    /* FIX: Use Linear Addressing, NOT Block Translation */
+    hn4_addr_t cur_lba = vol->sb.info.lba_bitmap_start;
     
     uint64_t needed_bytes = (cap_blocks + 7) / 8;
     uint64_t needed_blocks_disk = (needed_bytes + bs - 1) / bs;
@@ -676,24 +676,14 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     }
 
     uint64_t blocks_left = needed_blocks_disk;
+    size_t words_filled = 0;
 
     while (blocks_left > 0) {
         uint32_t io_n = (blocks_left > chunk_blocks) ? chunk_blocks : (uint32_t)blocks_left;
-        
-        hn4_addr_t io_lba;
-        /* Use capacity check */
-        if (_phys_lba_from_block(cur_idx, bs, sect_sz, cap, &io_lba) != HN4_OK) {
-             /* Hard Fail. Do not trust partial bitmap state. */
-             hn4_hal_mem_free(io_buf);
-             hn4_hal_mem_free(vol->void_bitmap);
-             vol->void_bitmap = NULL;
-             return HN4_ERR_BITMAP_CORRUPT;
-        }
-
         uint32_t io_sectors = (io_n * bs) / sect_sz;
 
-        /* HAL Contract - we assume synchronous full read or error */
-        if (hn4_hal_sync_io(dev, HN4_IO_READ, io_lba, io_buf, io_sectors) != HN4_OK) {
+        /* Direct read from current linear LBA */
+        if (hn4_hal_sync_io(dev, HN4_IO_READ, cur_lba, io_buf, io_sectors) != HN4_OK) {
             hn4_hal_mem_free(io_buf);
             hn4_hal_mem_free(vol->void_bitmap);
             vol->void_bitmap = NULL;
@@ -718,7 +708,8 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
         }
 
         blocks_left -= io_n;
-        cur_idx += io_n;
+        /* Advance LBA linearly by sector count */
+        cur_lba = hn4_addr_add(cur_lba, io_sectors);
     }
 
     hn4_hal_mem_free(io_buf);
@@ -882,7 +873,6 @@ static hn4_result_t _check_block_toxicity(HN4_IN hn4_volume_t* vol, uint64_t blo
 
 static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOUT hn4_volume_t* vol)
 {
-    /* Q-Mask is optional for Pico profile */
     if (vol->sb.info.format_profile == HN4_PROFILE_PICO) return HN4_OK;
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
@@ -892,18 +882,16 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
     uint32_t bs = vol->vol_block_size;
     uint64_t cap = vol->vol_capacity_bytes;
 
-    /* 1. Calculate Size: 2 bits per block */
+    /* 1. Calculate Size */
     uint64_t total_data_blocks = cap / bs;
     uint64_t qmask_bytes_needed = (total_data_blocks * 2 + 7) / 8;
     
-    /* Align allocation to 8 bytes for 64-bit word access */
     size_t alloc_sz = HN4_ALIGN_UP(qmask_bytes_needed, 8);
     
     vol->quality_mask = hn4_hal_mem_alloc(alloc_sz);
     if (!vol->quality_mask) return HN4_ERR_NOMEM;
     vol->qmask_size = alloc_sz;
     
-    /* Initialize to SILVER (0xAA) - Default Safe State */
     memset(vol->quality_mask, 0xAA, alloc_sz);
 
     /* 2. Calculate Disk Extents */
@@ -913,7 +901,6 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
 
     uint64_t qmask_blocks_disk = (qmask_bytes_needed + bs - 1) / bs;
 
-    /* Safety Check: Overlap */
     if (start_blk + qmask_blocks_disk > end_blk) {
         hn4_hal_mem_free(vol->quality_mask);
         vol->quality_mask = NULL;
@@ -921,7 +908,7 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
     }
 
     /* 3. IO Buffer Setup */
-    uint32_t chunk_len = (2 * 1024 * 1024) / bs; /* 2MB chunks */
+    uint32_t chunk_len = (2 * 1024 * 1024) / bs;
     if (chunk_len == 0) chunk_len = 1;
     
     void* io_buf = hn4_hal_mem_alloc(chunk_len * bs);
@@ -931,48 +918,33 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
         return HN4_ERR_NOMEM;
     }
 
-    /* 4. Read Loop */
-    uint64_t cur_blk = start_blk;
+    /* 4. Read Loop (Fixed Linear Addressing) */
+    hn4_addr_t cur_lba = vol->sb.info.lba_qmask_start;
     uint64_t blocks_left = qmask_blocks_disk;
     size_t mem_offset = 0;
 
     while (blocks_left > 0) {
         uint32_t io_n = (blocks_left > chunk_len) ? chunk_len : (uint32_t)blocks_left;
-        
-        hn4_addr_t io_lba;
-        if (_phys_lba_from_block(cur_blk, bs, sect_sz, cap, &io_lba) == HN4_OK) {
-            
-            uint32_t io_sectors = (io_n * bs) / sect_sz;
+        uint32_t io_sectors = (io_n * bs) / sect_sz;
 
-            /* 
-             * Advance by what we actually copied/planned to copy.
-             * Compute step first, clamped to allocation bounds.
-             */
+        /* Read directly from linear LBA */
+        if (hn4_hal_sync_io(dev, HN4_IO_READ, cur_lba, io_buf, io_sectors) == HN4_OK) {
+            
             size_t bytes_step = io_n * bs;
             if (mem_offset + bytes_step > alloc_sz) {
                 bytes_step = alloc_sz - mem_offset;
             }
 
-            /* Tolerant Read: If fails, we keep 0xAA (Silver) pattern for this chunk */
-            if (hn4_hal_sync_io(dev, HN4_IO_READ, io_lba, io_buf, io_sectors) == HN4_OK) {
-                memcpy((uint8_t*)vol->quality_mask + mem_offset, io_buf, bytes_step);
-            } else {
-                HN4_LOG_WARN("Q-Mask Partial Read Fail @ Blk %llu. Defaulting to Silver.", cur_blk);
-            }
-            
-            mem_offset += bytes_step;
+            memcpy((uint8_t*)vol->quality_mask + mem_offset, io_buf, bytes_step);
         } else {
-            /* 
-             * Mapping failure implies Q-Mask gap. 
-             * We fallback to Silver (0xAA) via initialization, but we must
-             * signal that the map is incomplete/untrustworthy.
-             */
-            HN4_LOG_WARN("Q-Mask Mapping Fail @ Blk %llu. Mark DEGRADED.", (unsigned long long)cur_blk);
-            vol->sb.info.state_flags |= HN4_VOL_DEGRADED;
+            HN4_LOG_WARN("Q-Mask Partial Read Fail. Defaulting to Silver.");
         }
-
+        
+        mem_offset += io_n * bs;
         blocks_left -= io_n;
-        cur_blk += io_n;
+        
+        /* Advance LBA linearly */
+        cur_lba = hn4_addr_add(cur_lba, io_sectors);
     }
 
     hn4_hal_mem_free(io_buf);

@@ -4304,7 +4304,12 @@ hn4_TEST(L10_Reconstruction, Leak_Ignored) {
 
     uint32_t bs = sb.info.block_size;
     uint32_t spb = bs / 512;
-    uint64_t flux_start_blk = sb.info.lba_flux_start / spb;
+    uint64_t flux_start_blk;
+#ifdef HN4_USE_128BIT
+    flux_start_blk = sb.info.lba_flux_start.lo / spb;
+#else
+    flux_start_blk = sb.info.lba_flux_start / spb;
+#endif
     
     /* 1. Manually SET bit at Flux+200 */
     uint64_t target_blk = flux_start_blk + 200;
@@ -4318,12 +4323,15 @@ hn4_TEST(L10_Reconstruction, Leak_Ignored) {
     raw_map[word_idx] = hn4_cpu_to_le64(1ULL << bit_idx);
     
     /* 
-     * COMPATIBILITY FIX:
-     * The driver's _load_bitmap_resources erroneously treats lba_bitmap_start 
-     * as a BLOCK index and multiplies it by SPB. 
-     * We must match this multiplication to ensure the driver sees our bit.
+     * FIX: Driver now reads correctly from Linear LBA. 
+     * We write directly to lba_bitmap_start.
      */
-    uint64_t driver_read_lba = sb.info.lba_bitmap_start * spb;
+    uint64_t driver_read_lba;
+#ifdef HN4_USE_128BIT
+    driver_read_lba = sb.info.lba_bitmap_start.lo;
+#else
+    driver_read_lba = sb.info.lba_bitmap_start;
+#endif
     
     hn4_hal_sync_io(dev, HN4_IO_WRITE, driver_read_lba, buf, spb);
     free(buf);
@@ -4514,8 +4522,6 @@ hn4_TEST(ResourceLoad, VoidBitmap_Content_Verify) {
     raw_disk[0] = hn4_cpu_to_le64(pattern);
 
     /* 2. Determine Bitmap Location */
-    /* NOTE: Driver treats this SB field as a BLOCK index and multiplies by SPB.
-       We must match that calculation to inject data where the driver reads. */
     uint64_t bmp_ptr_val;
 #ifdef HN4_USE_128BIT
     bmp_ptr_val = sb.info.lba_bitmap_start.lo;
@@ -4523,8 +4529,8 @@ hn4_TEST(ResourceLoad, VoidBitmap_Content_Verify) {
     bmp_ptr_val = sb.info.lba_bitmap_start;
 #endif
 
-    uint32_t spb = bs / 512;
-    uint64_t actual_disk_lba = bmp_ptr_val * spb;
+    /* FIX: No multiplication. SB stores Sector LBA. */
+    uint64_t actual_disk_lba = bmp_ptr_val;
 
     /* 3. Inject Pattern to Disk */
     hn4_hal_sync_io(dev, HN4_IO_WRITE, actual_disk_lba, buf, bs/512);
@@ -4566,7 +4572,6 @@ hn4_TEST(ResourceLoad, QMask_Content_Verify) {
     raw_disk[0] = hn4_cpu_to_le64(pattern);
 
     /* 2. Determine Q-Mask Location */
-    /* NOTE: Matching driver's block-based addressing logic */
     uint64_t qm_ptr_val;
 #ifdef HN4_USE_128BIT
     qm_ptr_val = sb.info.lba_qmask_start.lo;
@@ -4574,8 +4579,8 @@ hn4_TEST(ResourceLoad, QMask_Content_Verify) {
     qm_ptr_val = sb.info.lba_qmask_start;
 #endif
 
-    uint32_t spb = bs / 512;
-    uint64_t actual_disk_lba = qm_ptr_val * spb;
+    /* FIX: No multiplication. SB stores Sector LBA. */
+    uint64_t actual_disk_lba = qm_ptr_val;
 
     /* 3. Inject Pattern to Disk */
     hn4_hal_sync_io(dev, HN4_IO_WRITE, actual_disk_lba, buf, bs/512);
@@ -4595,7 +4600,6 @@ hn4_TEST(ResourceLoad, QMask_Content_Verify) {
     hn4_unmount(vol);
     destroy_fixture(dev);
 }
-
 /* 
  * Test 204: Spec 16.5 - Incompatible Flag Rejection
  * Scenario: SB has `incompat_flags` set to 0x1 (Unknown Feature).
