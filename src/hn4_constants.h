@@ -83,6 +83,10 @@ extern "C" {
 /* Taint Threshold for forced Read-Only */
 #define HN4_TAINT_THRESHOLD_RO  20
 
+/* Define supported features mask (currently none for v1.0) */
+#define HN4_SUPPORTED_INCOMPAT_MASK  0x0000000000000000ULL 
+
+
 /* =========================================================================
  * 5. SHARED INLINE HELPERS
  * ========================================================================= */

@@ -1243,9 +1243,16 @@ static hn4_result_t _reconstruct_cortex_state(
     
     uint64_t cortex_sectors = end_blk - start_blk;
     uint64_t cortex_bytes = cortex_sectors * ss;
-    
-    /* 2. Allocate Nano-Cortex (RAM Cache) */
-    vol->nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+
+/* Safety: Cap Nano-Cortex to 256MB during mount to prevent OOM DOS */
+if (cortex_bytes > (256 * 1024 * 1024)) {
+    HN4_LOG_WARN("Cortex too large for RAM cache (%llu bytes). Disabling Zero-Scan.", 
+                 (unsigned long long)cortex_bytes);
+    /* Proceed without cache - Degraded but functional */
+    return HN4_OK; 
+}
+
+vol->nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
     if (!vol->nano_cortex) return HN4_ERR_NOMEM;
     vol->cortex_size = cortex_bytes;
 
@@ -1360,6 +1367,7 @@ static hn4_result_t _reconstruct_cortex_state(
  * 6. MAIN MOUNT ENTRY POINT
  * ========================================================================= */
 
+
 HN4_SUCCESS(return == HN4_OK)
 hn4_result_t hn4_mount(
     HN4_IN hn4_hal_device_t* dev,
@@ -1372,6 +1380,16 @@ hn4_result_t hn4_mount(
     bool force_ro = false;
 
     if (!dev || !out_vol) return HN4_ERR_INVALID_ARGUMENT;
+
+    /* Spec 10.5: Thermal Awareness */
+    uint32_t temp_c = hn4_hal_get_temperature(dev);
+    if (temp_c > 85) {
+        HN4_LOG_CRIT("Thermal Critical (%u C). Mount Denied.", temp_c);
+        return HN4_ERR_THERMAL_CRITICAL;
+    } else if (temp_c > 75) {
+        HN4_LOG_WARN("High Temperature (%u C). Forcing Read-Only.", temp_c);
+        force_ro = true;
+    }
 
     vol = hn4_hal_mem_alloc(sizeof(hn4_volume_t));
     if (!vol) return HN4_ERR_NOMEM;
@@ -1530,12 +1548,12 @@ hn4_result_t hn4_mount(
 
    /* ----- HARD FAIL CHECKS (not part of state_flags) ----- */
 
-    if (vol->sb.info.incompat_flags != 0) {
-        HN4_LOG_CRIT("Mount Denied: Unknown Incompatible Features (0x%llx)",
-                     (unsigned long long)vol->sb.info.incompat_flags);
-        res = HN4_ERR_VERSION_INCOMPAT;
-        goto cleanup;
-    }
+    if ((vol->sb.info.incompat_flags & ~HN4_SUPPORTED_INCOMPAT_MASK) != 0) {
+        HN4_LOG_CRIT("Mount Denied: Unsupported Incompatible Features (0x%llx)",
+                 (unsigned long long)(vol->sb.info.incompat_flags & ~HN4_SUPPORTED_INCOMPAT_MASK));
+                 res = HN4_ERR_VERSION_INCOMPAT;
+                 goto cleanup;
+                }
 
     if (!(st & HN4_VOL_METADATA_ZEROED)) {
         HN4_LOG_CRIT("Mount Denied: Metadata not certified zeroed.");
