@@ -172,7 +172,7 @@ static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev,
     /* Reset remainder */
     offset += zone_size_bytes;
     while (offset < aligned_cap) {
-        hn4_addr_t lba = hn4_lba_from_blocks(offset / logical_block_size);
+        hn4_addr_t lba = hn4_lba_from_sectors(offset / logical_block_size);
         
         res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, zone_sectors);
         if (res != HN4_OK) return res;
@@ -191,8 +191,13 @@ static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev,
 static hn4_result_t _sanitize_generic(hn4_hal_device_t* dev, hn4_size_t capacity_bytes, uint32_t bs) {
     HN4_LOG_VAL("Generic TRIM/Discard. Bytes", capacity_bytes);
     /* Issue 9: Discard uses BLOCK COUNT */
+    if (capacity_bytes % bs != 0) {
+    /* Align down to avoid discarding beyond capacity */
+    capacity_bytes = HN4_ALIGN_DOWN(capacity_bytes, bs);
+    }
+    /* hn4_hal_sync_io_large expects len_bytes and divides by bs internally */
     return hn4_hal_sync_io_large(dev, HN4_IO_DISCARD, hn4_addr_from_u64(0), NULL, capacity_bytes, bs);
-}
+    }
 
 /**
  * _survey_silicon_cartography
@@ -222,13 +227,31 @@ static hn4_result_t _survey_silicon_cartography(
     /* 128-bit Subtraction */
     sector_delta = hn4_u128_sub(end_lba, start_lba);
     
-    /* Approximation for loop limit (QMask is rarely > 18EB itself, even if location is) */
-    /* If the region size itself > 64 bits, we clamp to max u64 for the loop counter 
-       or we implement a 128-bit loop. For QMask, size is small relative to disk. */
-    if (sector_delta.hi > 0) return HN4_ERR_GEOMETRY; // QMask size > 18EB is insane
+    if (sector_delta.hi > 0) return HN4_ERR_GEOMETRY; 
     
-    total_bytes.lo = sector_delta.lo * ss;
-    total_bytes.hi = 0; // Assuming QMask size fits in 64-bit
+    /* Overflow Guard / Full 128-bit Mult */
+#if defined(__SIZEOF_INT128__)
+    unsigned __int128 tmp_sz = (unsigned __int128)sector_delta.lo * ss;
+    total_bytes.lo = (uint64_t)tmp_sz;
+    total_bytes.hi = (uint64_t)(tmp_sz >> 64);
+#else
+    /* Manual 64x32 -> 96 bit multiply logic */
+    if (ss > 0 && sector_delta.lo > (UINT64_MAX / ss)) {
+        uint64_t a = sector_delta.lo;
+        uint64_t b = ss;
+        uint64_t al = a & 0xFFFFFFFF;
+        uint64_t ah = a >> 32;
+        
+        uint64_t p0 = al * b;
+        uint64_t p1 = ah * b;
+        
+        total_bytes.lo = p0 + (p1 << 32);
+        total_bytes.hi = (p1 >> 32) + ((total_bytes.lo < p0) ? 1 : 0);
+    } else {
+        total_bytes.lo = sector_delta.lo * ss;
+        total_bytes.hi = 0;
+    }
+#endif
 #else
     if (end_lba < start_lba) return HN4_ERR_GEOMETRY;
     sector_delta = end_lba - start_lba;
@@ -460,14 +483,12 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     }
 
     /* Check Max Cap (Handle Unlimited for AI) */
-    if (spec->max_cap != HN4_CAP_UNLIMITED) {
-        if (capacity_bytes > spec->max_cap) {
-            HN4_LOG_VAL("Capacity too large for profile", capacity_bytes);
-            return HN4_ERR_GEOMETRY;
-        }
+    if (capacity_bytes < spec->min_cap) {
+        HN4_LOG_VAL("Capacity too large for profile", capacity_bytes);
+        return HN4_ERR_GEOMETRY;
     }
 
-    if (capacity_bytes < spec->min_cap || capacity_bytes > spec->max_cap) {
+    if (spec->max_cap != HN4_CAP_UNLIMITED && capacity_bytes > spec->max_cap) {
         HN4_LOG_VAL("Capacity out of bounds for profile", capacity_bytes);
         return HN4_ERR_GEOMETRY;
     }
@@ -581,7 +602,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     /* Horizon (D1.5) / Stream (D2) & Chronicle */
     uint64_t tail_rsv = (bs > HN4_SB_SIZE) ? bs : HN4_SB_SIZE;
     
-    /* [MANUAL FIX] Reserve 10MB for Chronicle Audit Log */
+    /* Reserve 10MB for Chronicle Audit Log */
     uint64_t chronicle_sz = HN4_ALIGN_UP(10 * HN4_SZ_MB, bs);
 
     /* Explicit Lower Bound Check before subtraction */
@@ -692,7 +713,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     /* --- STEP 2: SANITIZE (THE NUKE) --- */
     uint64_t total_cap = hn4_addr_to_u64(sb_cpu.info.total_capacity); 
 
-    /* FIX #4: Pre-flight ZNS Alignment Check */
+    /* Pre-flight ZNS Alignment Check */
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
         /* Ensure the calculated capacity is strictly zone-aligned before we start wiping */
         if (total_cap % caps->zone_size_bytes != 0) {
@@ -853,14 +874,19 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
      * REGION_BYTES must calculate using SECTOR SIZE because start/end are Sector LBAs.
      * Difference in sectors * SectorSize = Bytes.
      */
-     #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
+    #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
         uint64_t s_val = hn4_addr_to_u64(start_lba); \
         uint64_t e_val = hn4_addr_to_u64(end_lba); \
         if (e_val < s_val) { \
              HN4_LOG_CRIT("Layout Regression: Region End < Start (%llu < %llu)", e_val, s_val); \
              return HN4_ERR_GEOMETRY; \
         } \
-        uint64_t len = (e_val - s_val) * ss; \
+        uint64_t count = e_val - s_val; \
+        if (count > (UINT64_MAX / ss)) { \
+             HN4_LOG_CRIT("Zero Region Overflow: %llu sectors", count); \
+             return HN4_ERR_GEOMETRY; \
+        } \
+        uint64_t len = count * ss; \
         if ((res = _zero_region_explicit(dev, start_lba, len, bs)) != HN4_OK) return res; \
     } while(0)
 
@@ -923,7 +949,8 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     uint64_t cap_bytes = hn4_addr_to_u64(sb_cpu.info.total_capacity);
     uint64_t east_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 33, bs);
     uint64_t west_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 66, bs);
-    uint64_t south_bytes = HN4_ALIGN_DOWN(cap_bytes - write_sz, bs);
+    uint64_t sb_reservation_sz = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
+    uint64_t south_bytes = HN4_ALIGN_DOWN(cap_bytes - sb_reservation_sz, bs);
 
     /* Enforce Sector Alignment Invariant for all mirrors */
     if ((east_bytes % ss != 0) || (west_bytes % ss != 0)) {

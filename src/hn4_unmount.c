@@ -103,8 +103,8 @@ static hn4_result_t _broadcast_superblock(
     if (active_ring_ptr_blk >= total_blocks) return HN4_ERR_GEOMETRY;
 #endif
 
-    uint32_t sectors_per_sb = HN4_SB_SIZE / ss;
-    if (sectors_per_sb == 0) sectors_per_sb = 1;
+    /* Use ceiling division to ensure correct coverage if HN4_SB_SIZE < ss */
+    uint32_t sectors_per_sb = (HN4_SB_SIZE + ss - 1) / ss;
 
     uint32_t buf_sz = HN4_ALIGN_UP(HN4_SB_SIZE, ss);
     void* io_buf = hn4_hal_mem_alloc(buf_sz);
@@ -249,7 +249,7 @@ static hn4_result_t _broadcast_superblock(
         phys_lba = targets[i] * (bs / ss);
 #endif
 
-        /* FIX: ZNS requires Zone Reset before Overwrite (Spec 13.2) */
+        /* ZNS requires Zone Reset before Overwrite (Spec 13.2) */
         if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
             /* 
              * For ZNS, Block Size = Zone Size.
@@ -385,8 +385,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                             persistence_ok = false;
                             final_res = HN4_ERR_HW_IO;
                         }
-                        
-                        /* FIX 1: Simplified Math. 'sectors' is already the count. */
+
                         start_lba_val += sectors;
                     }
                 }

@@ -99,7 +99,8 @@ static inline hn4_result_t _epoch_phys_map(
     hn4_u128_t cap_blocks = vol_cap_bytes; 
     (void)vol_cap_bytes; // Bypass strict check for this snippet or implement u128 div.
 #else
-    uint64_t total_blocks = vol_cap_bytes / block_size;
+    /* Use ceiling division to allow access to partial blocks at volume end */
+    uint64_t total_blocks = (vol_cap_bytes + block_size - 1) / block_size;
     if (block_idx >= total_blocks) return HN4_ERR_GEOMETRY;
 #endif
 

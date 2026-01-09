@@ -3602,3 +3602,65 @@ hn4_TEST(Epoch, Ring_Topology_Reset) {
     hn4_hal_mem_free(mdev->mmio_base);
     destroy_device_fixture(dev);
 }
+
+/* 
+ * TEST 1: Safety - Zero Region Overflow Guard
+ * RATIONALE: Verifies that the `SAFE_ZERO_REGION` macro and `_zero_region_explicit`
+ *            correctly handle massive region sizes without integer wrapping.
+ * SCENARIO: Virtual Wormhole with UINT64_MAX capacity (18.4 EB).
+ *           Even with 64-bit addressing, the metadata regions (Bitmap/QMask)
+ *           should calculate correctly or fail gracefully (NOMEM), not crash/wrap.
+ */
+hn4_TEST(FixVerify, Safety_MaxCap_Overflow_Guard) {
+    /* 18 Exabytes (Aligned to 4KB) */
+    uint64_t cap = 18ULL * HN4_SZ_EB; 
+    
+    hn4_hal_device_t* dev = create_device_fixture(1 * HN4_SZ_GB, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    /* Wormhole requires Strict Flush */
+    mdev->caps.hw_flags |= HN4_HW_STRICT_FLUSH;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_AI; /* Generic is capped at 18EB, AI is unlimited */
+    params.mount_intent_flags = HN4_MNT_VIRTUAL | HN4_MNT_WORMHOLE;
+    
+#ifdef HN4_USE_128BIT
+    params.override_capacity_bytes.lo = cap;
+    params.override_capacity_bytes.hi = 0;
+#else
+    params.override_capacity_bytes = cap;
+#endif
+
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* 
+     * Should succeed. The geometry math handles large numbers, 
+     * and IO is streamed (no massive malloc).
+     */
+    ASSERT_EQ(HN4_OK, res);
+    
+    destroy_device_fixture(dev);
+}
+
+
+/* 
+ * TEST 2: Fix Verify - Profile Min Capacity Message Path
+ * RATIONALE: Confirms the bounds check `if (capacity_bytes < spec->min_cap)` 
+ *            works as intended for the AI profile (Min 1TB).
+ */
+hn4_TEST(FixVerify, ProfileBounds_AI_Underflow) {
+    /* 500GB is less than AI Profile minimum (1TB) */
+    uint64_t cap = 500ULL * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_AI;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Must return GEOMETRY error due to being too small */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+    
+    destroy_device_fixture(dev);
+}

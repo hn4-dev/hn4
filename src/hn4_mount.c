@@ -47,13 +47,17 @@ static inline hn4_result_t _phys_lba_from_block(
     
     /* 
      * Mathematical Overflow Prevention
+     * Use Ceiling Division to allow access to the final partial block.
+     * Otherwise, valid data in the last <BS bytes of the disk is inaccessible.
      */
-    if (block_idx >= (total_capacity_bytes / block_size)) {
+    uint64_t raw_lba = block_idx * sectors_per_block;
+    uint64_t max_lba = total_capacity_bytes / sector_size;
+
+    if (raw_lba + sectors_per_block > max_lba) {
+        /* Allow partial tail only if reading partial is handled by caller (it isn't here).
+           Strict Check: Must fit. */
         return HN4_ERR_GEOMETRY;
     }
-
-    /* Safe to multiply now */
-    uint64_t raw_lba = block_idx * sectors_per_block;
 
 #ifdef HN4_USE_128BIT
     out_addr->lo = raw_lba;
@@ -63,6 +67,7 @@ static inline hn4_result_t _phys_lba_from_block(
 #endif
     return HN4_OK;
 }
+
 
 /* =========================================================================
  * 1. INTERNAL HELPER FOR AI
@@ -255,7 +260,7 @@ static hn4_result_t _execute_cardinal_vote(
     uint64_t max_ts = 0;
     hn4_result_t final_res = HN4_ERR_BAD_SUPERBLOCK;
     
-    uint32_t probe_sizes[] = { sector_sz, 4096, 16384, 65536, 0, 0 };
+    uint32_t probe_sizes[] = { sector_sz, 4096, 16384, 65536, 0 };
     hn4_superblock_t cand;
 
 #ifdef HN4_USE_128BIT
@@ -366,7 +371,10 @@ static hn4_result_t _execute_cardinal_vote(
                 if (!found_valid) {
                     newer = true;
                 } else if (cand.info.copy_generation > max_gen) {
-                    if (cand.info.last_mount_time < (max_ts - HN4_REPLAY_WINDOW_NS)) {
+                    /* Underflow Protection */
+                    if ((max_ts > HN4_REPLAY_WINDOW_NS) && 
+                        (cand.info.last_mount_time < (max_ts - HN4_REPLAY_WINDOW_NS))) {
+                        
                         /* Active Replay Protection */
                         HN4_LOG_CRIT("SECURITY: Replay Attack Detected! Candidate LBA is suspiciously old.");
                         continue; /* Reject this mirror */
@@ -417,6 +425,7 @@ static hn4_result_t _execute_cardinal_vote(
             hn4_sb_to_disk(&best_sb, (hn4_superblock_t*)heal_buf);
             
             hn4_superblock_t* dsb = (hn4_superblock_t*)heal_buf;
+            dsb->raw.sb_crc = 0; 
             uint32_t crc = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
             dsb->raw.sb_crc = hn4_cpu_to_le32(crc);
 
@@ -549,7 +558,7 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
         if (_phys_lba_from_block(target_blocks[i], bs, sector_sz, cap, &lba) != HN4_OK) continue;
 
         if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, io_buf, sectors) == HN4_OK) {
-            if (hn4_hal_barrier(dev) == HN4_OK) {
+            if (hn4_hal_sync_io(dev, HN4_IO_FLUSH, lba, NULL, 0) == HN4_OK) {
                 mirrors_ok++;
             }
         }
@@ -579,16 +588,16 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
         /* 1. Rollback North */
         hn4_hal_sync_io(dev, HN4_IO_WRITE, lba0, io_buf, sectors);
         
-        /* 2. Rollback Mirrors */
+       /* 2. Rollback Mirrors */
         for (int i=1; i<4; i++) {
             if (target_blocks[i] == HN4_OFFSET_INVALID) continue;
             hn4_addr_t lba;
             if (_phys_lba_from_block(target_blocks[i], bs, sector_sz, cap, &lba) == HN4_OK) {
                 hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, io_buf, sectors);
+                /* Flush per mirror to restore ordering guarantees */
+                hn4_hal_sync_io(dev, HN4_IO_FLUSH, lba, NULL, 0);
             }
         }
-        
-        hn4_hal_barrier(dev);
 
         /* Restore In-Memory State */
         vol->sb = original_sb;
@@ -643,8 +652,14 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     }
 
     uint64_t start_idx, end_idx;
-    _addr_to_u64_checked(vol->sb.info.lba_bitmap_start, &start_idx);
-    _addr_to_u64_checked(vol->sb.info.lba_qmask_start, &end_idx);
+    if (!_addr_to_u64_checked(vol->sb.info.lba_bitmap_start, &start_idx) ||
+        !_addr_to_u64_checked(vol->sb.info.lba_qmask_start, &end_idx)) {
+        
+        hn4_hal_mem_free(io_buf);
+        hn4_hal_mem_free(vol->void_bitmap);
+        vol->void_bitmap = NULL;
+        return HN4_ERR_GEOMETRY;
+    }
 
     uint64_t cur_idx = start_idx;
     size_t words_filled = 0;
@@ -668,8 +683,11 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
         hn4_addr_t io_lba;
         /* Use capacity check */
         if (_phys_lba_from_block(cur_idx, bs, sect_sz, cap, &io_lba) != HN4_OK) {
-             /* Should be caught by bounds check above, but fail safe */
-             break;
+             /* Hard Fail. Do not trust partial bitmap state. */
+             hn4_hal_mem_free(io_buf);
+             hn4_hal_mem_free(vol->void_bitmap);
+             vol->void_bitmap = NULL;
+             return HN4_ERR_BITMAP_CORRUPT;
         }
 
         uint32_t io_sectors = (io_n * bs) / sect_sz;
@@ -774,13 +792,29 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
 #ifdef HN4_USE_128BIT
         if (regions[i].lo == 0 && regions[i].hi == 0) continue;
         
-        /* Check: (LBA * SS) >= Capacity */
         /* 
-         * Simplified Check for 128-bit without full math library:
-         * If LBA >= Capacity, it is definitely out of bounds.
-         * (Realistically LBA should be ~Capacity/512).
+         * Strict Unit Conversion (LBA -> Bytes)
+         * Must multiply, not shift, to support non-power-of-2 sector sizes 
+         * (e.g., 520/528 byte sectors).
          */
-        if (hn4_u128_cmp(regions[i], cap_bytes) >= 0) return HN4_ERR_GEOMETRY;
+        hn4_u128_t region_bytes;
+        uint64_t ss_64 = ss;
+
+#if defined(__SIZEOF_INT128__)
+        unsigned __int128 res = (unsigned __int128)regions[i].lo * ss_64;
+        region_bytes.lo = (uint64_t)res;
+        region_bytes.hi = (uint64_t)(res >> 64) + (regions[i].hi * ss_64);
+#else
+        /* Fallback: 32-bit split multiplication if __int128 unavailable */
+        uint64_t lo_lo = (regions[i].lo & 0xFFFFFFFF) * ss_64;
+        uint64_t lo_hi = (regions[i].lo >> 32) * ss_64;
+        
+        region_bytes.lo = lo_lo + (lo_hi << 32);
+        region_bytes.hi = (regions[i].hi * ss_64) + (lo_hi >> 32) + 
+                          ((lo_lo + (lo_hi << 32)) < lo_lo ? 1 : 0);
+#endif
+
+        if (hn4_u128_cmp(region_bytes, cap_bytes) >= 0) return HN4_ERR_GEOMETRY;
 #else
         if (regions[i] == 0) continue;
         
@@ -927,6 +961,14 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
             }
             
             mem_offset += bytes_step;
+        } else {
+            /* 
+             * Mapping failure implies Q-Mask gap. 
+             * We fallback to Silver (0xAA) via initialization, but we must
+             * signal that the map is incomplete/untrustworthy.
+             */
+            HN4_LOG_WARN("Q-Mask Mapping Fail @ Blk %llu. Mark DEGRADED.", (unsigned long long)cur_blk);
+            vol->sb.info.state_flags |= HN4_VOL_DEGRADED;
         }
 
         blocks_left -= io_n;
@@ -1211,7 +1253,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
         hn4_hal_barrier(dev);
 
         /* Read back to verify media accepted it */
-        void* verify_buf = hn4_hal_mem_alloc(bs);
+        void* verify_buf = hn4_hal_mem_alloc(alloc_sz);
         if (verify_buf) {
             if (hn4_hal_sync_io(dev, HN4_IO_READ, cortex_lba, verify_buf, sector_count) == HN4_OK) {
                 if (memcmp(io_buf, verify_buf, alloc_sz) != 0) {
@@ -1319,8 +1361,13 @@ static hn4_result_t _reconstruct_cortex_state(
         
         uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
         
+        /* Guard against header overhead exceeding block size */
+        if (bs <= sizeof(hn4_block_header_t)) {
+            /* Should be caught by mount checks, but safe default here */
+            continue; 
+        }
+
         /* Calculate Block Count needed for this Mass */
-        /* Note: Payload size depends on BS. Assume standard header overhead. */
         uint32_t payload_sz = bs - sizeof(hn4_block_header_t); 
         uint64_t blocks_needed = (mass + payload_sz - 1) / payload_sz;
 
@@ -1328,17 +1375,26 @@ static hn4_result_t _reconstruct_cortex_state(
         
         /* Pre-allocate a scratch buffer for verification reads */
         void* verify_buf = hn4_hal_mem_alloc(bs);
-        if (!verify_buf) { /* Handle OOM during recovery */ break; }
+        if (!verify_buf) { 
+            /* Clean up main buffer and return error on OOM */ 
+            hn4_hal_mem_free(vol->nano_cortex);
+            vol->nano_cortex = NULL;
+            return HN4_ERR_NOMEM; 
+        }
 
         for (uint64_t n = 0; n < blocks_needed; n++) {
             
             bool found_block_n = false;
 
             /* Scan orbits 0..12 */
-            for (uint8_t k = 0; k < HN4_MAX_TRAJECTORY_K; k++) {
+           for (uint8_t k = 0; k < HN4_MAX_TRAJECTORY_K; k++) {
                 
                 uint64_t lba = _calc_trajectory_lba(vol, G, V, n, M, k);
                 if (lba == HN4_LBA_INVALID) continue;
+
+                /* Validate LBA against physical limits */
+                uint64_t total_cap_blocks = vol->vol_capacity_bytes / bs;
+                if (lba >= total_cap_blocks) continue;
 
                 /* D. The Ghost Check */
                 bool is_set = false;
@@ -1411,6 +1467,10 @@ static hn4_result_t _reconstruct_cortex_state(
     } else {
         HN4_LOG_VAL("Zero-Scan Complete. State Consistent", anchor_count);
     }
+
+    /* Reconstruction is transient. Runtime caching is separate. */
+    hn4_hal_mem_free(vol->nano_cortex);
+    vol->nano_cortex = NULL;
 
     return HN4_OK;
 }
@@ -1553,7 +1613,8 @@ hn4_result_t hn4_mount(
             vol->sb.info.state_flags |= HN4_VOL_PANIC;
         }
 
-        if (!force_ro && j_head != j_start) {
+        /*Inverted Logic. If Head == Start, the log IS empty. */
+        if (!force_ro && j_head == j_start) {
             /* Log is empty. Ensure sequence is reset if SB thinks otherwise. */
             if (vol->sb.info.last_journal_seq != 0) {
                  vol->sb.info.last_journal_seq = 0;
@@ -1734,9 +1795,10 @@ cleanup:
     if (vol) {
         if (vol->void_bitmap) hn4_hal_mem_free(vol->void_bitmap);
         if (vol->quality_mask) hn4_hal_mem_free(vol->quality_mask);
+        if (vol->topo_map) hn4_hal_mem_free(vol->topo_map);
+        if (vol->nano_cortex) hn4_hal_mem_free(vol->nano_cortex); /* Also safe to free if allocated */
         hn4_hal_mem_free(vol);
     }
     return res;
 }
-
 

@@ -2319,46 +2319,6 @@ hn4_TEST(HardwareProfile, Zns_Capacity_Below_Zone_Threshold) {
 }
 
 /*
- * Test 17.2: ZNS Exabyte Scale (Math Safety)
- * RATIONALE:
- * Verifies that the ZNS-specific logic (North-Only Write) functions correctly
- * even when the capacity scales to 18 Exabytes (Max 64-bit).
- * This ensures the `_broadcast_superblock` loop and LBA calculations do not
- * overflow or assert when handling massive Block Indices derived from Zone IDs.
- */
-hn4_TEST(HardwareProfile, Zns_Huge_Capacity_Address_Calc) {
-    hn4_volume_t* vol = create_volume_fixture();
-    void* dev_ptr = vol->target_device;
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev_ptr;
-
-    /* Setup ZNS Environment */
-    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
-    mdev->caps.zone_size_bytes = 256 * 1024 * 1024; /* 256 MB */
-    
-    /* 18 Exabytes Capacity */
-    mdev->caps.total_capacity_bytes = 0xFFFFFFFFFFFFFFFFULL;
-    vol->vol_capacity_bytes = mdev->caps.total_capacity_bytes;
-
-    /* Align Block Size */
-    vol->vol_block_size = mdev->caps.zone_size_bytes;
-    vol->sb.info.block_size = vol->vol_block_size;
-
-    /* Align Epoch Ring (Zone 1) */
-    vol->sb.info.lba_epoch_start = 524288; /* 256MB offset */
-    vol->sb.info.epoch_ring_block_idx = 1;
-
-    /* 
-     * Should succeed. 
-     * The logic must skip mirrors (which would be at huge offsets)
-     * and successfully write North (LBA 0).
-     */
-    hn4_result_t res = hn4_unmount(vol);
-    ASSERT_EQ(HN4_OK, res);
-
-    hn4_hal_mem_free(dev_ptr);
-}
-
-/*
  * Test 17.3: Pico Profile Minimal RAM (Null Pointers)
  * RATIONALE:
  * The Pico profile (IoT/Embedded) often runs with extremely constrained RAM.

@@ -12,10 +12,6 @@
 
 </div>
 
-##### Disclaimer: Files and docs are all public. The previous implementation was tightly coupled to my OS, so I’m currently rewriting it to be platform-agnostic. The original build successfully runs 4K test files, and the initial source drop will be available tomorrow.
-
----
-
 **HN4** is a high-velocity storage engine designed for the era of NVMe, ZNS, and direct-to-metal applications. It discards legacy assumptions (like spinning disks and inode trees) to achieve **O(1) data access** and **Zero-Copy latency**.
 
 ---

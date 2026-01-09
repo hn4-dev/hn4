@@ -94,7 +94,6 @@ extern "C" {
 /**
  * _secure_zero
  * Secure Zero with Memory Fence. Prevents compiler DCE.
- * (Duplicated in epoch/mount/unmount)
  */
 static inline void _secure_zero(void* ptr, size_t size) {
     if (ptr && size > 0) {

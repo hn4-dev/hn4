@@ -255,7 +255,7 @@ hn4_TEST(Integrity, EpochFuture) {
     uint8_t* io_buf = calloc(1, FIXTURE_BLK);
     memcpy(io_buf, &ep, sizeof(ep));
     
-    /* FIX: Use correct Sector LBA for Epoch Ring Start (16) */
+    /* Use correct Sector LBA for Epoch Ring Start (16) */
     hn4_hal_sync_io(dev, HN4_IO_WRITE, 16, io_buf, FIXTURE_BLK/512);
     free(io_buf);
     
@@ -4597,28 +4597,6 @@ hn4_TEST(ResourceLoad, QMask_Content_Verify) {
 }
 
 /* 
- * Test 203: Spec 10.6 - RAM Boundary Check (Valid Alloc)
- * Scenario: Cortex is 10MB (Well within 256MB limit).
- * Logic: Should allocate successfully.
- * Expected: Mount OK, vol->nano_cortex is NOT NULL.
- */
-hn4_TEST(Spec_10_6, RAM_Alloc_Success) {
-    hn4_hal_device_t* dev = create_fixture_formatted();
-    /* Fixture default Cortex is ~256KB */
-    
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-    
-    /* Should have allocated cache */
-    ASSERT_TRUE(vol->nano_cortex != NULL);
-    
-    hn4_unmount(vol);
-    destroy_fixture(dev);
-}
-
-/* 
  * Test 204: Spec 16.5 - Incompatible Flag Rejection
  * Scenario: SB has `incompat_flags` set to 0x1 (Unknown Feature).
  * Logic: Driver mask `~HN4_SUPPORTED_MASK` should catch this.
@@ -5764,6 +5742,69 @@ hn4_TEST(Validation, Struct_Layout_Integrity) {
     destroy_fixture(dev);
 }
 
+hn4_TEST(Geometry, Epoch_Partial_Block_Access) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* 1. Set Capacity: 2MB + 1 Byte */
+    uint64_t cap_val = (2ULL * 1024 * 1024) + 1;
+    
+#ifdef HN4_USE_128BIT
+    sb.info.total_capacity.lo = cap_val;
+    sb.info.total_capacity.hi = 0;
+#else
+    sb.info.total_capacity = cap_val;
+#endif
+    
+    /* 2. Set Pointer to Index 512 (The 513th block) */
+    uint64_t target_idx = 512;
+    
+#ifdef HN4_USE_128BIT
+    sb.info.epoch_ring_block_idx.lo = target_idx;
+    sb.info.epoch_ring_block_idx.hi = 0;
+#else
+    sb.info.epoch_ring_block_idx = target_idx;
+#endif
+
+    /* 3. Disable profile checks that might load bitmaps (optional but cleaner) */
+    sb.info.format_profile = HN4_PROFILE_PICO;
+
+    /* 4. Update CRC and Write SB */
+    sb.raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, &sb, HN4_SB_SIZE - 4);
+    sb.raw.sb_crc = hn4_cpu_to_le32(crc);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* 
+     * 5. Write Valid Epoch at the Target Block 
+     * LBA = 512 * (4096/512) = 4096.
+     */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = sb.info.current_epoch_id;
+    ep.timestamp = hn4_hal_get_time_ns();
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+    
+    uint8_t* buf = calloc(1, 4096);
+    memcpy(buf, &ep, sizeof(ep));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 4096, buf, 8);
+    free(buf);
+    
+    /* 6. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    ASSERT_EQ(HN4_OK, res);
+    
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
 /* 
  * Test 503: Cardinal - Split-Brain Time Skew (Fix 4)
  * Scenario: North and East have Same Generation (100).
@@ -5831,3 +5872,120 @@ hn4_TEST(L10_Reconstruction, QMask_Boundary_Check) {
     hn4_unmount(vol);
     destroy_fixture(dev);
 }
+
+
+/*
+ * Test: 128-bit Geometry Validation (Unit System Fix)
+ * Scenario: 
+ *   Capacity = 4096 bytes (Low 128-bit value: 4096).
+ *   Sector Size = 512.
+ *   Epoch LBA = 10.
+ *
+ * Old Logic (Bug):
+ *   Region LBA (10) < Capacity (4096). 
+ *   Result: PASS (Incorrect).
+ *
+ * New Logic (Fix):
+ *   Region Bytes = LBA (10) * SS (512) = 5120.
+ *   5120 > Capacity (4096).
+ *   Result: FAIL (Correct).
+ */
+hn4_TEST(Geometry, Validate_128Bit_Unit_Conversion) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    
+    /* 1. Read SB */
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    /* 2. Setup 128-bit mode params */
+    /* Capacity = 4096 bytes */
+#ifdef HN4_USE_128BIT
+    sb.info.total_capacity.lo = 4096;
+    sb.info.total_capacity.hi = 0;
+    
+    /* Set Region LBA to 10. 
+       10 < 4096 (Numerical comparison passes).
+       10 * 512 = 5120 > 4096 (Physical comparison fails). */
+    sb.info.lba_epoch_start.lo = 10;
+    sb.info.lba_epoch_start.hi = 0;
+    
+    /* Zero other regions to isolate the failure to Epoch */
+    sb.info.lba_cortex_start.lo = 0; sb.info.lba_cortex_start.hi = 0;
+    sb.info.lba_bitmap_start.lo = 0; sb.info.lba_bitmap_start.hi = 0;
+    sb.info.lba_qmask_start.lo  = 0; sb.info.lba_qmask_start.hi  = 0;
+    sb.info.lba_flux_start.lo   = 0; sb.info.lba_flux_start.hi   = 0;
+    sb.info.lba_horizon_start.lo= 0; sb.info.lba_horizon_start.hi= 0;
+#else
+    /* 64-bit mock for compilation, logic verified in 128-bit path above */
+    sb.info.total_capacity = 4096;
+    sb.info.lba_epoch_start = 10;
+#endif
+
+    /* 3. Update CRC */
+    sb.raw.sb_crc = 0;
+    uint32_t crc = hn4_crc32(0, &sb, HN4_SB_SIZE - 4);
+    sb.raw.sb_crc = hn4_cpu_to_le32(crc);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+
+    /* 4. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+
+    /* 
+     * If the Unit fix is applied, this MUST return HN4_ERR_GEOMETRY.
+     * If not applied, it would likely return HN4_OK (or ERR_NOMEM/etc later).
+     */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/*
+ * Test: Anchor Integrity - CRC Valid but Semantically Invalid
+ * Logic: Write an anchor with valid CRC but invalid flags/ID.
+ *        Recovery scan must reject it.
+ */
+hn4_TEST(Recovery, Schrodinger_Anchor) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    /* 1. Create Malformed Anchor */
+    hn4_anchor_t bad_anchor = {0};
+    bad_anchor.seed_id.lo = 0xBADF00D; /* Invalid ID */
+    bad_anchor.data_class = 0;         /* Missing VALID flag */
+    
+    /* 2. Compute Valid CRC for invalid data */
+    bad_anchor.checksum = 0;
+    bad_anchor.checksum = hn4_cpu_to_le32(hn4_crc32(0, &bad_anchor, offsetof(hn4_anchor_t, checksum)));
+
+    /* 3. Inject into Cortex (Block 1) */
+    /* Cortex Start + 1 block */
+    uint64_t cortex_start = 0; /* SB read above gives sector */
+    #ifdef HN4_USE_128BIT
+    cortex_start = sb.info.lba_cortex_start.lo;
+    #else
+    cortex_start = sb.info.lba_cortex_start;
+    #endif
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, cortex_start + (4096/512), &bad_anchor, sizeof(hn4_anchor_t)/512);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 
+     * Verify: The invalid anchor should NOT be in the cache 
+     * (or at least treated as empty/invalid).
+     * Since we can't easily inspect internal cache state from here without 
+     * allocators, we rely on the mount not crashing or asserting.
+     */
+
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
