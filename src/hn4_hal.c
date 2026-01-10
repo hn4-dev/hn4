@@ -340,12 +340,15 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, 
     
     hn4_hal_submit_io(dev, &req, _sync_cb);
     
-    while(!ctx.done) { 
+    /* FIX: Acquire semantics enforced inside loop condition check */
+    /* Note: Casting volatile bool* to _Atomic bool* for standard compliance */
+    while(!atomic_load_explicit((_Atomic bool*)&ctx.done, memory_order_acquire)) { 
         HN4_YIELD(); 
         hn4_hal_poll(dev); 
     }
     
-    atomic_thread_fence(memory_order_acquire);
+    /* Fence is now redundant due to load_acquire above, but harmless to keep */
+    atomic_thread_fence(memory_order_acquire); 
     return ctx.res;
 }
 
