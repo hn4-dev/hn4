@@ -7,98 +7,93 @@
 
 ---
 
-## 1. Abstract: The Passive Gardener
+## 1. Abstract: Non-Blocking Maintenance
 
-In traditional filesystems, maintenance is **Blocking**.
-*   `fsck` locks the drive on boot.
-*   `defrag.exe` grinds the HDD for hours.
-*   `ZFS Scrub` saturates IO bandwidth.
+Standard filesystem maintenance is historically blocking. Tools like `fsck`, `defrag`, or `ZFS Scrub` often saturate IO bandwidth or lock the drive, degrading performance for active applications.
 
-The **HN4 Scavenger** is a **Non-Blocking, Budget-Aware Micro-Service**.
-It runs only when the drive queue is idle. It operates on "Time Slices" (e.g., 5ms budget), ensuring it never interrupts a Game or Database query.
+The **HN4 Scavenger** (The Entropic Custodian) functions as a non-blocking, budget-aware micro-service. It operates strictly on available "Time Slices" (e.g., 5ms execution windows) when the drive queue is idle. This ensures that maintenance never introduces latency spikes to foreground workloads like database queries or real-time rendering.
 
-Its job is to enforce **Fluid Dynamics**: slowly moving the filesystem from a state of *Chaos* (Fragmentation) to *Order* (Optimization) without user intervention.
+Its primary function is **Entropy Reversal**: incrementally transitioning the filesystem from a fragmented state to a mathematically optimized state without requiring offline time.
 
 ---
 
 ## 2. Core Functions
 
-The Scavenger has three prime directives, executed cyclically.
+The Scavenger operates cyclically through three specific directives.
 
 ### 2.1 The Chronophage (TTL Reaper)
-**Goal:** Cleanup temporary files without explicit delete commands.
+**Goal:** Automated cleanup of temporary files based on Time-To-Live (TTL).
 
 *   **Logic:**
-    1.  Scan Anchor Table (D0).
-    2.  Check `Anchor.flags & HN4_FLAG_TTL`.
-    3.  Check `Anchor.mod_clock` (Death Time).
+    1.  Scans the Anchor Table (D0).
+    2.  Filters for `Anchor.flags & HN4_FLAG_TTL`.
+    3.  Compares `Anchor.mod_clock` against the current system time.
     4.  **Action:** If `Now > Death_Time`:
-        *   Convert Anchor to **Tombstone**.
-        *   Free Blocks in Bitmap.
-        *   Emit Audit Log.
-*   **Impact:** Solves the "Disk Full of Temp Files" problem at the driver level. Apps don't need to run cleanup scripts.
+        *   Converts the Anchor to a **Tombstone**.
+        *   Reclaims Blocks in the Allocation Bitmap.
+        *   Emits an Audit Log entry.
+*   **Operational Impact:** Eliminates the "Disk Full of Temp Files" failure state at the driver level. Applications are relieved of the requirement to run dedicated cleanup scripts.
 
 ### 2.2 The Hyper-Stitcher (Stream Optimization)
-**Goal:** Fix the $O(N)$ read penalty of Linked Lists (Horizon/Stream mode).
+**Goal:** Elimination of $O(N)$ read penalties in Linked List structures (Horizon/Stream mode).
 
-When a file is written sequentially in D2, it forms a chain: `Block 1 -> Block 2 -> Block 3`. Seeking to Block 10,000 requires 10,000 reads.
-
-*   **Logic:**
-    1.  The Scavenger detects a long chain.
-    2.  It calculates the physical location of Block 1024.
-    3.  It updates Block 0's header with a **Hyper-Link** (`hyper_strm`) pointing directly to Block 1024.
-*   **Result:** A linear search becomes a **Skip-List Search** ($O(\log N)$).
-*   **User Experience:** Seeking in a 50GB video file becomes instant, even if the file was just recorded.
-
-### 2.3 Orbit Tuning (Defragmentation)
-**Goal:** Restore $O(1)$ access to fragmented files.
-
-Files can end up in high collision orbits ($k=5, 6$) due to disk crowding. This hurts read latency.
+Sequential writes in D2 naturally form a chain: `Block 1 -> Block 2 -> Block 3`. Seeking to a high offset (e.g., Block 10,000) typically requires 10,000 iterative reads.
 
 *   **Logic:**
-    1.  Identify "Stressed" Anchors (High `k_avg`).
-    2.  **Solve:** Calculate a new Prime Vector ($V'$) that fits the file better into the *current* empty space map.
-    3.  **Migrate:**
-        *   Read File using Old $V$.
-        *   Write File using New $V'$.
-        *   Atomic Swap.
-*   **Difference from Defrag:** We don't just "move blocks together." We "retune the math" so the blocks land in better slots naturally.
+    1.  Detects long block chains during idle scans.
+    2.  Calculates physical addresses for stride intervals (e.g., Block 1024).
+    3.  Injects a **Hyper-Link** (`hyper_strm`) into the Block 0 header, pointing directly to the stride target.
+*   **Result:** Converts linear search into a **Skip-List Search** ($O(\log N)$).
+*   **Use Case:** Enables instant seeking in massive media files (e.g., 50GB video) immediately after recording, regardless of physical fragmentation.
+
+### 2.3 Orbit Tuning (Mathematical Defragmentation)
+**Goal:** Restoration of $O(1)$ access times for collision-heavy files.
+
+During high-congestion writes, files may settle into high-collision hash orbits ($k=5, 6$). This increases lookup latency.
+
+*   **Logic:**
+    1.  Identifies "Stressed" Anchors (High `k_avg`).
+    2.  **Solver:** Calculates a new Prime Vector ($V'$) that maps the file to a low-collision slot within the *current* empty space map.
+    3.  **Migration:**
+        *   Reads file via Old Vector $V$.
+        *   Writes file via New Vector $V'$.
+        *   Performs an Atomic Swap of the metadata.
+*   **Differentiation:** Unlike standard defragmentation, which physically consolidates blocks, Orbit Tuning re-optimizes the hashing mathematics so blocks land in naturally efficient slots.
 
 ---
 
 ## 3. The Budgeting System (Zero-Stutter)
 
-The Scavenger must be invisible.
+The Scavenger is designed to be invisible to the host OS scheduler.
 
 ### 3.1 The IO Budget
 *   **Input:** `hn4_scavenge_pulse(vol, ops_budget)`.
 *   **Metric:** 1 OP = 4KB Read/Write.
-*   **Control:** The OS Scheduler calls this function only when the NVMe Submission Queue is empty.
-*   **Hard Stop:** If `ops_budget` hits 0, the Scavenger saves its state (Cursor) and returns immediately.
+*   **Trigger:** The OS calls this function only when the NVMe Submission Queue is empty.
+*   **Constraint:** If `ops_budget` hits 0, the Scavenger saves its cursor state and returns immediately. This prevents the maintenance thread from delaying incoming read/write requests.
 
 ### 3.2 Thermal Hysteresis
-Scrubbing generates heat.
-*   **Sensor:** Check `NVMe SMART Temp` every 256 blocks.
+Scrubbing operations generate significant controller heat.
+*   **Sensor:** polls `NVMe SMART Temp` every 256 blocks.
 *   **Logic:** If `Temp > 75°C`: **Sleep 5000ms.**
-*   **Goal:** Prevent the maintenance thread from throttling the GPU during a gaming session.
+*   **Goal:** Prevents the Scavenger from inducing hardware thermal throttling during intensive tasks (e.g., gaming or compiling).
 
 ---
 
 ## 4. Crash Recovery (The Triage Log)
 
-If the system crashes, the Scavenger acts as the forensic team.
+In the event of a system crash, the Scavenger acts as a forensic recovery tool on the next boot.
 
-*   **On Boot:** It reads the **Triage Log** (Circular Buffer).
-*   **Analysis:**
-    *   Finds blocks marked `HN4_VOL_DIRTY`.
-    *   Re-scans their checksums.
-    *   If valid: Clear Dirty flag.
-    *   If invalid: Trigger **Helix Repair**.
-*   **Benefit:** This avoids a full-disk scan. Only the blocks that were "in flight" during the crash are checked.
+*   **Logic:**
+    1.  Reads the **Triage Log** (Circular Buffer).
+    2.  Identifies blocks marked `HN4_VOL_DIRTY` (writes that were in-flight during the crash).
+    3.  Verifies checksums for these specific blocks.
+        *   **Valid:** Clear Dirty flag.
+        *   **Invalid:** Trigger **Helix Repair** (parity reconstruction).
+*   **Benefit:** Eliminates the need for full-disk scans (`fsck`). Only blocks potentially affected by the crash are verified.
 
 ---
 
 ## 5. Summary
 
-The Scavenger is the **Entropy Reversal Engine**.
-While the user creates chaos (writes/deletes), the Scavenger quietly restores mathematical order in the background, ensuring the filesystem gets *faster* over time, not slower.
+The Scavenger is the **Entropy Reversal Engine** for HN4. While user activity increases system entropy (writes/deletes/fragmentation), the Scavenger continuously restores mathematical order in the background, ensuring the filesystem performance characteristics improve, rather than degrade, over the drive's lifespan.

@@ -1,126 +1,117 @@
 # HN4 WORMHOLE PROTOCOL
-### *Identity Entanglement & Spatial Overlays*
-**Specification:** v5.5 | **Status:** Production Ready | **Module:** `hn4_format.c`
+### *Deterministic Identity Cloning & Geometric Overlays*
+
+**Status:** Implementation Standard v5.5
+**Module:** `hn4_format.c` / `hn4_mount.c`
+**Metric:** Address Space Isomorphism
 
 ---
 
-## 1. Executive Summary
+## 1. Operational Theory
 
-In traditional file systems (NTFS, ext4, XFS), **Identity is Physical**. A Volume UUID is generated randomly at formatting time to guarantee uniqueness. If an Operating System detects two volumes with the same UUID attached simultaneously, it triggers a "Collision Panic" (forcing a rename, disabling a drive, or crashing).
+In standard filesystem architectures (ext4, XFS), a Volume UUID is a random 128-bit integer generated at format time to ensure global uniqueness. Operating System kernels rely on this uniqueness to multiplex block devices; detecting two mounted volumes with identical UUIDs typically triggers a collision error or kernel panic to prevent data corruption.
 
-**HN4 asserts that Identity is Mathematical.**
+**HN4 decouples Identity from Physical Instantiation.**
 
-The **Wormhole Protocol** is a mechanism within the `hn4_format` routine that allows an engineer to deliberately clone the **Identity (UUID)** and **Equation of State** of an existing volume onto new physical media. This creates two distinct physical objects that share the same mathematical topology.
+The **Wormhole Protocol** is a format-time directive that forces a new volume to inherit the specific **UUID**, **Generation Count**, and **Geometry Parameters** of an existing volume.
 
-This enables **Stateless Synchronization**, **Zero-Latency RAM Overlays**, and **Temporal Forking** without the overhead of virtualization layers.
+Because HN4 utilizes algebraic addressing (where physical placement is a function of the Volume UUID and File Seed), two volumes formatted with identical parameters possess **Binary Isomorphism**. Writing a specific logical block to File $A$ will calculate the exact same physical LBA on both drives, regardless of their underlying hardware differences.
+
+This enables stateless synchronization, hierarchy-free RAM caching, and temporal snapshotting without virtualization overhead.
 
 ---
 
-## 2. The Architecture of Entanglement
+## 2. Implementation Mechanics
 
-The Wormhole is not a "link" or a "shortcut." It is a complete instantiation of the filesystem universe with specific initial conditions.
+The protocol is invoked during the `hn4_format` routine. Instead of seeding the Pseudo-Random Number Generator (PRNG) for a new identity, the caller injects a specific state vector.
 
-### 2.1 The Genesis Injection
-In `hn4_format.c`, the protocol exposes a bypass to the standard PRNG (Pseudo-Random Number Generator).
+### 2.1 The Format Injection
+The `hn4_format_params_t` structure (in `hn4.h`) exposes specific fields to bypass standard initialization:
 
 ```c
 typedef struct {
-    /* ... standard params ... */
+    // ... standard geometry params ...
+
+    /* WORMHOLE CONTROL */
+    bool        clone_uuid;              // Disable PRNG for Identity
+    hn4_u128_t  specific_uuid;           // Target UUID to replicate
     
-    // WORMHOLE CONFIGURATION
-    bool        clone_uuid;         // Force deterministic Identity
-    hn4_u128_t  specific_uuid;      // The Target Identity to mimic
-    uint64_t    mount_intent_flags; // HN4_MNT_WORMHOLE | HN4_MNT_OVERLAY
-    uint32_t    root_perms_or;      // Permission Injection (e.g. Force Read-Only)
-    hn4_size_t  override_capacity_bytes; // Virtual geometry overlay
+    /* OVERLAY CONFIGURATION */
+    uint64_t    mount_intent_flags;      // Flags: HN4_MNT_WORMHOLE | HN4_MNT_VIRTUAL
+    hn4_size_t  override_capacity_bytes; // Force logical geometry (Virtual Size)
+    
+    /* SECURITY OVERRIDES */
+    uint32_t    root_perms_or;           // Inject permission masks (e.g., Force RO)
 } hn4_format_params_t;
 ```
 
-### 2.2 Iso-Morphic Trajectories
-Because the HN4 "Ballistic Engine" calculates data placement based on the Volume UUID and the File Seed ID:
-$$ LBA = f(\text{UUID}_{vol}, \text{Seed}_{file}, N) $$
+### 2.2 Address Isomorphism
+The core addressing equation depends on the volume identity:
+$$ LBA = f(\text{UUID}_{vol}, \text{Seed}_{file}, \text{Block}_{index}) $$
 
-Two volumes formatted as Wormholes (sharing `UUID_vol`) share the **exact same physical lattice**.
-*   If you write File A to `Volume_X` (Wormhole 1)...
-*   And you write File A to `Volume_Y` (Wormhole 2)...
-*   **The data lands on the exact same LBA sector on both drives.**
-
-This guarantees **Binary Isomorphism** without a synchronization table.
+If $\text{UUID}_{vol}$ is identical between Drive A and Drive B, the function $f$ returns identical coordinates for any given file.
+*   **Result:** Data locality is deterministic across physical boundaries. No lookup table or translation layer is required to map data between the two volumes.
 
 ---
 
 ## 3. Engineering Use Cases
 
-### 3.1 The "Ram-Drive Overlay" (The Accelerator)
-*Scenario:* You have a 10TB HDD (Archive). You want NVMe-like speeds for the "Hot" data, but you don't want to manage a caching driver.
+### 3.1 Hardware-Accelerated Overlays (L1 Physical Cache)
+**Problem:** Accelerating a slow, large capacity tier (HDD/Tape) with a small, fast tier (RAM/Optane) usually requires a block-level caching driver (e.g., dm-cache, bcache).
 
-*   **Action:** Format a 64GB RAM Disk as a **Wormhole** of the 10TB HDD.
-*   **Result:** The OS sees two volumes with the `SAME_UUID`.
-*   **The HN4 Driver:** Detects the `HN4_MNT_WORMHOLE` intent flag on the RAM disk. It automatically treats the RAM disk as a **L1 Physical Cache**.
-*   **Behavior:**
-    *   Reads check the RAM Wormhole first.
-    *   Writes go to the RAM Wormhole first (Low Latency), then flush to the HDD (Persistence).
-    *   *No complex mapping table is required because the LBAs are mathematically identical.*
+**Solution:** Format a RAM block device as a Wormhole of the HDD.
+1.  **Format:** Use `override_capacity_bytes` to make the 64GB RAM drive report the same logical capacity (e.g., 10TB) as the HDD source.
+2.  **Mount:** Mount the RAM drive with `HN4_MNT_WORMHOLE`.
+3.  **Behavior:** The HN4 driver treats the RAM drive as a sparse physical overlay.
+    *   **Writes:** Go to the RAM Wormhole (Low Latency).
+    *   **Flush:** Dirty blocks from RAM are written to the *exact same LBA* on the HDD. No translation map is needed because the LBAs are mathematically identical.
 
-### 3.2 Stateless Teleportation (Cluster Sync)
-*Scenario:* A distributed cluster needs to sync petabytes of data between Nodes. Using `rsync` requires scanning millions of file headers (slow).
+### 3.2 Stateless Delta Synchronization
+**Problem:** syncing petabyte-scale datasets between nodes usually requires traversing directory trees (rsync) to identify changes.
 
-*   **Action:** Format drives on Node A and Node B as Wormholes (Same UUID).
-*   **The Sync:** Since the LBA mapping is deterministic, Node A does not need to send filenames or metadata to Node B.
-    *   Node A simply streams **Raw Physical Blocks** that have changed.
-    *   Node B writes them directly to disk at the offset received.
-    *   **Result:** The file system reconstructs itself on Node B automatically. The "files" appear out of the void because the math is valid.
+**Solution:** If Node A and Node B share Wormhole volumes (Same UUID):
+1.  **Logic:** The physical layout is identical.
+2.  **Sync:** Node A streams a log of changed physical sectors (LBA + Length).
+3.  **Apply:** Node B writes these sectors directly to disk.
+4.  **Result:** The filesystem structure on Node B updates automatically. New files "appear" and deleted files vanish without Node B ever processing a metadata transaction, because the underlying mathematical structure was synchronized at the block level.
 
-### 3.3 Temporal Forking (The "What If" Sandbox)
-*Scenario:* You have a critical production database. You want to test a dangerous schema migration without touching the backup.
+### 3.3 Temporal Forking (Sandbox Environments)
+**Problem:** Testing schema migrations on production data requires costly backup/restore cycles.
 
-*   **Action:**
-    1.  Take a Snapshot of Production.
-    2.  Format a new volume (or sparse file) as a Wormhole of that Snapshot.
-    3.  Inject `root_perms_or = HN4_PERM_WRITE` (Even if the snapshot was Read-Only).
-*   **Result:** You now have a writable clone of history.
-    *   You can mutate the data on the Wormhole drive.
-    *   The original Production drive is mathematically invisible to these changes.
-    *   *Note:* The `sb.copy_generation` will diverge, creating a parallel timeline.
+**Solution:**
+1.  **Snapshot:** Create a read-only snapshot of the Production Volume.
+2.  **Fork:** Format a new sparse volume as a Wormhole of that snapshot.
+3.  **Diverge:** Mount the Wormhole as Read-Write (`root_perms_or = HN4_PERM_WRITE`).
+4.  **Result:** The Wormhole shares the history of the production volume up to the fork point. Writes to the Wormhole diverge the `copy_generation`, creating a parallel timeline. The original data remains immutable; the new volume accumulates the delta.
 
 ---
 
-## 4. Implementation Guide
+## 4. Safety Interlocks
 
-### 4.1 Invoking a Wormhole (C Code)
-To format a drive (`/dev/nvme1n1`) as a Wormhole of an existing UUID:
+Allowing duplicate UUIDs is dangerous for standard OS kernel logic. HN4 implements specific gates to prevent "Split-Brain" corruption.
 
-```c
-hn4_format_params_t params = {0};
-params.target_profile = HN4_PROFILE_AI;
-params.label = "Production_Clone_A";
+### 4.1 The Intent Flag (`mount_intent`)
+The Superblock contains a `mount_intent` field.
+*   **Standard Volume:** `Intent == 0`. The driver asserts exclusive ownership of the UUID. If a duplicate is found, the mount fails (Safety Panic).
+*   **Wormhole Volume:** `Intent == HN4_MNT_WORMHOLE`. The driver registers the volume as a **Satellite**. It acknowledges the UUID conflict is intentional and suppresses the kernel panic.
 
-// ENABLE WORMHOLE PROTOCOL
-params.clone_uuid = true;
-params.specific_uuid = target_production_uuid; // 128-bit UUID from Source
-
-// Set Intent: This tells the OS "I am a clone, do not panic"
-params.mount_intent_flags = HN4_MNT_WORMHOLE | HN4_MNT_VIRTUAL;
-
-// Execute Format
-hn4_result_t res = hn4_format(device_hal, &params);
-```
-
-### 4.2 The Safety Interlock
-To prevent "Split-Brain" corruption (where the OS confuses the two drives and writes metadata to one but data to the other):
-
-1.  **The Intent Check:** The HN4 Mount logic checks `sb.mount_intent`.
-2.  **Logic:**
-    *   If `Intent == DEFAULT` and a duplicate UUID exists: **PANIC/REJECT**.
-    *   If `Intent == WORMHOLE`: **ACCEPT**. The driver enters "Entangled Mode" (Overlay or Independent depending on OS config).
+### 4.2 Strict Flush Requirement
+Wormhole volumes operating as overlays often act as write-back caches.
+*   **Constraint:** The underlying HAL must support `HN4_HW_STRICT_FLUSH`.
+*   **Reasoning:** If the overlay (RAM) acknowledges a write but fails to flush to the backing store (HDD) before a crash, the mathematical consistency between the two timelines is broken.
 
 ---
 
-## 5. Security Implications
+## 5. Security Context
 
-*   **The Sovereign Key:** Since permissions are embedded in the Anchor (on disk), cloning the UUID does **not** bypass encryption or Access Control Lists (Tethers).
-*   **Audit Trail:** Creation of a Wormhole is an event that generates a distinct **Chronicle Entry** in the audit log, ensuring that administrators can trace the lineage of the forked data.
+Cloning a UUID does not bypass Data-at-Rest Encryption (DARE).
+
+*   **Key Independence:** The Volume UUID is a cleartext identifier. The Master Key used to decrypt payload data is wrapped in the **Cortex**.
+*   **Behavior:** If an attacker creates a Wormhole of an encrypted drive, they replicate the encrypted ciphertext. Without the specific cryptographic key for that volume instance, the Wormhole contains only high-entropy noise.
+*   **Audit:** Wormhole creation is a logged event. The `hn4_format` routine writes a genesis entry to the Chronicle (Audit Log), cryptographically chaining the fork event to the parent volume's history.
 
 ---
 
-**Summary:** The Wormhole Protocol transforms storage from a "Container of Files" into a **"Mathematical Function of State."** It allows data to exist in superposition across multiple physical mediums simultaneously.
+## 6. Summary
+
+The Wormhole Protocol treats storage not as a container, but as a function. By injecting initial conditions, we force distinct physical substrates to evaluate the same storage equation, enabling seamless data mobility and layering without the performance cost of virtualization tables.

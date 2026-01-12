@@ -1,118 +1,115 @@
 # THE SHADOW HOP PROTOCOL
-### *Beyond Copy-on-Write: The Physics of Mutable Ballistics*
+### *Beyond Copy-on-Write: Atomic Mutation via Ballistic Trajectory*
 
-## 1. The Core Concept
-
-Traditional file systems rely on **Pointers**. To find a block of data, they traverse a tree: `Inode -> Indirect Block -> Physical Block`.
-When you modify data in a **Copy-on-Write (CoW)** system (like ZFS or Btrfs), you cannot overwrite the live block. You write to a new location, update the pointer, update the parent pointer, and update the root. This is the **"Tree Tax."**
-
-**HN4 rejects Pointers.** It relies on **Ballistic Equations**.
-To find a block, the CPU calculates a trajectory.
-The **Shadow Hop** is the mechanism by which data moves to a new physical location *without* requiring the metadata tree to be rewritten. It exploits the multi-variate nature of the Ballistic Equation to create "Orbital Shells" for data versions.
-
-**Positioning Statement:**
-*Shadow Hop is Copy-on-Write without metadata amplification — atomic mutation through mathematical relocation.*
+**Status:** Implementation Standard v6.1
+**Module:** `hn4_write.c`
+**Metric:** Linearizable Atomicity / $O(1)$ Metadata Overhead
 
 ---
 
-## 2. The Mathematical Foundation
+## 1. The Core Architecture
 
-To understand the Hop, one must understand the Addressing Equation (Spec Section 6.1):
+Legacy Copy-on-Write (CoW) filesystems (ZFS, Btrfs) rely on pointer trees. To modify a data block atomically, they must allocate a new block, write the data, and then bubble the pointer update up the tree to the root. This is the **"Tree Tax"**: a single 4KB data write can trigger 16KB+ of metadata writes and multiple seeking I/O operations.
 
-$$ LBA_{phys} = G + (N \times V) + \Theta(k) $$
+**HN4 rejects pointers.** It utilizes **Ballistic Equations**.
+To modify data, the engine does not update a pointer; it solves for a new trajectory coordinate.
 
-*   **$G$ (Gravity Center):** The immutable starting point of the file.
-*   **$N$ (Sequence):** The logical block number (0, 1, 2...).
-*   **$V$ (Vector):** The stride/spacing between blocks.
-*   **$k$ (Orbital Shell):** The Collision/Version offset. **This is the variable used by Shadow Hop.**
-
-In a standard file, data settles at **$k=0$** (The Ground State).
-When we need to modify data atomically, we do not overwrite $k=0$. We solve for **$k=1$** (The Shadow State).
-
-### The Bounded Search Window
-Critics might ask: *"Does the system search $k$ to infinity?"*
-**No.**
-*   The reader probes $k$ within a strict, bounded window (default: $k \in \{0..12\}$).
-*   In 99.9% of workloads, files oscillate purely between $k=0$ and $k=1$.
-*   **Pathological Collisions:** If all 12 orbital slots are physically blocked (a statistical anomaly), the Void Engine triggers **Vector Reseeding**. It selects a new Prime Vector $V'$ and migrates the block to a completely new trajectory, bypassing the congestion entirely.
-*   **Result:** Lookup complexity is effectively $O(1)$, capped at $O(k_{max})$. It is deterministic.
+**The Shadow Hop** is the mechanism by which data moves to a new physical location without requiring a metadata tree rewrite. It exploits the multi-variate nature of the HN4 addressing equation to create "Orbital Shells" ($k$) that serve as atomic versioning slots.
 
 ---
 
-## 3. The Shadow Hop Mechanism (Step-by-Step)
+## 2. Mathematical Foundation
 
-Let us visualize a write operation to **Logical Block 5** of a file.
+The location of any block is derived from the immutable physics parameters stored in the file's **Anchor** (Spec Section 6.1):
 
-### PHASE 1: The Trajectory Calculation
-The Driver calculates the physical location of Block 5 in the **Ground State ($k=0$)**.
-*   It reads the header at that location.
-*   It verifies the **Generation Counter** matches the Anchor's `write_gen`.
+$$ LBA_{phys} = LBA_{base} + \left( [ G + (N \times V \times 2^M) + \Theta(k) ] \pmod{\Phi} \right) $$
+
+*   **$G$ (Gravity Center):** Physical start index.
+*   **$N$ (Sequence):** Logical block offset.
+*   **$V$ (Vector):** Stride/Velocity.
+*   **$M$ (Scale):** Block size exponent ($2^M$).
+*   **$\Theta(k)$:** The Collision/Version offset function.
+
+In a resting state, data resides at **$k=0$** (Ground State).
+When modifying data, the engine does not overwrite $k=0$. It solves for **$k=1$** (Shadow State).
+
+### Bounded Search Window
+The reader probes $k$ within a strict window (default $k \in \{0..12\}$).
+*   **Standard Operation:** Files oscillate purely between $k=0$ and $k=1$.
+*   **Pathological Collision:** If all orbital slots are physically blocked (rare), the Void Engine triggers **Vector Reseeding** ($V'$) to migrate the block to a completely new trajectory.
+*   **Complexity:** Lookup is effectively $O(1)$, capped at $O(k_{max})$.
+
+---
+
+## 3. The Shadow Hop Pipeline (Execution Path)
+
+**Scenario:** Atomic overwrite of **Logical Block 5**.
+
+### PHASE 1: Residency Resolution
+The driver calculates the physical LBA for Block 5 at **$k=0$**.
+*   It reads the header to verify `Generation == Anchor.write_gen`.
+*   This identifies the "Old Data" to be eclipsed later.
 
 ### PHASE 2: The Hop (Allocation)
-The Driver calculates the physical location for **$k=1$**.
-*   If $k=1$ is occupied by another file, it tries $k=2$, then $k=3$.
-*   It finds a free slot at **$k=1$**. This is the **Shadow Slot**.
+The driver calculates the trajectory for **$k=1$**.
+*   It checks the in-memory **Void Bitmap**.
+*   If $k=1$ is free, it is reserved. If occupied, it probes $k=2$.
 
-### PHASE 3: The Write (Commit)
-The Driver writes the **New Data** to the Shadow Slot ($k=1$).
-*   **Crucial:** The Header of this new block is tagged with `Gen = Anchor.write_gen + 1`.
-*   **Safety:** The old data at $k=0$ (`Gen=100`) is still valid on disk. If power fails now, the file is unchanged (Atomic).
+### PHASE 3: The Write (Shadow Commit)
+The driver writes the **New Data** to the Shadow Slot ($k=1$).
+*   **Header Tag:** `Header.Generation` is set to `Anchor.write_gen + 1`.
+*   **State:** The disk now contains Old Data (Gen 100) and New Data (Gen 101). The New Data is logically invalid because the Anchor still references Gen 100.
 
-### PHASE 4: The Anchor Update (Atomic Switch)
-*   The Driver updates the **Anchor** (Metadata) in RAM.
-*   It increments `Anchor.write_gen` to **101**.
-*   It flushes the Anchor to disk.
-*   **The Switch:** From this moment on, any reader looking for Block 5 will reject the old block (Gen 100) because it is stale, and accept the new block (Gen 101).
+### PHASE 4: The Hardware Barrier (FUA)
+The driver issues a **Force Unit Access (FUA)** or `NVMe Flush`.
+*   **Invariant:** The Anchor Update (Phase 5) is *never* issued until the storage controller acknowledges the Shadow Write is durable on NAND.
 
-### PHASE 5: The Eclipse (Selective Deallocate)
+### PHASE 5: The Anchor Update (Linearization Point)
+The driver updates the **Anchor** in RAM and flushes it to disk.
+*   **Mutation:** `Anchor.write_gen` increments to **101**.
+*   **The Switch:** This single 128-byte write atomically invalidates the old block ($k=0$) and validates the new block ($k=1$) for all subsequent readers.
+
+### PHASE 6: The Eclipse (Deallocation)
 Once the Anchor is secure:
-*   The Driver issues an **Eclipse** to the old location at $k=0$.
-*   **Method:** `NVMe Write Zeroes` (or TRIM).
-*   **Result:** The old block is physically erased, freeing space immediately.
-*   **Failure Mode:** If the Eclipse fails (power loss), the system remains consistent. The old block simply becomes "stale garbage" (ignored by readers) until the Scavenger cleans it up.
+*   The driver issues an internal **Eclipse** command for the old $k=0$ location.
+*   **Action:** Updates in-memory bitmap (Clear Bit) and optionally issues TRIM/Discard.
+*   **Failure Mode:** If power fails here, the old block remains allocated but "stale" (Gen 100 < Anchor 101). It is effectively garbage, cleaned up later by the Scavenger.
 
 ---
 
-### 4. Crash Consistency & Atomicity
+## 4. Crash Consistency Model
 
-Shadow Hop guarantees **Linearizable Atomicity**. There is no state where a partial write is visible.
+Shadow Hop guarantees **Linearizable Atomicity**. There is no intermediate state where a partial write or corrupted block is visible.
 
-| Event | Time $T$ | State of Block $N$ | State of File | If Power Fails Here... |
+| Event | Time $T$ | Block N State | Global File State | Power Failure Result |
 | :--- | :--- | :--- | :--- | :--- |
-| **Start** | 0 | At $k=0$ (Gen 100) | Gen 100 | File is valid (Old Version). |
-| **Write Shadow** | 1 | Copy at $k=1$ (Gen 101) | Gen 100 | File is valid (Old Version). Shadow is ignored. |
-| **Flush Anchor** | 2 | Copy at $k=1$ (Gen 101) | **Gen 101** | **ATOMIC SWITCHOVER.** File is valid (New Version). |
-| **Eclipse** | 3 | $k=0$ is ERASED. | Gen 101 | File is valid (New Version). Space reclaimed. |
+| **Start** | 0 | $k=0$ (Gen 100) | Gen 100 | File Valid (Old Version) |
+| **Shadow Write** | 1 | $k=1$ (Gen 101) | Gen 100 | File Valid (Old Version). Shadow ignored. |
+| **Flush Anchor** | 2 | **Anchor Updates** | **Gen 101** | **ATOMIC SWITCHOVER.** File Valid (New Version). |
+| **Eclipse** | 3 | $k=0$ Freed | Gen 101 | File Valid (New Version). Space reclaimed. |
 
-### The Hardware Barrier (Strict Ordering)
-To guarantee this timeline, the Driver does not rely on "hope."
-1.  **Shadow Write:** Data is sent to the SSD.
-2.  **The Wall:** The Driver issues a **Force Unit Access (FUA)** or `NVMe Flush` command.
-3.  **The Promise:** The Anchor Update (Step 4) is **never** issued until the hardware acknowledges that the Shadow Write is durable on NAND.
+### The "Zero-Trust" Reader
+Because "Old Data" exists momentarily before Eclipse, the Read Path (`hn4_read.c`) implements a strict validation gauntlet. A block is accepted **only** if:
+1.  **Identity:** `Header.well_id` matches `Anchor.seed_id`.
+2.  **Integrity:** `CRC32` matches.
+3.  **Freshness:** `Header.generation` == `Anchor.write_gen`.
 
-### The Zero-Trust Read (The Gauntlet)
-Because "Old Data" exists momentarily before Eclipse, the Read Path implements a strict filter. A block is accepted **only** if it passes The Gauntlet:
-*   **Magic Check:** Header must be `0x424C4B30`.
-*   **Identity Check:** `Header.well_id` must match `Anchor.seed_id` (Prevents reading another file's collision).
-*   **Time Check:** `Header.generation` must match `Anchor.write_gen` (Prevents reading stale Shadow Hops).
-*   **Integrity Check:** `CRC32` of the payload must match.
-
-**The Logic:** Reads **NEVER** use blocks whose generation is older than the Anchor's `write_gen`. Writes **ONLY** increase generation monotonically. This prevents ghost reads and stale cache drift.
+**Logic:** Reads reject any block where `Gen < Anchor.Gen`. Writes only increment `Gen`. This prevents stale reads (Ghosts) without requiring locks.
 
 ---
 
-## 5. Visual Illustration
+## 5. State Transition Visualization
 
 ### SCENARIO: Overwriting Block N
 
 #### T0: Resting State
-The file exists. Block N is at the primary trajectory ($k=0$).
+File is at Gen 100. Block N is at Primary Orbit ($k=0$).
 
 ```text
       [ ANCHOR (D0) ]
       Gen: 100
            |
-           v (Calculated, not pointed)
+           v (Calculated via Math)
 ------------------------------------------------------------------
 PHYSICAL DISK:
 [ ... ] [ DATA v1 (Gen 100) ] [ ... ] [ FREE SPACE ] [ ... ]
@@ -121,11 +118,11 @@ PHYSICAL DISK:
 ```
 
 #### T1: The Shadow Hop (Write)
-We write new data. We calculate the trajectory for $k=1$. We write there.
+Data written to $k=1$. Generation tagged as 101. Anchor is NOT updated yet.
 
 ```text
       [ ANCHOR (D0) ]
-      Gen: 100  <-- Still points to old gen technically
+      Gen: 100  <-- System of Record
            |
            v
 ------------------------------------------------------------------
@@ -133,11 +130,11 @@ PHYSICAL DISK:
 [ ... ] [ DATA v1 (Gen 100) ] [ ... ] [ DATA v2 (Gen 101) ] [ ... ]
            ^                             ^
            LBA_0                         LBA_1
-           (Old Valid)                   (New, Not yet committed)
+           (Current Valid)               (Future / Invisible)
 ```
 
 #### T2: The Anchor Update (Commit)
-We update the Anchor generation. The logic shifts instantly.
+Anchor `write_gen` increments. Logic shifts instantly.
 
 ```text
       [ ANCHOR (D0) ]
@@ -149,11 +146,11 @@ PHYSICAL DISK:
 [ ... ] [ DATA v1 (Gen 100) ] [ ... ] [ DATA v2 (Gen 101) ] [ ... ]
            ^                             ^
            LBA_0                         LBA_1
-           (STALE - Ignored)             (VALID - Accepted)
+           (STALE - Rejected)            (VALID - Accepted)
 ```
 
 #### T3: The Eclipse (Cleanup)
-We wipe the old slot.
+Old slot is zeroed/trimmed.
 
 ```text
 PHYSICAL DISK:
@@ -165,55 +162,40 @@ PHYSICAL DISK:
 
 ---
 
-## 6. Shadow Hop vs. Copy-on-Write (The Comparison)
+## 6. Architecture Comparison: CoW vs. Hop
 
-This is the decisive architectural difference between HN4 and ZFS/Btrfs.
+This table highlights the decisive architectural difference: Metadata Amplification.
 
-| Feature | Copy-on-Write (Tree) | Shadow Hop (Math) |
+| Feature | Copy-on-Write (Tree) | Shadow Hop (Vector) |
 | :--- | :--- | :--- |
 | **Addressing** | Pointers (Block IDs) | Equation ($G + N \cdot V$) |
-| **Modification** | 1. Write New Data<br>2. Update Leaf Node<br>3. Update Parent Node<br>4. Update Root Node | 1. Write New Data ($k+1$)<br>2. Zero Old Data ($k$) |
-| **Metadata I/O** | **High (Write Amplification).** A 4KB write can cause 16KB+ of metadata updates. | **Near Zero.** The Anchor (Root) only updates its Timestamp/Gen. No intermediate nodes exist. |
-| **Fragmentation** | **Severe.** Logical adjacency is lost immediately upon write. | **Controlled.** The new block ($k=1$) is mathematically related to the old one. |
-| **Integrity Scrub** | **Slow ($O(Tree)$).** Must traverse metadata pointers to find blocks. | **Fast ($O(N)$).** Linear scan. The Scrubber calculates where blocks *should* be and verifies them against the math. |
-| **Seek Overhead** | $O(\log N)$ (Tree Traversal). | $O(1)$ (Calculation). |
-| **Garbage Collection**| Complex. Must ref-count blocks to know when to free. | Instant. The "Eclipse" command frees the old space immediately. |
-
-### The FTL Advantage
-Modern SSDs hate CoW because it destroys logical locality.
-HN4 is the first filesystem designed **with** the FTL, not against it.
-*   **Mapping Stability:** The logical relationship between Block N and Block N+1 is preserved ($V$ is constant).
-*   **TRIM Hints:** The "Eclipse" command feeds directly into the SSD's internal garbage collector, reducing write amplification inside the NAND.
+| **Modification** | 1. Write Data<br>2. Update Leaf Pointer<br>3. Update Parent Pointer<br>4. Update Root | 1. Write Data ($k+1$)<br>2. Zero Old Data ($k$) |
+| **Metadata I/O** | **High.** A 4KB write can cause 16KB+ of metadata updates (Write Amplification). | **Near Zero.** Only the Anchor (Root) updates. No intermediate nodes exist. |
+| **Fragmentation** | **High.** Logical adjacency is lost immediately upon write. | **Controlled.** The new block ($k=1$) is mathematically related to the old one via $V$. |
+| **Integrity Scrub** | **Slow ($O(Tree)$).** Must traverse pointers. | **Fast ($O(N)$).** Linear calculation. Scrubber predicts location and verifies. |
+| **Garbage Collection**| Complex. Ref-counting required. | Instant. "Eclipse" frees space immediately. |
 
 ---
 
-## 7. Block Reuse & The "Gravity Well"
+## 7. Orbital Recurrence (The "Toggle" Effect)
 
-You might ask: *"If we keep hopping to $k=1, 2, 3...$, won't we run out of orbits? Does the file explode?"*
+The system does not consume infinite $k$ slots. It recycles them.
 
-No. The system is elastic.
-
-### The Re-Entry (Looping)
-The Shadow Hop isn't an infinite line; it's a priority queue.
+**The Loop:**
 1.  Write v1 at $k=0$.
 2.  Write v2 at $k=1$. (Eclipse $k=0$).
 3.  **Write v3:**
-    *   Driver calculates $k=0$. Is it free? **YES** (We eclipsed it in step 2).
+    *   Driver calculates $k=0$. Is it free? **YES** (Freed in Step 2).
     *   Driver writes v3 at $k=0$.
     *   Driver Eclipses $k=1$.
 
-**The Result:** A file undergoing heavy random I/O simply "toggles" or "orbits" between a few mathematical slots ($LBA_X$ and $LBA_Y$) indefinitely. It does not spray data across the drive unless those primary slots are physically blocked by other files.
-
-### Proven Stability (Empirical Data)
-Recent tests (`hn4_TEST(Shadow, Slot_Recycling_Immediate)` and `hn4_TEST(Wear, FTL_PingPong_Detection)`) confirm this behavior:
-*   **Recycling:** Slots freed by a Shadow Hop are immediately available for reuse by new files or the same file.
-*   **Ping-Pong Mitigation:** The Allocator logic ensures that while toggle behavior is possible for single-file benchmarks, concurrent workloads naturally spread via collision avoidance, achieving statistical wear leveling without complex algorithms.
+**Engineering Consequence:** A file undergoing heavy random I/O "toggles" between two mathematical coordinates ($LBA_X$ and $LBA_Y$). It does not spray data across the drive unless those primary slots are physically blocked by other files. This behavior is FTL-friendly, as it presents a stable logical-to-physical mapping pattern to the SSD firmware.
 
 ---
 
-## 8. Summary of Benefits
+## 8. Summary of Characteristics
 
-1.  **Lowest Latency:** Removes the overhead of walking/rewriting B-Trees during writes.
-2.  **Atomic Safety:** Data is never overwritten in place. Crashes during write leave the old `Gen` intact.
-3.  **Determinism:** At any time, forensic validation can recompute every block location from the Anchor alone. **There is no hidden state.**
-4.  **No GC Dependency:** The filesystem does not rely on background Garbage Collection for correctness, only for efficiency. Correctness is guaranteed by the Generation Counter.
+1.  **Latency:** Eliminates the read-modify-write cycle of B-Tree metadata nodes.
+2.  **Safety:** Data is never overwritten in place. Generation counters prevent stale reads.
+3.  **Determinism:** Forensic recovery can reconstruct the file state purely from the Anchor, without traversing a broken tree.
+4.  **Metadata Efficiency:** The metadata overhead for a write is constant ($O(1)$), regardless of file depth or size.

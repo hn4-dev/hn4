@@ -1,95 +1,105 @@
-# HN4: Silicon Cartography (Quality Masking)
+# HN4 ARCHITECTURE: SILICON CARTOGRAPHY
+### *Quality Masking Subsystem*
 
-> **"Hardware lies. Physics doesn't."**
-
-This document details the **Silicon Cartography** subsystem, a revolutionary feature of the HYDRA-NEXUS 4 (HN4) file system.
-
-Instead of trusting the SSD controller or RAM manufacturer to hide defects, HN4 actively **surveys** the silicon substrate, builds a **Quality Map (Q-Mask)**, and dynamically routes data based on the reliability of each physical sector.
-
-This transforms HN4 from a passive driver into an **Adaptive Storage Hypervisor**.
+**Status:** Implementation Standard v6.0
+**Module:** `hn4_cartography.c`
+**Role:** Physical Substrate Abstraction & Wear Management
 
 ---
 
-### 1. The Core Philosophy
+## 1. Abstract: The Spectrum Model
 
-Legacy filesystems (Ext4, NTFS) assume a binary state for storage: **Working** or **Broken**. If a sector is slow or flaky, the filesystem waits for the hardware ECC to fix it. If that fails, the filesystem panics.
+Traditional filesystems treat storage media as binary: a block is either **Valid** or **Bad**. If a sector exhibits high latency or intermittent read failures, the filesystem relies entirely on hardware ECC. If ECC fails, the OS receives an IO error.
 
-HN4 assumes hardware is a **Spectrum**:
-*   Some blocks are fast (SLC Cache).
-*   Some blocks are slow (QLC / Worn out).
-*   Some blocks are dying (High Bit Error Rate).
+HN4 implements **Silicon Cartography**. This subsystem rejects the binary model in favor of a **Reliability Spectrum**. It assumes physical NAND/media quality is non-uniform due to manufacturing variance, wear leveling, or thermal stress.
 
-We map this spectrum and use it.
+Instead of hiding these variances, HN4 surveys the physical substrate to generate a **Quality Mask (Q-Mask)**. This allows the allocator to route data based on the specific durability requirements of the write operation.
 
 ---
 
-### 2. The Data Structure: The Q-Mask
+## 2. Data Structure: The Q-Mask
 
-Parallel to the standard Allocation Bitmap (1-bit), HN4 maintains a **Quality Mask** (2-bits per block).
+Parallel to the standard 1-bit Allocation Bitmap, HN4 maintains a 2-bit **Quality Mask**.
 
-| Bits | Grade | Latency | Retention | Usage Policy |
+**Storage Location:** Contiguous block immediately following the Void Bitmap.
+**Memory State:** Loaded into pinned RAM during `hn4_mount`.
+
+### 2.1 The Four Tiers
+
+| Bits | Designation | Latency Threshold | Reliability | Allocation Policy |
 | :--- | :--- | :--- | :--- | :--- |
-| `11` | **GOLD** | $< 150 \mu s$ | Perfect | **Metadata Only.** Anchors, Superblocks, Tethers. |
-| `10` | **SILVER**| Standard | Good | **Default.** User Data, Text, Source Code. |
-| `01` | **BRONZE**| $> 5 ms$ | Corrected | **Transient.** Game Assets, Temp Files, Swap. |
-| `00` | **TOXIC** | Fail | Fail | **BANNED.** Mathematically masked out. |
-
-**Location:** Stored on disk immediately after the Void Bitmap region. Loaded into RAM on mount.
+| `11` | **GOLD** | $< 150 \mu s$ | Maximum | **Critical Only.** Superblocks, Anchors, Tethers. |
+| `10` | **SILVER**| Standard | Nominal | **Default.** Standard user data, binaries, text. |
+| `01` | **BRONZE**| $> 5 ms$ | Degraded | **Transient.** `HINT_LUDIC` (Game Assets), Swap, Cache. |
+| `00` | **TOXIC** | Fail | Unsafe | **BANNED.** Mathematically excluded from trajectory. |
 
 ---
 
-### 3. Calibration: The Format-Time Survey
+## 3. Initialization: The Format-Time Survey
 
-When you run `hn4_format`, the driver does not just write headers. It performs a **Surface Scan Benchmark** (implemented in `_init_bitmap` inside `hn4_format.c`).
+During volume creation (`hn4_format`), the driver performs a physical characterization of the media before writing filesystem headers. This is handled by `_init_bitmap`.
 
-1.  **Latency Map:** The driver writes a pattern (`0x5A`) and reads it back, measuring nanosecond response time.
-2.  **Binning Logic:**
-    *   Fastest 5% of blocks $\to$ **GOLD**.
-    *   Slowest 10% of blocks $\to$ **BRONZE**.
-    *   I/O Errors $\to$ **TOXIC**.
-3.  **Result:** The file system is "born" knowing exactly where the high-performance NAND dies are located physically on the chip.
+### 3.1 Latency Profiling
+1.  **Pattern Write:** The driver writes a test pattern (`0x5A`) to distributed sectors.
+2.  **Timed Read:** The driver reads the pattern back, measuring nanosecond response time.
+3.  **Binning:**
+    *   **Top 5% (Fastest):** Marked **GOLD**. This isolates SLC cache regions on generic SSDs.
+    *   **Bottom 10% (Slowest):** Marked **BRONZE**. Identifies QLC regions or worn cells.
+    *   **Write Failures:** Marked **TOXIC**.
 
----
-
-### 4. Runtime Logic: The Adaptive Allocator
-
-The **Void Engine (Allocator)** is now Quality-Aware (`_check_quality_tier` in `hn4_allocator.c`).
-
-**Scenario A: Saving a Database (`HINT_ATOMIC`)**
-1.  Allocator calculates trajectory $T_1$.
-2.  Checks Q-Mask at $T_1$.
-3.  Result: **BRONZE**.
-4.  **Action:** REJECT. The database demands reliability. The allocator calculates $T_2$ (Shadow Hop) until it finds **SILVER** or **GOLD**.
-
-**Scenario B: Installing a 100GB Game (`HINT_LUDIC`)**
-1.  Allocator calculates trajectory $T_1$.
-2.  Checks Q-Mask.
-3.  Result: **BRONZE**.
-4.  **Action:** ACCEPT. Game textures are read-only and can tolerate millisecond latency. This utilizes storage that would otherwise be wasted.
+**Result:** The filesystem topology is physically aligned with the specific performance characteristics of the hardware instance.
 
 ---
 
-### 5. Self-Healing: Dynamic Degradation
+## 4. Runtime Logic: The Quality-Aware Allocator
 
-What happens when a "Silver" block starts failing years later?
+The **Void Engine** (Allocator) references the Q-Mask during write operations (`_check_quality_tier` in `hn4_allocator.c`).
 
-1.  **Detection:** The **Auto-Medic** (Read Repair) detects a CRC failure or a timeout on Block $X$.
-2.  **Demotion:**
-    *   The Driver performs an **Atomic Bitwise AND** on the Q-Mask to downgrade Block $X$ from `10` (Silver) to `01` (Bronze).
+### 4.1 Scenario A: High-Integrity Write
+*   **Context:** Database commit or System Config.
+*   **Flag:** `HINT_ATOMIC`.
+*   **Logic:**
+    1.  Allocator calculates Trajectory $T_1$.
+    2.  Check Q-Mask at $T_1$.
+    3.  **Result:** `01` (BRONZE).
+    4.  **Decision:** **REJECT**. The data is too critical for degraded storage.
+    5.  **Action:** Calculate Shadow Hop ($T_2$) until a SILVER or GOLD slot is found.
+
+### 4.2 Scenario B: Bulk Asset Write
+*   **Context:** Game installation or Texture streaming.
+*   **Flag:** `HINT_LUDIC`.
+*   **Logic:**
+    1.  Allocator calculates Trajectory $T_1$.
+    2.  Check Q-Mask at $T_1$.
+    3.  **Result:** `01` (BRONZE).
+    4.  **Decision:** **ACCEPT**. Read-only assets tolerate higher latency.
+    5.  **Benefit:** Utilizes storage capacity that purely safe systems would discard or leave idle.
+
+---
+
+## 5. Self-Healing: Dynamic Degradation
+
+HN4 manages silicon decay in real-time. If a "Silver" block exhibits errors during operation, the system downgrades it rather than failing.
+
+### 5.1 The Demotion Workflow
+1.  **Detection:** `hn4_read` detects a CRC mismatch or IO timeout on Block $X$.
+2.  **Bitwise Downgrade:** The Q-Mask is updated via an atomic `AND` operation.
+    *   `10` (Silver) `& 01` $\rightarrow$ `00` (Toxic) *[Severe Fail]*
+    *   `10` (Silver) $\rightarrow$ `01` (Bronze) *[Latency Fail]*
 3.  **Evacuation:**
-    *   If the data in Block $X$ was Critical (Metadata), it is immediately moved to a Gold block.
-    *   The old block is freed (but now marked Bronze).
-4.  **Toxic Lock:**
-    *   If a block fails verify-after-write, it is marked `00` (Toxic).
-    *   The Allocator treats Toxic blocks as "Occupied Gravity Wells." No future file can ever land there.
+    *   If Block $X$ contained Metadata, it is immediately rewritten to a GOLD vector.
+    *   If Block $X$ contained User Data, it is flagged for the Scavenger to move during idle time.
+4.  **Toxic Lock:** Once a block reaches `00` (TOXIC), the Void Engine treats it as a permanent gravity well. No future write trajectory will resolve to this address.
 
 ---
 
-### 6. Why This Matters
+## 6. Technical Implications
 
-This architecture allows HN4 to:
-*   **Run on "Garbage" Hardware:** You can format a dying SD card with 20% bad sectors, and HN4 will simply map around them and use the remaining 80% reliably.
-*   **Survive Radiation:** In space/nuclear environments where bitflips are common, HN4 dynamically isolates damaged RAM/Flash pages without crashing the OS.
-*   **Maximize NVMe Speed:** By putting Metadata on the fastest physical NAND pages (GOLD), directory lookups and file opens remain instantaneous even as the drive fills up.
+### 6.1 Fault Isolation
+The architecture allows HN4 to function on compromised media. A drive with 20% bad sectors remains usable; the `TOXIC` mask simply routes all IO to the remaining 80% valid surface area.
 
-**HN4 doesn't just store data. It manages the physics of the medium.**
+### 6.2 Radiation Hardening
+In environments subject to Single Event Upsets (space/high-altitude), physical memory pages often degrade individually. Dynamic Degradation allows the OS to isolate damaged pages without a full system crash.
+
+### 6.3 Performance Tiering
+By forcibly mapping metadata (Anchors) to the fastest physical NAND pages (GOLD), filesystem overhead (stat/open) remains minimized, even as the drive approaches capacity or end-of-life write endurance.
