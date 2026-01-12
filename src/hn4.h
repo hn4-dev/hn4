@@ -182,6 +182,11 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_MNT_READ_ONLY       (1ULL << 1)
 #define HN4_MNT_VIRTUAL         (1ULL << 2) /* Container is a file, not a device */
 
+/* Allocation Policy Flags */
+#define HN4_POL_SEQ   (1 << 0) /* Force V=1 */
+#define HN4_POL_DEEP  (1 << 1) /* Force 128 Probes */
+
+
 /* Quality Tiers */
 #define HN4_Q_TOXIC             0x00 /* 00 - DEAD/UNSAFE */
 #define HN4_Q_BRONZE            0x01 /* 01 - Noisy/Slow (Temp/Media) */
@@ -211,7 +216,7 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_FLAG_DUBIOUS        (1ULL << 11)
 #define HN4_FLAG_PINNED         (1ULL << 12)
 #define HN4_FLAG_TTL            (1ULL << 13)
-#define HN4_FLAG_SHRfED          (1ULL << 14)
+#define HN4_FLAG_SHRED          (1ULL << 14)
 #define HN4_FLAG_SEQUENTIAL     (1ULL << 15) /* Force V=1 */
 #define HN4_FLAG_VECTOR         (1ULL << 16) /* Vector Embedding present */
 #define HN4_HINT_HORIZON        (1ULL << 17) /* Redirect D1->D1.5 */
@@ -342,6 +347,21 @@ typedef struct HN4_PACKED {
 #define HN4_PERM_SOVEREIGN      (1 << 5)
 #define HN4_PERM_ENCRYPTED      (1 << 6)
 
+/* Compression Meta Macros */
+#define HN4_COMP_ALGO_MASK      0x0F
+#define HN4_COMP_NONE           0
+#define HN4_COMP_ORE            3
+#define HN4_COMP_SIZE_SHIFT     4   /* Bits 4-31 are size */
+
+#define HN4_CRC_SEED_HEADER 0xFFFFFFFFU
+#define HN4_CRC_SEED_DATA   0x00000000U
+/* Wire Format Grammar */
+#define HN4_ORE_CMD_CARRIER     0x00    /* Raw Literals */
+#define HN4_ORE_CMD_FLAG_ECHO   0x80    /* Back-Reference Indicator */
+#define HN4_ORE_LEN_MASK        0x7F
+#define HN4_ORE_EXT_SENTINEL    0xFF    /* Extension Byte for VarInt */
+
+
 /* 8.1 The Anchor Layout (128 Bytes) - Aligned to 2x CPU Cache Lines */
 typedef struct HN4_PACKED {
     /* 0x00 */
@@ -401,13 +421,6 @@ typedef struct HN4_PACKED {
 /* =========================================================================
  * 5. ON-DISK STRUCTURES (L3 - DATA LAYER)
  * ========================================================================= */
-
-/* Compression Meta Macros */
-#define HN4_COMP_ALGO_MASK      0x0F
-#define HN4_COMP_NONE           0
-#define HN4_COMP_LZ4            1
-#define HN4_COMP_ZSTD           2
-#define HN4_COMP_SIZE_SHIFT     4   /* Bits 4-31 are size */
 
 /* 3.2 The Flux Manifold (D1 Block Structure) */
 typedef struct HN4_PACKED {
@@ -604,7 +617,7 @@ typedef struct {
         _Atomic uint64_t heal_count;
         _Atomic uint64_t crc_failures;
         _Atomic uint64_t barrier_failures;
-        _Atomic uint32_t last_panic_code;
+        _Atomic uint32_t trajectory_collapse_counter;
     } stats;
 
     int64_t last_log_ts; /* For rate limiting */
@@ -686,6 +699,27 @@ typedef struct {
     /* Wormhole: Spatial Overlay (Virtual Geometry) */
     hn4_size_t  override_capacity_bytes;
 } hn4_format_params_t;
+
+/* =========================================================================
+ * SHARED TYPES
+ * ========================================================================= */
+
+/* 
+ * 16-byte aligned 128-bit value for Atomic CAS operations.
+ * Unlike hn4_u128_t, this is NOT packed.
+ */
+typedef struct HN4_ALIGNED(16) {
+    uint64_t lo;
+    uint64_t hi;
+} hn4_aligned_u128_t;
+
+/* Bitmap Operation Codes */
+typedef enum { 
+    BIT_SET, 
+    BIT_CLEAR, 
+    BIT_TEST, 
+    BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
+} hn4_bit_op_t;
 
 
 /* =========================================================================

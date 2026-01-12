@@ -12,7 +12,6 @@
 #include <string.h>
 
 /* --- INTERNAL BINDINGS --- */
-typedef enum { BIT_SET, BIT_CLEAR, BIT_TEST, BIT_FORCE_CLEAR } hn4_bit_op_t;
 
 /* Local helper to verify internal math since _gcd is static */
 static uint64_t _test_gcd(uint64_t a, uint64_t b) {

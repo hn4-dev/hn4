@@ -486,7 +486,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
     if (sb_seq > 0 && tip_seq < sb_seq) {
         _log_ratelimited(vol, "SECURITY: Time-Travel Detected! Log Seq < SB Seq", tip_seq);
         
-        atomic_fetch_add(&vol->stats.last_panic_code, HN4_ERR_TAMPERED);
+        atomic_fetch_add(&vol->stats.trajectory_collapse_counter, HN4_ERR_TAMPERED);
         vol->sb.info.state_flags |= HN4_VOL_PANIC;
         
         hn4_hal_mem_free(buf); hn4_hal_mem_free(prev_buf);

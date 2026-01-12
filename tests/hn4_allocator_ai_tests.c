@@ -21,19 +21,6 @@
 #define HN4_TOTAL_BLOCKS (HN4_CAPACITY / HN4_BLOCK_SIZE)
 #define HN4_BITMAP_BYTES (((HN4_TOTAL_BLOCKS + 63) / 64) * sizeof(hn4_armored_word_t))
 
-/* Internal Enum needed for mock setup */
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR 
-} hn4_bit_op_t;
-
-/* HAL Simulation bindings (External references to HAL) */
-extern void hn4_hal_sim_set_gpu_context(uint32_t gpu_id);
-extern void hn4_hal_sim_clear_gpu_context(void);
-extern hn4_result_t _bitmap_op(hn4_volume_t* vol, uint64_t block_idx, hn4_bit_op_t op, bool* out_state_changed);
-
 typedef struct {
     hn4_hal_caps_t caps;
     uint8_t*       mmio_base;

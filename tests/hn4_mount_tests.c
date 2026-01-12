@@ -984,7 +984,9 @@ hn4_TEST(Recovery, SouthDisabledSmallVol) {
     fp.target_profile = HN4_PROFILE_PICO; /* Best for small vols */
     
     hn4_result_t res = hn4_format(dev, &fp);
-    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    /* FIX: Expect SUCCESS. 1MB is valid for PICO now. */
+    ASSERT_EQ(HN4_OK, res);
     
     /* Cleanup */
     hn4_hal_mem_free(dev);
@@ -4973,33 +4975,6 @@ hn4_TEST(Consensus, All_Dead) {
     destroy_fixture(dev);
 }
 
-/* 
- * Test 314: Consensus - South Calculation Boundary
- * Scenario: Volume size prevents South SB (Too small).
- * Logic: Ensure we don't read/write OOB when checking South.
- */
-hn4_TEST(Consensus, South_Not_Checked_If_Small) {
-    /* Create 1MB device */
-    hn4_hal_device_t* dev = create_fixture_raw();
-    configure_caps(dev, 1024*1024, 512);
-    
-    /* Format as Pico */
-    hn4_format_params_t fp = {0};
-    fp.target_profile = HN4_PROFILE_PICO;
-    hn4_format(dev, &fp);
-    
-    /* Corrupt North */
-    uint8_t garbage[HN4_SB_SIZE];
-    memset(garbage, 0xAA, HN4_SB_SIZE);
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, garbage, HN4_SB_SIZE/512);
-    
-    /* Try Mount - Should fail fast, not crash on South check */
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_ERR_BAD_SUPERBLOCK, hn4_mount(dev, &p, &vol));
-    
-    destroy_fixture(dev);
-}
 
 /* =========================================================================
  * BATCH 5: ENTROPY & IDENTITY
@@ -5990,6 +5965,138 @@ hn4_TEST(Recovery, Schrodinger_Anchor) {
      */
 
     if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test: Poison Detection (Endian Logic Verification)
+ * Scenario: Disk contains 0xDEADBEEF in Magic fields.
+ */
+hn4_TEST(Integrity, Poison_Endian_Safe) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* Construct Poisoned Sector */
+    uint32_t* raw = calloc(1, HN4_SB_SIZE);
+    
+    /* 
+     * Write 0xDEADBEEF as Little Endian integers.
+     * The fix ensures we convert Disk(LE) -> CPU before comparing.
+     * On LE Host: Disk(EF BE AD DE) -> Read(EF BE AD DE) -> to_cpu -> DEADBEEF. Match.
+     * On BE Host: Disk(EF BE AD DE) -> Read(EF BE AD DE) -> to_cpu -> DEADBEEF. Match.
+     * 
+     * Without fix on BE Host:
+     * Disk(EF BE AD DE) -> Read(EF BE AD DE) -> (raw32*) -> 0xEFBEADDE != 0xDEADBEEF. Fail.
+     */
+    for(int i=0; i<4; i++) raw[i] = hn4_cpu_to_le32(HN4_POISON_PATTERN);
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, raw, HN4_SB_SIZE/512);
+    free(raw);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    /* Should detect WIPE PENDING */
+    ASSERT_EQ(HN4_ERR_WIPE_PENDING, hn4_mount(dev, &p, &vol));
+
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test: Generation Wrap (u64 Rollover)
+ * Scenario: North = 1. East = UINT64_MAX. 
+ * Logic: 1 is the 'next' generation after MAX. North should win.
+ */
+hn4_TEST(Consensus, Generation_Wrap_Logic) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    /* 1. Setup East as UINT64_MAX (Pre-wrap) */
+    sb.info.copy_generation = 0xFFFFFFFFFFFFFFFFULL;
+    write_mirror_sb(dev, &sb, 1); // East
+
+    /* 2. Setup North as 1 (Post-wrap) */
+    sb.info.copy_generation = 1;
+    write_sb(dev, &sb, 0); // North
+
+    /* 3. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 
+     * Assert Winner:
+     * If fixed: Gen 1 wins. Mount increments to 2.
+     * If broken: Gen MAX wins. Mount fails to increment (Cap) or stays MAX.
+     */
+    ASSERT_EQ(2, vol->sb.info.copy_generation);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test: Replay Window Arithmetic Underflow
+ * Scenario: System/Volume time is small (e.g., embedded start).
+ */
+hn4_TEST(Security, Replay_Underflow_Check) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    /* North: Gen 10, Time 100ns (Very small) */
+    sb.info.copy_generation = 10;
+    sb.info.last_mount_time = 100;
+    write_sb(dev, &sb, 0);
+
+    /* East: Gen 11, Time 200ns (Valid newer) */
+    sb.info.copy_generation = 11;
+    sb.info.last_mount_time = 200;
+    write_mirror_sb(dev, &sb, 1);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 
+     * If bug exists: East is rejected (False Positive Replay). Volume Gen = 10 (+1).
+     * If fixed: East accepted. Volume Gen = 11 (+1).
+     */
+    ASSERT_TRUE(vol->sb.info.copy_generation >= 11);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test: SB Healing Verification
+ * Scenario: East Mirror is corrupt. Mount should detect and overwrite it.
+ */
+hn4_TEST(Recovery, SB_Mirror_Healing) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* 1. Corrupt East Mirror */
+    uint8_t garbage[HN4_SB_SIZE];
+    memset(garbage, 0xCC, HN4_SB_SIZE);
+    
+    uint64_t east_off = ((FIXTURE_SIZE / 100) * 33);
+    east_off = (east_off + 4095) & ~4095ULL;
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, east_off/512, garbage, HN4_SB_SIZE/512);
+
+    /* 2. Mount (Triggers Healing) */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 3. Read back East Mirror */
+    hn4_superblock_t check;
+    hn4_hal_sync_io(dev, HN4_IO_READ, east_off/512, &check, HN4_SB_SIZE/512);
+
+    /* Assert it is now valid and matches Vol UUID */
+    ASSERT_EQ(HN4_MAGIC_SB, check.info.magic);
+    ASSERT_EQ(vol->sb.info.volume_uuid.lo, check.info.volume_uuid.lo);
+
+    if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
 }
 

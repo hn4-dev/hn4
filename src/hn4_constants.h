@@ -42,6 +42,20 @@ extern "C" {
 #endif
 
 /* =========================================================================
+ * SHARED CONSTANTS (Consolidated)
+ * ========================================================================= */
+
+#define HN4_LBA_INVALID         UINT64_MAX
+#define HN4_CORTEX_SLOT_SIZE    128
+
+/* Payload Size Calculation Helper */
+#define HN4_BLOCK_PayloadSize(bs)   ((bs) - sizeof(hn4_block_header_t))
+
+/* Allocation Policy Flags */
+#define HN4_POL_SEQ   (1 << 0) /* Force V=1 (Sequential) */
+#define HN4_POL_DEEP  (1 << 1) /* Force 128 Probes (Deep Scan) */
+
+/* =========================================================================
  * 2. CAPACITY UNITS (Used in format/mount)
  * ========================================================================= */
 

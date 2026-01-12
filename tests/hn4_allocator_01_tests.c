@@ -10,13 +10,6 @@
 #include "hn4_endians.h"
 #include <string.h>
 
-/* --- BINDINGS --- */
-typedef enum { BIT_SET, BIT_CLEAR, BIT_TEST, BIT_FORCE_CLEAR } hn4_bit_op_t;
-
-extern hn4_result_t _bitmap_op(hn4_volume_t* vol, uint64_t idx, hn4_bit_op_t op, bool* chg);
-extern uint64_t _calc_trajectory_lba(hn4_volume_t* v, uint64_t G, uint64_t V, uint64_t N, uint16_t M, uint8_t k);
-extern hn4_result_t hn4_alloc_block(hn4_volume_t* vol, const hn4_anchor_t* anchor, uint64_t logical_idx, hn4_addr_t* out_lba, uint8_t* out_k);
-
 /* --- FIXTURE --- */
 #define FIXTURE_CAPACITY (1024ULL * 1024ULL * 1024ULL) /* 1 GB */
 #define FIXTURE_BS       4096

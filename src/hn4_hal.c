@@ -340,7 +340,7 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, 
     
     hn4_hal_submit_io(dev, &req, _sync_cb);
     
-    /* FIX: Acquire semantics enforced inside loop condition check */
+    /* Acquire semantics enforced inside loop condition check */
     /* Note: Casting volatile bool* to _Atomic bool* for standard compliance */
     while(!atomic_load_explicit((_Atomic bool*)&ctx.done, memory_order_acquire)) { 
         HN4_YIELD(); 
@@ -357,7 +357,6 @@ hn4_result_t hn4_hal_barrier(hn4_hal_device_t* dev) {
 }
 
 /*
- * FIXED: hn4_hal_sync_io_large
  * Prevents Deadlock/OOM by enforcing alignment and advancing pointers.
  */
 hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev, 
@@ -389,7 +388,7 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
 
     hn4_size_t remaining = len_bytes;
     hn4_addr_t current_lba = start_lba;
-    uint8_t*   buf_cursor = (uint8_t*)buf; /* Fix: typed pointer for arithmetic */
+    uint8_t*   buf_cursor = (uint8_t*)buf;
 
     while (1) {
         /* 1. Check if done */
@@ -432,7 +431,7 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
         /* 5. Advance State */
         uint64_t bytes_transferred = (uint64_t)chunk_blocks * block_size;
         
-        /* Advance Buffer (Fixes Bug #2) */
+        /* Advance Buffer */
         buf_cursor += bytes_transferred;
 
         /* Advance LBA */
@@ -515,7 +514,6 @@ void hn4_hal_spinlock_release(hn4_spinlock_t* l) {
 
 #if defined(__STDC_NO_THREADS__) && !defined(_MSC_VER)
     /* 
-     * FIX #1 & #6: Unsafe Fallback Removed. 
      * If we cannot guarantee thread isolation, we default to CPU mode.
      */
     #define HN4_NO_TLS_SUPPORT 1
@@ -526,7 +524,7 @@ void hn4_hal_spinlock_release(hn4_spinlock_t* l) {
 #endif
 
 #ifndef HN4_NO_TLS_SUPPORT
-    /* FIX #2: Atomic ensures consistency against interrupts/signals */
+    /* Atomic ensures consistency against interrupts/signals */
     static HN4_TLS_ATTR _Atomic uint32_t _tl_gpu_context_id = HN4_GPU_ID_NONE;
 #endif
 
@@ -545,7 +543,7 @@ void hn4_hal_sim_set_gpu_context(uint32_t gpu_id) {
     /* Silently ignore setting affinity on unsafe platforms */
     return; 
 #else
-    /* FIX #3: Semantic validation */
+    /* Semantic validation */
     if (gpu_id == HN4_GPU_ID_NONE) {
         /* User should use clear, but we handle it safely */
         atomic_store_explicit(&_tl_gpu_context_id, HN4_GPU_ID_NONE, memory_order_relaxed);
@@ -559,7 +557,7 @@ void hn4_hal_sim_set_gpu_context(uint32_t gpu_id) {
 /**
  * hn4_hal_sim_clear_gpu_context
  * 
- * FIX #9: Resets the thread context to CPU mode. 
+ * Resets the thread context to CPU mode. 
  * MUST be called before thread returns to a pool.
  */
 void hn4_hal_sim_clear_gpu_context(void) {
@@ -589,7 +587,8 @@ uint32_t hn4_hal_get_calling_gpu_id(void) {
 #endif
     
     /* 
-     * FIX #7: PRODUCTION NOTE (Illustration Only)
+     * TODO! OUT OF SCOPE FOR HN4. 
+     *
      * In a real kernel, this logic is highly specific to the OS/Vendor stack.
      * Example (Linux/NVIDIA):
      * 
@@ -613,7 +612,7 @@ uint32_t hn4_hal_get_topology_count(hn4_hal_device_t* dev) {
      * PRODUCTION NOTE: 
      * Queries ACPI SRAT (System Resource Affinity Table) or PCIe Root Complex.
      * 
-     * FIX #5: Returns 0 by default. Allocator logic handles 0 gracefully 
+     * Returns 0 by default. Allocator logic handles 0 gracefully 
      * by disabling AI optimization.
      */
     return 0; 

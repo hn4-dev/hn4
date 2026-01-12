@@ -183,3 +183,4 @@ uint64_t hn4_crc64(uint64_t seed, const void * HN4_RESTRICT buf, size_t len) {
     return ~crc;
 }
 #endif
+

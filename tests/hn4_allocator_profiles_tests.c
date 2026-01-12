@@ -25,14 +25,6 @@ typedef struct {
     uint64_t hw_flags;
 } fixture_config_t;
 
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR /* FIX 5: Non-Panic Rollback */ 
-} hn4_bit_op_t;
-
-
 typedef struct {
     hn4_hal_caps_t caps;
     uint8_t*       mmio_base;

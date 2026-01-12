@@ -11,13 +11,6 @@
 #include <string.h>
 #include <pthread.h>
 
-/* --- INTERNAL BINDINGS --- */
-typedef enum { BIT_SET, BIT_CLEAR, BIT_TEST, BIT_FORCE_CLEAR } hn4_bit_op_t;
-
-extern hn4_result_t _bitmap_op(hn4_volume_t* vol, uint64_t idx, hn4_bit_op_t op, bool* chg);
-extern hn4_result_t hn4_alloc_block(hn4_volume_t* vol, const hn4_anchor_t* anchor, uint64_t logical_idx, hn4_addr_t* out_lba, uint8_t* out_k);
-extern void hn4_free_block(hn4_volume_t* vol, uint64_t phys_lba);
-
 /* --- FIXTURE REUSE --- */
 #define FIXTURE_CAPACITY (100ULL * 1024ULL * 1024ULL)
 #define FIXTURE_BS       4096

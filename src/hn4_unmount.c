@@ -150,6 +150,8 @@ static hn4_result_t _broadcast_superblock(
     bool attempt_south = false;
     uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
 
+
+    
     /* 
      * MATH: Handle 128-bit Capacity for Mirror Calculation 
      */
@@ -223,8 +225,14 @@ static hn4_result_t _broadcast_superblock(
     for (int i = 0; i < SB_LOC_MAX; i++) {
         if (i == SB_LOC_SOUTH && !attempt_south) continue;
         
-        /* Skip if 128-bit fallback zeroed them out */
-        if (i > 0 && targets[i] == 0) continue; 
+        /* 
+         * If calculation results in 0 (North), we must SKIP this mirror
+         * to prevent corrupting the primary Superblock.
+         */
+        if (i > SB_LOC_NORTH && targets[i] == 0) {
+            slot_ok[i] = false; /* Mark as failed/skipped */
+            continue; 
+        }
 
         /* 
          * On ZNS devices, the East/West/South mirrors reside in Sequential Zones.
@@ -249,18 +257,19 @@ static hn4_result_t _broadcast_superblock(
         phys_lba = targets[i] * (bs / ss);
 #endif
 
-        /* ZNS requires Zone Reset before Overwrite (Spec 13.2) */
+        /* 
+         * ZNS Topology Compliance.
+         * 1. Mirrors (i > 0) are in Sequential Zones and cannot be overwritten in-place.
+         *    We must skip them to avoid Write Pointer violations.
+         * 2. North (i == 0) is in a Conventional Zone (LBA 0).
+         *    We must NOT issue ZONE_RESET on Conventional Zones.
+         */
         if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
-            /* 
-             * For ZNS, Block Size = Zone Size.
-             * Resetting the "Sector LBA" resets the whole Zone/Block.
-             * Safety: We only do this because we have 3 other mirrors.
-             */
-            hn4_result_t rst = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, phys_lba, NULL, 0);
-            if (rst != HN4_OK) {
-                slot_ok[i] = false;
+            if (i > SB_LOC_NORTH) {
+                slot_ok[i] = false; /* Skip Mirrors on ZNS */
                 continue;
             }
+            /* North: Fall through to standard WRITE (No Reset) */
         }
         
         hn4_result_t io_res = hn4_hal_sync_io(dev, HN4_IO_WRITE, phys_lba, io_buf, sectors_per_sb);
@@ -270,15 +279,23 @@ static hn4_result_t _broadcast_superblock(
         } else {
             slot_ok[i] = false;
             if (i == SB_LOC_SOUTH) {
+                /* 
+                 * Only rewind if we haven't already disabled the South flag.
+                 * If attempt_south is already false (should be checked at loop top), 
+                 * we must not rewind again.
+                 */
+                if (!attempt_south) break; 
+
                 cpu_sb.info.compat_flags &= ~HN4_COMPAT_SOUTH_SB;
+                
                 /* Re-serialize */
                 hn4_sb_to_disk(&cpu_sb, (hn4_superblock_t*)io_buf);
                 dsb->raw.sb_crc = 0;
-                crc = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
-                dsb->raw.sb_crc = hn4_cpu_to_le32(crc);
+                uint32_t c = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
+                dsb->raw.sb_crc = hn4_cpu_to_le32(c);
                 
                 attempt_south = false; 
-                i = -1; /* Restart loop */
+                i = -1; /* Restart loop to update N/E/W */
                 memset(slot_ok, 0, sizeof(slot_ok)); 
                 continue;
             }
@@ -297,9 +314,17 @@ static hn4_result_t _broadcast_superblock(
     bool quorum_met;
 
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        /* 
+         * ZNS only writes North (Sequential constraints).
+         * Success = North is written.
+         */
         quorum_met = north_valid; 
     } else {
-        /* Standard: North + 1 Mirror OR 3 Mirrors */
+        /* 
+         * Standard Quorum:
+         * 1. North + at least 1 Mirror (Total >= 2).
+         * 2. OR All 3 Mirrors if North failed (Total >= 3).
+         */
         quorum_met = (north_valid && total_success >= 2) || (!north_valid && total_success >= 3);
     }
     return quorum_met ? HN4_OK : HN4_ERR_HW_IO;
@@ -357,9 +382,22 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                         size_t items = 0;
                         size_t cap_items = bs / 8;
                         
-                        /* Copy to scratch (Preserves RAM endianness) */
+                        /* Copy to scratch */
                         while (items < cap_items && cursor < total_words) {
-                            raw[items++] = vol->void_bitmap[cursor++].data;
+                            /* 
+                             * Verify RAM Integrity before Flush.
+                             * Check the Armored Word's ECC. If RAM corrupted, do not persist.
+                             * We trigger a panic to preserve the last good state on disk.
+                             */
+                            hn4_armored_word_t* w = &vol->void_bitmap[cursor];
+                            uint64_t safe_data;
+                            if (_ecc_check_and_fix(vol, w->data, w->ecc, &safe_data, NULL) != HN4_OK) {
+                                HN4_LOG_CRIT("CRITICAL: RAM Bitmap Corruption detected at word %zu during unmount!", cursor);
+                                return HN4_ERR_CPU_INSANITY; /* Abort flush */
+                            }
+                            
+                            raw[items++] = safe_data;
+                            cursor++;
                         }
                         
                         /* Swap Scratch (Destructive allowed here) */
@@ -504,22 +542,25 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
      * --------------------------------------------------------------------- */
     
     /* Optional retention on error for debugging */
+    bool retain_debug = false;
 #ifdef HN4_DEBUG_RETAIN_ON_ERROR
     if (HN4_IS_ERR(final_res)) {
-        HN4_LOG_CRIT("Unmount failed with error %d. Retaining structs in RAM.", final_res);
-        return final_res;
+        HN4_LOG_CRIT("Unmount failed (%d). Retaining structs.", final_res);
+        retain_debug = true;
     }
 #endif
 
-    bool should_zero = !vol->read_only;
+    if (!retain_debug) {
+        bool should_zero = !vol->read_only;
 
-    _safe_release_mem((void**)&vol->void_bitmap, vol->bitmap_size, should_zero);
-    _safe_release_mem((void**)&vol->quality_mask, vol->qmask_size, should_zero);
-    _safe_release_mem((void**)&vol->l2_summary_bitmap, 0, false); 
-    _safe_release_mem((void**)&vol->nano_cortex, vol->cortex_size, should_zero);
+        _safe_release_mem((void**)&vol->void_bitmap, vol->bitmap_size, should_zero);
+        _safe_release_mem((void**)&vol->quality_mask, vol->qmask_size, should_zero);
+        _safe_release_mem((void**)&vol->l2_summary_bitmap, 0, false); 
+        _safe_release_mem((void**)&vol->nano_cortex, vol->cortex_size, should_zero);
 
-    if (should_zero) _secure_zero(vol, sizeof(hn4_volume_t));
-    hn4_hal_mem_free(vol);
+        if (should_zero) _secure_zero(vol, sizeof(hn4_volume_t));
+        hn4_hal_mem_free(vol);
+    }
 
     HN4_LOG_VAL("Unmount Complete. Status", final_res);
     return final_res;

@@ -9,6 +9,50 @@ architecture shifts.
 
 ---
 
+## [0.1.5] — 2026-01-09
+### **Core IO Online: Shadow Hop, Shotgun Read & Tensor Compression**
+
+This release marks the **first production deployment** of the complete Data Path. The theoretical protocols for atomic writes ("Shadow Hop") and probabilistic reads ("Shotgun Protocol") are now implemented, verified, and active. This update also brings the compression engine online and hardens the self-healing feedback loop.
+
+### 🌑 The Shadow Hop (Atomic Write Pipeline)
+
+Writes in HN4 are no longer just "writes"—they are now a verified state transition. The new `hn4_write_block_atomic` pipeline enforces a strict 4-stage invariant to prevent partial state commit:
+
+1.  **Ballistic Allocation:** A new block (Shadow LBA) is selected via the Trajectory Equation `φ(G,V,N,k)`.
+2.  **The Wall (Barrier):** Data is flushed to media (FUA/Pre-Flush). We do not trust completion interrupts without a barrier.
+3.  **Anchor Switch:** The In-Memory Anchor is updated with the new generation ID and checksum only *after* data persistence is verified.
+4.  **The Eclipse:** The old physical block is marked for asynchronous reclamation (Tombstoning).
+
+**ZNS Specifics:** Added drift protection. If a Zone Append operation lands on an LBA different from the calculated trajectory (Gravity Drift), the write is rejected to preserve mathematical determinism.
+
+### 🔫 Shotgun Read Protocol
+
+The read path has been upgraded from a linear fetch to a probabilistic "Shotgun" scan:
+
+- **O(1) Bounded Scan:** If the primary block ($k=0$) fails CRC or generation checks, the driver instantaneously probes up to 12 alternative orbital trajectories ($k=1..12$) to find a valid replica.
+- **Auto-Medic Trigger:** If a survivor block is found in a higher orbit, the **Auto-Medic** subsystem immediately rewrites the data back to the primary $k=0$ slot, downgrading the media quality rating to **BRONZE** (Healed).
+- **Phantom Defense:** Reads now strictly validate the `well_id` (File UUID) and `generation` inside the block header. Stale data from previous epochs is treated as a "Phantom Block" error, triggering a healing event.
+
+### 📉 Tensor-Core Compression (TCC)
+
+The compression engine is now online and enforcing safety constraints:
+
+- **Isotope & Gradient Detection:** The engine detects constant runs ("Isotopes") and linear arithmetic progressions ("Gradients") in addition to standard entropy reduction.
+- **Expansion Attack Defense:** If compressed size $\ge$ input size (high entropy), the engine creates a **"Thawed"** block (Raw Storage) and returns `HN4_INFO_THAWED`. We never store expanded data.
+- **Buffer Safety:** Implemented `hn4_compress_bound()` to strictly guarantee output buffer sufficiency before encoding starts, preventing kernel heap overflows.
+
+### 🧠 Allocator & Mount Consistency
+
+- **Zero-Scan Reconstruction (L10):** During mount, if the bitmap is flagged dirty, the system now performs a "Zero-Scan". It loads the entire **Cortex** (Anchor Table) and re-projects every file's ballistic trajectory to rebuild the allocation map in RAM. This prevents "Ghost Writes" (overwriting valid data that was missing from a stale bitmap).
+- **Taint Decay:** Successfully mounting and unmounting a volume with `HN4_VOL_CLEAN` status now halves the global `taint_counter`, allowing a volume to gradually earn back trust after repair events.
+
+### 🧹 Code Normalization & Safety
+
+- **Header Convergence:** Eliminated duplicate definitions of `HN4_LBA_INVALID`, `hn4_bit_op_t`, and geometry macros. These are now centralized in `hn4.h` and `hn4_constants.h`.
+- **Error Prioritization:** `hn4_read` now uses a weighted error merging logic. Critical infrastructure failures (`CPU_INSANITY`) take precedence over logical errors (`GENERATION_SKEW`), which take precedence over data errors (`DATA_ROT`).
+
+---
+
 ## [0.1.4] — 2026-01-08
 ### Allocator Physics, Fragmentation Resilience & Consistency Guarantees
 
@@ -241,17 +285,6 @@ Right now you can:
 ✔ observe audit history via Chronicle  
 
 More components are coming — fast.
-
----
-
-## Unreleased
-Work in progress includes:
-
-- Advanced allocator & write-combining paths  
-- Richer Chronicle introspection tooling  
-- Performance tuning + benchmarks  
-- Extended HAL backends  
-- Expanded failure-simulation test coverage  
 
 ---
 

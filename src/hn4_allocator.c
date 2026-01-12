@@ -32,11 +32,6 @@
     _Static_assert(sizeof(hn4_armored_word_t) == 16, "HN4: Armored Word must be exactly 16 bytes");
 #endif
 
-typedef struct {
-    uint64_t lo;
-    uint64_t hi;
-} hn4_uint128_val_t;
-
 #define HN4_LBA_INVALID UINT64_MAX
 #define HN4_CORTEX_SLOT_SIZE 128
 #define HN4_SATURATION_GENESIS  90
@@ -54,10 +49,6 @@ static const bool _hn4_is_linear_lut[4] = {
     [HN4_DEV_ZNS]  = true,
     [HN4_DEV_TAPE] = true
 };
-
-/* Allocation Policy Flags */
-#define HN4_POL_SEQ   (1 << 0) /* Force V=1 */
-#define HN4_POL_DEEP  (1 << 1) /* Force 128 Probes */
 
 /* Device Topology Policy */
 static const uint8_t _hn4_dev_policy[4] = {
@@ -107,8 +98,8 @@ static const uint8_t _hn4_prof_policy[8] = {
 
 static inline bool
 _hn4_cas128(volatile void *dst,
-            hn4_uint128_val_t *expected,
-            hn4_uint128_val_t  desired)
+            hn4_aligned_u128_t  *expected,
+            hn4_aligned_u128_t   desired)
 {
     /* Alignment is REQUIRED for both x86-64 and ARM64 */
     if (HN4_UNLIKELY(((uintptr_t)dst & 0xF) != 0))
@@ -184,7 +175,6 @@ _hn4_cas128(volatile void *dst,
 
 #else
     /* 
-     * FIX [Spec 18.9]: Adaptive Atomics (Global Spinlock Fallback).
      * Provides binary compatibility for 32-bit/Embedded targets (Pico).
      *
      * WARNING: SCALABILITY HAZARD
@@ -242,8 +232,8 @@ static inline bool _hn4_cas64(volatile uint64_t* dst,
  * FIX 1 (ARM): Used LDXP + CLREX. No STXP. No RMW semantics.
  * FIX 2 (x64): Reverted to CMPXCHG16B(0,0) to guarantee atomicity.
  */
-static inline hn4_uint128_val_t _hn4_load128(volatile void* src) {
-    hn4_uint128_val_t ret;
+static inline hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
+    hn4_aligned_u128_t  ret;
 
 #if defined(__x86_64__) || defined(_M_X64)
     /*
@@ -374,13 +364,14 @@ static uint64_t _gcd(uint64_t a, uint64_t b) {
     int safety = 0;
     while (b != 0) {
         /* 
-         * FIX: Safety Bailout. 
-         * Return 0 (Invalid GCD) to signal failure. 
-         * Returning 1 (Coprime) would lie to the physics engine and risk collision.
+         * Return 1 (Coprime). 
+         * While "lying" about the GCD, returning 1 forces the allocator to treat 
+         * the numbers as coprime. This results in a stride of 1 (Linear Scan), 
+         * which is safe and guarantees coverage, whereas 0 causes division-by-zero.
          */
         if (++safety > 256) {
-            HN4_LOG_WARN("GCD math stall. Forcing fallback.");
-            return 0; 
+            HN4_LOG_WARN("GCD math stall. Forcing fallback to 1 (Linear).");
+            return 1; 
         }
 
         b >>= __builtin_ctzll(b);
@@ -486,12 +477,6 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     }
 }
 
-
-/* 
- * FIX 2A: Quality Check Helper
- * File: hn4_allocator.c
- * Replaces: _is_quality_compliant (if exists)
- */
  hn4_result_t _check_quality_compliance(hn4_volume_t* vol, uint64_t lba, uint8_t intent) {
     if (!vol->quality_mask) return HN4_OK; 
 
@@ -548,88 +533,6 @@ static inline uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
 /* =========================================================================
  * 4. SECDED LOGIC
  * ========================================================================= */
-
-/*
- * _ecc_check_and_fix
- * Logic:
- * - ODD Parity Error (P=1) + Syndrome!=0 -> SEC (Correctable)
- * - EVEN Parity Error (P=0) + Syndrome!=0 -> DED (Fatal)
- */
-/* STATIC LUT STATE */
-static int8_t _hn4_ecc_lut[256];
-static atomic_bool _hn4_ecc_lut_ready = false;
-
-/* One-time initializer */
-static void _init_ecc_lut(void) {
-    /* Use stack buffer to avoid half-initialized global reads */
-    int8_t tmp[256];
-    memset(tmp, -1, sizeof(tmp));
-
-    /* 
-     * Map Syndrome -> Bit Index
-     * Logic: If Data Bit 'i' flips, the Syndrome (Calc ^ Raw) will be 
-     * exactly equal to _calc_ecc_hamming(1 << i).
-     */
-    for (int i = 0; i < 64; i++) {
-        uint8_t syndrome = _calc_ecc_hamming(1ULL << i);
-        tmp[syndrome] = (int8_t)i;
-    }
-
-    /* Atomic Commit */
-    memcpy(_hn4_ecc_lut, tmp, 256);
-    atomic_store_explicit(&_hn4_ecc_lut_ready, true, memory_order_release);
-}
-
-HN4_HOT
-static inline hn4_result_t _ecc_check_and_fix(
-    HN4_IN  hn4_volume_t* vol,
-    HN4_IN  uint64_t raw_data, 
-    HN4_IN  uint8_t raw_ecc, 
-    HN4_OUT uint64_t* out_data,
-    HN4_OUT bool* out_was_corrected
-) {
-    uint8_t calc_ecc = _calc_ecc_hamming(raw_data);
-    uint8_t diff = calc_ecc ^ raw_ecc;
-
-    /* PREDICTION: 99.9% of reads are clean */
-    if (HN4_LIKELY(diff == 0)) {
-        *out_data = raw_data;
-        if (out_was_corrected) *out_was_corrected = false;
-        return HN4_OK;
-    }
-
-    /* PREDICTION: Initialization happens once */
-    if (HN4_UNLIKELY(!atomic_load_explicit(&_hn4_ecc_lut_ready, memory_order_acquire))) {
-        _init_ecc_lut();
-    }
-
-    if (diff == 1) {
-        *out_data = raw_data;
-        if (out_was_corrected) *out_was_corrected = true;
-        return HN4_OK;
-    }
-
-    if ((diff & (diff - 1)) == 0) {
-         *out_data = raw_data; 
-         if (out_was_corrected) *out_was_corrected = true;
-         return HN4_OK;
-    }
-
-    int8_t bit_idx = _hn4_ecc_lut[diff];
-
-    if (bit_idx >= 0) {
-        *out_data = raw_data ^ (1ULL << bit_idx);
-        if (out_was_corrected) *out_was_corrected = true;
-        return HN4_OK;
-    }
-
-    HN4_LOG_CRIT("ECC: DED Detected! Syndrome 0x%02X", diff);
-    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
-    *out_data = 0;
-    if (out_was_corrected) *out_was_corrected = false;
-    return HN4_ERR_BITMAP_CORRUPT;
-}
-
 
 static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool is_set) {
     /* =========================================================================
@@ -766,13 +669,8 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
  * 5. BITMAP OPERATIONS
  * ========================================================================= */
 
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
-} hn4_bit_op_t;
-
+HN4_HOT
+_Check_return_
 HN4_HOT
 _Check_return_
 hn4_result_t _bitmap_op(
@@ -795,17 +693,12 @@ hn4_result_t _bitmap_op(
             return HN4_ERR_UNINITIALIZED;
         }
 
-        /* 
-         * PICO Stack Buffer (4KB).
-         * CONSTRAINT: HAL logical_block_size must be <= 4096. 
-         * Verified during format/mount, but checked here for safety.
-         */
         const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
         const uint32_t ss = caps->logical_block_size;
         
         if (HN4_UNLIKELY(ss > 4096)) return HN4_ERR_NOMEM;
 
-        uint8_t sector_buf[4096]; // Stack allocation OK for kernel threads (typically 8KB-16KB stack)
+        uint8_t sector_buf[4096]; 
         
         /* Coordinate Calculation */
         uint64_t word_idx      = block_idx / 64;
@@ -819,8 +712,7 @@ hn4_result_t _bitmap_op(
 
         /* 
          * CRITICAL SECTION (PICO)
-         * Since we lack RAM structures for CAS, we serialize access via the L2 lock.
-         * This prevents RMW races between concurrent allocators.
+         * Serialize access via the L2 lock to prevent RMW races.
          */
         hn4_hal_spinlock_acquire(&vol->l2_lock);
 
@@ -841,7 +733,6 @@ hn4_result_t _bitmap_op(
             goto pico_cleanup; /* DED / Corruption detected */
         }
 
-        /* If healed, update buffer state (implicit write-back happens at step 4) */
         if (corrected) {
             word->data = safe_data;
         }
@@ -849,6 +740,7 @@ hn4_result_t _bitmap_op(
         /* 3. EXECUTE: Apply bit logic */
         bool is_set = (word->data & (1ULL << bit_off)) != 0;
         bool mutation_needed = false;
+        bool report_change = false;
 
         if (op == BIT_TEST) {
             if (out_result) *out_result = is_set;
@@ -870,16 +762,11 @@ hn4_result_t _bitmap_op(
             /* Regenerate ECC */
             word->ecc = _calc_ecc_hamming(word->data);
             mutation_needed = true;
-            if (out_result) *out_result = true;
+            report_change = true;
         }
 
         /* 4. WRITE: Commit changes if mutated or healed */
         if (mutation_needed) {
-            /* 
-             * NOTE: In PICO mode, we do NOT check vol->read_only here because 
-             * the upper layers should have blocked write ops. For BIT_TEST healing,
-             * we attempt write-back, but if it fails (RO media), we mask the error.
-             */
             hn4_result_t w_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, sector_buf, 1);
             
             if (w_res != HN4_OK) {
@@ -888,9 +775,13 @@ hn4_result_t _bitmap_op(
                     res = HN4_OK; 
                 } else {
                     res = HN4_ERR_HW_IO;
+                    /* If write failed, we must NOT report logic change */
+                    report_change = false;
                 }
             }
         }
+        
+        if (op != BIT_TEST && out_result) *out_result = report_change;
 
     pico_cleanup:
         hn4_hal_spinlock_release(&vol->l2_lock);
@@ -917,7 +808,7 @@ hn4_result_t _bitmap_op(
     volatile void* target_addr = &vol->void_bitmap[word_idx];
 
     /* 2. Atomic Loop State */
-    hn4_uint128_val_t expected, desired;
+    hn4_aligned_u128_t  expected, desired;
     bool success = false;
     bool logic_change = false;       /* Did the logical bit state change? */
     bool heal_event_pending = false; /* Did we fix an ECC error? */
@@ -928,6 +819,7 @@ hn4_result_t _bitmap_op(
     do {
         /* Reset per-loop flags */
         logic_change = false;
+        bool is_healing_write = false;
 
         /* 2.1 Deconstruct Word: [Data: 64] [Version: 56] [ECC: 8] */
         uint64_t data = expected.lo;
@@ -965,6 +857,7 @@ hn4_result_t _bitmap_op(
             /* Force write-back of corrected data */
             desired.lo = safe_data;
             logic_change = true; /* Conceptually a change (repair) to force commit */
+            is_healing_write = true; /* Mark as healing */
         }
         else if ((op == BIT_SET && is_set) || 
                  ((op == BIT_CLEAR || op == BIT_FORCE_CLEAR) && !is_set)) 
@@ -983,7 +876,6 @@ hn4_result_t _bitmap_op(
                                              (1ULL << (l2_idx % 64)), memory_order_release);
                 }
 
-                /* AUDIT: Double-Free detection in strict mode */
                 #ifdef HN4_STRICT_AUDIT
                 if (op == BIT_CLEAR && !is_set) {
                     atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_release);
@@ -995,6 +887,7 @@ hn4_result_t _bitmap_op(
             }
             /* ECC Error found during No-Op -> Write back corrected data */
             desired.lo = safe_data;
+            is_healing_write = true; /* Mark as healing */
         } 
         else {
             /* MUTATION: State change required */
@@ -1014,7 +907,7 @@ hn4_result_t _bitmap_op(
         uint64_t current_ver_logical = (ver ^ epoch_mux); 
         uint64_t next_ver_logical;
 
-        if (op == BIT_TEST) {
+        if (is_healing_write) { /* Use explicit healing flag */
             /* For Healing Reads, preserve the logical version to minimize noise */
             next_ver_logical = current_ver_logical;
         } else {
@@ -1044,28 +937,32 @@ hn4_result_t _bitmap_op(
     /* Result */
     if (out_result) {
         if (op == BIT_TEST) *out_result = ((desired.lo & bit_mask) != 0);
-        else *out_result = logic_change;
+        else *out_result = logic_change; /* Logic change is true for mutation */
     }
 
-    /* Side Effects (Counters, L2, Dirty Flags) */
-    if (logic_change) {
+    /* Side Effects (Counters, L2, Dirty Flags) 
+       Only update L2/Counters if LOGICAL state changed, not just ECC repair */
+    bool actual_mutation = (desired.lo != expected.lo) && /* Value changed */
+                           (op != BIT_TEST) &&            /* Not a read */
+                           !heal_event_pending;           /* Not just healing? No, healing + mutation is mutation. */
+                           
+    /* Simple check using the final known values from the successful CAS loop */
+    bool bit_was_set = ((expected.lo & bit_mask) != 0); // Using raw load? No, use safe_data logic?
+    /* expected.lo might be corrupt. We rely on 'op' logic path. */
+
+    if (logic_change && op != BIT_TEST) {
         /* GHOST BIT PROTECTION */
-        /* Mark Dirty BEFORE touching L2 to ensure flusher sees intent immediately */
         if (op != BIT_FORCE_CLEAR && !vol->in_eviction_path) {
-            /* UPGRADE: Use seq_cst to prevent Store-Store reordering on ARM64 */
             atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_seq_cst);
         }
 
-        /* Update Usage Counters and L2 Bitmap (The "Commit") */
         _update_counters_and_l2(vol, block_idx, (op == BIT_SET));
         
-        /* Ensure the L2 update is visible globally */
         atomic_thread_fence(memory_order_seq_cst);
     }
     
     return heal_event_pending ? HN4_INFO_HEALED : HN4_OK;
 }
-
 /* =========================================================================
  * NANO-LATTICE ALLOCATOR (The Cortex-Plex)
  * ========================================================================= */

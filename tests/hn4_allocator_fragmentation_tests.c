@@ -21,15 +21,6 @@
 #define HN4_TOTAL_BLOCKS (HN4_CAPACITY / HN4_BLOCK_SIZE)
 #define HN4_BITMAP_BYTES (((HN4_TOTAL_BLOCKS + 63) / 64) * sizeof(hn4_armored_word_t))
 
-/* Duplicate internal enum for white-box testing */
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR /* FIX 5: Non-Panic Rollback */ 
-} hn4_bit_op_t;
-
-
 typedef struct {
     hn4_hal_caps_t caps;
     uint8_t*       mmio_base;

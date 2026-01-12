@@ -23,21 +23,6 @@ typedef struct {
     void*          driver_ctx;
 } mock_hal_device_t;
 
-/* Duplicate internal enum for white-box testing */
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR /* FIX 5: Non-Panic Rollback */ 
-} hn4_bit_op_t;
-
-/* Forward declaration of internal function under test */
-extern hn4_result_t _bitmap_op(
-    hn4_volume_t* vol, 
-    uint64_t block_idx, 
-    hn4_bit_op_t op,
-    bool* out_state_changed
-);
 
 /* Standard Fixture Creator */
 static hn4_volume_t* create_alloc_fixture(void) {

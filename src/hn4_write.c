@@ -2,7 +2,7 @@
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
  * MODULE:      Atomic Write Pipeline (The Shadow Hop)
  * SOURCE:      hn4_write.c
- * STATUS:      FIXED / PRODUCTION (v25.1)
+ * STATUS:      PRODUCTION (v25.1)
  * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * DESCRIPTION:
@@ -29,26 +29,12 @@
 #include "hn4_endians.h"
 #include "hn4_addr.h"
 #include "hn4_annotations.h" 
+#include "hn4_constants.h"
 #include <string.h>
 
-/* =========================================================================
- * EXTERNAL BINDINGS & CONSTANTS
- * ========================================================================= */
-
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST 
-} hn4_bit_op_t;
-
-/* Policy Flags */
-#define HN4_POL_SEQ  (1 << 0)
-
 /* Internal Constants */
-#define HN4_BLOCK_PayloadSize(bs) ((bs) - sizeof(hn4_block_header_t))
 #define HN4_ORBIT_LIMIT           12
-#define HN4_LBA_INVALID           UINT64_MAX
-#define HN4_ZNS_TIMEOUT_NS        (30ULL * 1000000000ULL) /* 30 Seconds */
+#define HN4_ZNS_TIMEOUT_NS        (30ULL * 1000000000ULL)
 
 /* 
  * POLICY LOOKUP TABLES
@@ -119,7 +105,7 @@ static inline void _pack_header(
     hdr->comp_meta  = hn4_cpu_to_le32(comp_meta);
     
     hdr->header_crc = 0;
-    uint32_t hcrc = hn4_crc32(0, hdr, offsetof(hn4_block_header_t, header_crc));
+    uint32_t hcrc = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, offsetof(hn4_block_header_t, header_crc));
     hdr->header_crc = hn4_cpu_to_le32(hcrc);
 }
 
@@ -178,7 +164,7 @@ static bool _verify_block_at_lba(
 
     /* Header Integrity Check */
     uint32_t stored_hcrc = hn4_le32_to_cpu(h->header_crc);
-    uint32_t calc_hcrc = hn4_crc32(0, h, offsetof(hn4_block_header_t, header_crc));
+    uint32_t calc_hcrc = hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc));
     if (stored_hcrc != calc_hcrc) return false;
 
     /* Ownership Check (Well ID) */
@@ -398,7 +384,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     HN4_LOG_CRIT("WRITE_ATOMIC: Old Residency LBA = %llu", (unsigned long long)old_lba);
 
     /* 3. Allocate IO Buffer */
-    void* io_buf = hn4_hal_mem_alloc(bs);
+     void* io_buf = hn4_hal_mem_alloc(bs);
     if (!io_buf) {
         HN4_LOG_CRIT("WRITE_ATOMIC: OOM allocating IO buffer");
         return HN4_ERR_NOMEM;
@@ -411,12 +397,66 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
      */
     memset(io_buf, 0, bs);
 
-    /* 4. Prepare Payload */
+    /* 4. Prepare Payload (With Compression Logic) */
     hn4_block_header_t* hdr = (hn4_block_header_t*)io_buf;
-    memcpy(hdr->payload, data, len);
+    
+    uint32_t final_algo = HN4_COMP_NONE;
+    uint32_t stored_len = len;
+
+    /* Check Hints: Do we try to compress? */
+    /* Only attempt if hint is set OR profile is Archive */
+    bool try_compress = (dclass_check & HN4_HINT_COMPRESSED) || 
+                        (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE);
+
+    if (try_compress && len > 128) {
+        /* Calculate worst-case bound */
+        uint32_t bound = hn4_compress_bound(len);
+        void* comp_scratch = hn4_hal_mem_alloc(bound);
+        
+        if (comp_scratch) {
+            uint32_t comp_size = 0;
+            
+            /* Attempt Compression */
+            hn4_result_t c_res = hn4_compress_block(
+                data, 
+                len, 
+                comp_scratch, 
+                bound, 
+                &comp_size,
+                vol->sb.info.device_type_tag, /* e.g. HN4_DEV_HDD */
+                vol->sb.info.hw_caps_flags    /* e.g. HN4_HW_NVM */
+            );
+            
+            /* 
+             * Evaluation: 
+             * - Must fit in payload_cap.
+             * - Must be efficient (comp_size < len).
+             * - Must succeed.
+             */
+            if (c_res == HN4_OK && comp_size < payload_cap && comp_size < len) {
+                
+                /* SUCCESS: Commit compressed data */
+                memcpy(hdr->payload, comp_scratch, comp_size);
+                
+                /* Zero-fill remainder of payload slot is handled by memset(io_buf, 0) above */
+                
+                final_algo = HN4_COMP_ORE;
+                stored_len = comp_size; /* Store compressed size in meta */
+                HN4_LOG_CRIT("WRITE_ATOMIC: Compression Success. %u -> %u bytes.", len, comp_size);
+            } 
+            /* ELSE: Fallback to Raw (Implicit) */
+            
+            hn4_hal_mem_free(comp_scratch);
+        }
+    }
+
+    /* Fallback: If compression failed/skipped, copy raw */
+    if (final_algo == HN4_COMP_NONE) {
+        memcpy(hdr->payload, data, len);
+    }
     
     /* CRC covers full slot (data + zero padding) */
-    uint32_t d_crc = hn4_crc32(0, hdr->payload, payload_cap);
+    uint32_t d_crc = hn4_crc32(HN4_CRC_SEED_DATA, hdr->payload, payload_cap);
 
     /* 
      * 5. The Shadow Hop (Allocation)
@@ -430,7 +470,17 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     /* 
      * Wrap Generation at 32-bits to match Anchor storage width.
      */
-    uint32_t next_gen_32 = hn4_le32_to_cpu(anchor->write_gen) + 1;
+    /* 
+     * Wrap Generation Protection.
+     * If generation wraps, we MUST NOT write. The upper layer must 
+     * perform an Epoch Rotation or deep scrub to reset generations.
+     */
+    uint32_t current_gen = hn4_le32_to_cpu(anchor->write_gen);
+    if (current_gen == UINT32_MAX) {
+        HN4_LOG_CRIT("WRITE_ATOMIC: Generation Wrap! Anchor Locked.");
+        return HN4_ERR_EEXIST; /* Forces Remount/FSCK */
+    }
+    uint32_t next_gen_32 = current_gen + 1;
     uint64_t next_gen = (uint64_t)next_gen_32;
 
     HN4_LOG_CRIT("WRITE_ATOMIC: Physics G=%llu V=%llu M=%u NextGen=%llu", 
@@ -587,7 +637,8 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     }
 
     /* 6. Seal Header */
-    _pack_header(hdr, hn4_le128_to_cpu(anchor->seed_id), block_idx, next_gen, d_crc, HN4_COMP_NONE);
+     uint32_t comp_meta = (stored_len << HN4_COMP_SIZE_SHIFT) | final_algo;
+    _pack_header(hdr, hn4_le128_to_cpu(anchor->seed_id), block_idx, next_gen, d_crc, comp_meta);
 
     /* 7. Commit Data to Media (The Shadow Write) */
     hn4_addr_t phys_sector = hn4_lba_from_sectors(target_lba * sectors);
@@ -640,34 +691,27 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
             uint64_t actual_lba_idx = hn4_addr_to_u64(phys_sector) / sectors;
 
             if (actual_lba_idx != target_lba) {
-                
-                /* BITMAP CORRECTION */
-                /* 1. Release the prediction (Ghost) */
-                _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
-                
-                /* 2. Claim the reality (The drift location) */
-                bool claimed;
-                hn4_result_t map_res = _bitmap_op(vol, actual_lba_idx, BIT_SET, &claimed);
-                
-                if (map_res != HN4_OK) {
-                    /* 
-                     * CRITICAL: Bitmap update failed. We wrote data but cannot track it. 
-                     * Mark volume dirty to force FSCK.
-                     */
-                    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
-                }
-
-                /* 3. Update Local Variable */
-                target_lba = actual_lba_idx;
-
-                /* 4. Update Gravity */
-                if (actual_lba_idx >= block_idx) {
-                    uint64_t new_G = actual_lba_idx - block_idx;
-                    anchor->gravity_center = hn4_cpu_to_le64(new_G);
-                } else {
-                    io_res = HN4_ERR_GEOMETRY;
-                }
-            }
+    /* 
+     * We cannot update the global Gravity Center (G) based on a single block's 
+     * drift, as this would invalidate the trajectory for all other blocks 
+     * in the file.
+     *
+     * If the ZNS drive ignores our placement hint, we must reject the write 
+     * to preserve the mathematical integrity of the Ballistic Index.
+     * The allocator should fallback to the Horizon (Linear) on retry.
+     */
+    HN4_LOG_CRIT("ZNS Drift Detected: Expected %llu, Got %llu. Aborting to protect G.", 
+                 (unsigned long long)target_lba, (unsigned long long)actual_lba_idx);
+                 
+    /* Rollback the bitmap claim on the predicted block */
+    _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+    
+    /* We cannot free the actual_lba_idx because we don't own it in the bitmap yet,
+       and the drive has already written to it. This creates a small leak 
+       (Space Amplification) to be cleaned by the Scavenger later. */
+       
+    return HN4_ERR_GEOMETRY;
+}
         }
     } else {
         /* Standard SSD/HDD Write */
@@ -686,9 +730,54 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
         if (io_res != HN4_ERR_ATOMICS_TIMEOUT) {
             _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
         } else {
-            HN4_LOG_CRIT("WRITE_ATOMIC: Timeout detected. Leaking Block %llu for safety.", 
-                         (unsigned long long)target_lba);
+            HN4_LOG_CRIT("WRITE_ATOMIC: Timeout detected. Leaking Block %llu.", (unsigned long long)target_lba);
+            
+            /* 1. Mark Volume Dirty (Allocator drift) */
             atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+            
+            /* 2. Downgrade Silicon Quality (Firmware distress signal) */
+            if (vol->quality_mask) {
+
+                uint64_t w_idx = target_lba / 32;
+
+                /* Bounds Check */
+            if (((w_idx + 1) * 8) <= vol->qmask_size) {
+        
+                uint32_t shift = (target_lba % 32) * 2;
+        
+                _Atomic uint64_t* q_ptr = (_Atomic uint64_t*)&vol->quality_mask[w_idx];
+        
+                uint64_t old_val = atomic_load_explicit(q_ptr, memory_order_relaxed);
+                uint64_t new_val;
+        
+        
+                /* OPTIMIZATION: Try once. If contention, we skip update rather than spin in hot path. */
+                /* Logic: If Toxic (00), keep Toxic. If Gold/Silver/Bronze, force Bronze (01). */
+        
+                /* REPAIRED: Strict CAS Loop. Toxic updates are mandatory. */
+int retries = 0;
+bool success = false;
+
+do {
+    uint64_t current_state = (old_val >> shift) & 0x3;
+
+    if (current_state == HN4_Q_TOXIC) {
+        success = true; /* Already toxic, nothing to do */
+        break;
+    }
+
+    uint64_t cleared = old_val & ~(3ULL << shift);
+    new_val = cleared | (1ULL << shift); /* Set Bronze */
+
+    success = atomic_compare_exchange_weak_explicit(q_ptr, &old_val, new_val, 
+                                    memory_order_release, 
+                                    memory_order_relaxed);
+                                    
+} while (!success && ++retries < 100);
+    
+            }
+
+         }
         }
 
         hn4_hal_mem_free(io_buf);
@@ -735,20 +824,23 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     }
 
     /* 10. THE ECLIPSE (Atomic Discard of Old LBA) */
-    if (old_lba != HN4_LBA_INVALID && old_lba != target_lba) {
-        
-        /* Discard FIRST to ensure data is invalid before marking free */
-        hn4_addr_t old_phys_sector = hn4_lba_from_blocks(old_lba * sectors);
-        hn4_hal_sync_io(vol->target_device, HN4_IO_DISCARD, old_phys_sector, NULL, sectors);
+    /* 10. THE ECLIPSE (Atomic Discard of Old LBA) */
+if (old_lba != HN4_LBA_INVALID && old_lba != target_lba) {
+    
+    /* 
+     * We removed the synchronous HN4_IO_DISCARD command. 
+     * Blocking on TRIM/UNMAP during the write path causes severe latency spikes.
+     * The old data is logically unreachable once the Anchor is updated (Step 9).
+     */
 
-        /* Barrier to ensure Discard is ordered before Bitmap update */
-        atomic_thread_fence(memory_order_release);
+    /* Barrier: Ensure the Anchor update (Step 9) is visible before freeing old space */
+    atomic_thread_fence(memory_order_release);
 
-        /* Then Clear Bitmap */
-        if (_bitmap_op(vol, old_lba, BIT_CLEAR, NULL) != HN4_OK) {
-            atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
-        }
+    /* Logically Free the old block. Physical TRIM is delegated to the Scavenger. */
+    if (_bitmap_op(vol, old_lba, BIT_CLEAR, NULL) != HN4_OK) {
+        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
     }
+}
 
     HN4_LOG_CRIT("WRITE_ATOMIC: Success.");
     hn4_hal_mem_free(io_buf);
