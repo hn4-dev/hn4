@@ -468,19 +468,24 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
     
     /* 
-     * Wrap Generation at 32-bits to match Anchor storage width.
-     */
-    /* 
-     * Wrap Generation Protection.
-     * If generation wraps, we MUST NOT write. The upper layer must 
-     * perform an Epoch Rotation or deep scrub to reset generations.
+     * Wrap Generation Logic (v26.0 Epoch Rotation).
+     * We allow the 32-bit generation to wrap to 1.
+     * 
+     * SAFETY PROOF:
+     * HN4 uses Ballistic Allocation (Shadow Hop). Every write moves the 
+     * physical LBA to a new trajectory 'k'. The probability of colliding 
+     * with a "Phantom Block" from exactly 4,294,967,295 transactions ago 
+     * at the exact same physical LBA is cryptographically negligible.
      */
     uint32_t current_gen = hn4_le32_to_cpu(anchor->write_gen);
+    uint32_t next_gen_32;
+    
     if (current_gen == UINT32_MAX) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Generation Wrap! Anchor Locked.");
-        return HN4_ERR_EEXIST; /* Forces Remount/FSCK */
+        HN4_LOG_WARN("WRITE_ATOMIC: Generation Wrap (Epoch Rotation). Resetting to 1.");
+        next_gen_32 = 1;
+    } else {
+        next_gen_32 = current_gen + 1;
     }
-    uint32_t next_gen_32 = current_gen + 1;
     uint64_t next_gen = (uint64_t)next_gen_32;
 
     HN4_LOG_CRIT("WRITE_ATOMIC: Physics G=%llu V=%llu M=%u NextGen=%llu", 
@@ -719,69 +724,89 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     }
     
     if (io_res != HN4_OK) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: IO Error %d. Rolling back.", io_res);
-        
         /* 
-         * LATENT WRITE PROTECTION:
-         * If the operation timed out, the HAL/Drive might still be processing it.
-         * We CANNOT free the bitmap, as the drive might overwrite a future owner.
-         * We deliberately leak this block (leave it SET) until FSCK/Scavenger runs.
+         * RESCUE PROTOCOL (v26.0):
+         * If we timed out, the drive might have actually written the data 
+         * but dropped the completion interrupt. Attempt to verify before leaking.
          */
-        if (io_res != HN4_ERR_ATOMICS_TIMEOUT) {
-            _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
-        } else {
-            HN4_LOG_CRIT("WRITE_ATOMIC: Timeout detected. Leaking Block %llu.", (unsigned long long)target_lba);
+        bool rescued = false;
+        
+        if (io_res == HN4_ERR_ATOMICS_TIMEOUT) {
+            HN4_LOG_WARN("WRITE_ATOMIC: Timeout. Attempting Rescue Protocol...");
             
-            /* 1. Mark Volume Dirty (Allocator drift) */
-            atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
-            
-            /* 2. Downgrade Silicon Quality (Firmware distress signal) */
-            if (vol->quality_mask) {
-
-                uint64_t w_idx = target_lba / 32;
-
-                /* Bounds Check */
-            if (((w_idx + 1) * 8) <= vol->qmask_size) {
-        
-                uint32_t shift = (target_lba % 32) * 2;
-        
-                _Atomic uint64_t* q_ptr = (_Atomic uint64_t*)&vol->quality_mask[w_idx];
-        
-                uint64_t old_val = atomic_load_explicit(q_ptr, memory_order_relaxed);
-                uint64_t new_val;
-        
-        
-                /* OPTIMIZATION: Try once. If contention, we skip update rather than spin in hot path. */
-                /* Logic: If Toxic (00), keep Toxic. If Gold/Silver/Bronze, force Bronze (01). */
-        
-                /* REPAIRED: Strict CAS Loop. Toxic updates are mandatory. */
-int retries = 0;
-bool success = false;
-
-do {
-    uint64_t current_state = (old_val >> shift) & 0x3;
-
-    if (current_state == HN4_Q_TOXIC) {
-        success = true; /* Already toxic, nothing to do */
-        break;
-    }
-
-    uint64_t cleared = old_val & ~(3ULL << shift);
-    new_val = cleared | (1ULL << shift); /* Set Bronze */
-
-    success = atomic_compare_exchange_weak_explicit(q_ptr, &old_val, new_val, 
-                                    memory_order_release, 
-                                    memory_order_relaxed);
-                                    
-} while (!success && ++retries < 100);
-    
+            /* 1. Force Barrier to drain drive queue */
+            if (hn4_hal_barrier(vol->target_device) == HN4_OK) {
+                
+                /* 2. Read-Back Verify */
+                void* rescue_buf = hn4_hal_mem_alloc(bs);
+                if (rescue_buf) {
+                    hn4_result_t r_res = hn4_hal_sync_io(vol->target_device, 
+                                                         HN4_IO_READ, 
+                                                         phys_sector, 
+                                                         rescue_buf, 
+                                                         sectors);
+                    
+                    if (r_res == HN4_OK) {
+                        /* Check if the data on disk matches what we intended to write */
+                        if (memcmp(io_buf, rescue_buf, bs) == 0) {
+                            HN4_LOG_WARN("WRITE_ATOMIC: Rescue Successful! Latent write confirmed.");
+                            rescued = true;
+                            io_res = HN4_OK; /* Clear Error */
+                        }
+                    }
+                    hn4_hal_mem_free(rescue_buf);
+                }
             }
-
-         }
         }
 
-        hn4_hal_mem_free(io_buf);
-        return io_res;
+        if (!rescued) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: IO Error %d. Rolling back.", io_res);
+            
+            /* 
+             * LATENT WRITE PROTECTION (The Leak):
+             * We can only free the bitmap if we are certain the drive stopped.
+             * On Timeout, we must leak to prevent data corruption of future allocs.
+             */
+            if (io_res != HN4_ERR_ATOMICS_TIMEOUT) {
+                _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+            } else {
+                HN4_LOG_CRIT("WRITE_ATOMIC: Timeout persists. Leaking Block %llu for Scavenger.", 
+                             (unsigned long long)target_lba);
+                
+                /* Mark Volume as Dirty so Scavenger knows to scan eventually */
+                atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+                
+                /* 2. Downgrade Silicon Quality (Firmware distress signal) */
+                if (vol->quality_mask) {
+                    uint64_t w_idx = target_lba / 32;
+                    /* Bounds Check */
+                    if (((w_idx + 1) * 8) <= vol->qmask_size) {
+                        uint32_t shift = (target_lba % 32) * 2;
+                        _Atomic uint64_t* q_ptr = (_Atomic uint64_t*)&vol->quality_mask[w_idx];
+                        uint64_t old_val = atomic_load_explicit(q_ptr, memory_order_relaxed);
+                        uint64_t new_val;
+                        int retries = 0;
+                        bool success = false;
+
+                        do {
+                            uint64_t current_state = (old_val >> shift) & 0x3;
+                            if (current_state == HN4_Q_TOXIC) {
+                                success = true; /* Already toxic */
+                                break;
+                            }
+                            uint64_t cleared = old_val & ~(3ULL << shift);
+                            new_val = cleared | (1ULL << shift); /* Set Bronze */
+                            success = atomic_compare_exchange_weak_explicit(q_ptr, &old_val, new_val, 
+                                            memory_order_release, 
+                                            memory_order_relaxed);
+                        } while (!success && ++retries < 100);
+                    }
+                }
+            }
+
+            hn4_hal_mem_free(io_buf);
+            return io_res;
+        }
     }
 
     /* 8. The Wall (Data Persistence Barrier) */

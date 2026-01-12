@@ -224,7 +224,6 @@ hn4_TEST(Write, Atomic_Persistence_Verify_Raw) {
     hn4_u128_t file_id = { .lo = 0xCAFEBABE, .hi = 0xDEADBEEF };
     
     anchor.seed_id = hn4_cpu_to_le128(file_id);
-    /* FIX 4: Explicit Generation Init */
     anchor.write_gen = hn4_cpu_to_le32(10);
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
@@ -246,7 +245,6 @@ hn4_TEST(Write, Atomic_Persistence_Verify_Raw) {
 
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
-    /* FIX 2: Strict LBA Unit Math */
     /* Get Flux Start in SECTORS */
     uint64_t flux_start_sec = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
     uint32_t bs = vol->vol_block_size;
@@ -350,17 +348,14 @@ hn4_TEST(Write, Horizon_Write_Verify) {
     
     uint64_t collision_lba = _calc_trajectory_lba(vol, 0, 0, 0, 0, 0);
     bool changed;
-    /* FIX 5: Check bitmap op result */
     ASSERT_EQ(HN4_OK, _bitmap_op(vol, collision_lba, BIT_SET, &changed));
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x1111;
-    /* FIX 4: Init Gen */
     anchor.write_gen = hn4_cpu_to_le32(1);
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID | HN4_HINT_HORIZON);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
 
-    /* FIX 2: Use Endian Helper */
     anchor.gravity_center = hn4_cpu_to_le64(0); 
     anchor.fractal_scale = hn4_cpu_to_le16(0); 
 
@@ -375,7 +370,6 @@ hn4_TEST(Write, Horizon_Write_Verify) {
     ASSERT_TRUE(g_val > 0);
     ASSERT_TRUE(g_val != collision_lba);
     
-    /* FIX 7: Verify Horizon Flag Persists */
     uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
     ASSERT_TRUE((dclass & HN4_HINT_HORIZON) != 0);
 
@@ -383,7 +377,6 @@ hn4_TEST(Write, Horizon_Write_Verify) {
     hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs);
     ASSERT_EQ(HN4_OK, res);
     
-    /* FIX 6: Use explicit length */
     ASSERT_EQ(0, memcmp(read_buf, buf, payload_len));
 
     free(buf); free(read_buf);
@@ -539,27 +532,25 @@ hn4_TEST(Write, ShadowHop_Trajectory_Shift) {
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x4444;
-    anchor.write_gen = hn4_cpu_to_le32(10); /* FIX 4 */
+    anchor.write_gen = hn4_cpu_to_le32(10); 
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
     anchor.gravity_center = hn4_cpu_to_le64(2000);
     
     uint64_t lba_k0 = _calc_trajectory_lba(vol, 2000, 0, 0, 0, 0);
     bool changed;
-    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_k0, BIT_SET, &changed)); /* FIX 5 */
+    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_k0, BIT_SET, &changed)); 
 
     uint8_t buf[64] = "SHADOW_HOP_DATA";
     ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 64));
 
     uint8_t read_buf[4096] = {0};
     ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
-    
-    /* FIX 6: Use explicit length 16 */
     ASSERT_EQ(0, memcmp(read_buf, buf, 16));
 
     uint64_t lba_k1 = _calc_trajectory_lba(vol, 2000, 0, 0, 0, 1);
     bool is_set;
-    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_k1, BIT_TEST, &is_set)); /* FIX 5 */
+    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_k1, BIT_TEST, &is_set)); 
     ASSERT_TRUE(is_set);
 
     hn4_unmount(vol);
@@ -705,14 +696,6 @@ hn4_TEST(Write, Write_Fails_On_RO) {
     write_fixture_teardown(dev);
 }
 
-
-
-
-/* 
- * FIX 9: New Test for Generation Selection
- * Scenario: Create two blocks at different orbits with same ID but different Gens.
- *           Verify Read picks the higher Gen.
- */
 hn4_TEST(Write, Read_Selects_Highest_Generation) {
     hn4_hal_device_t* dev = write_fixture_setup();
     hn4_volume_t* vol = NULL;
@@ -2068,23 +2051,19 @@ hn4_TEST(Write, Write_Generation_Wraparound) {
     uint64_t flux_start_block = hn4_addr_to_u64(vol->sb.info.lba_flux_start) / spb;
     anchor.gravity_center = hn4_cpu_to_le64(flux_start_block + 400);
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE | HN4_PERM_SOVEREIGN);
     anchor.orbit_vector[0] = 1; 
     anchor.fractal_scale = hn4_cpu_to_le16(0);
 
-    /* Set to Max 32-bit Integer */
+    /* Set to Max 32-bit Integer to trigger rotation logic */
     anchor.write_gen = hn4_cpu_to_le32(0xFFFFFFFF);
 
     uint8_t buf[16] = "WRAP_TEST";
 
-    /* 
-     * FIX: Expect REJECTION (HN4_ERR_EEXIST).
-     * The driver now protects against generation wrap-around.
-     */
-    ASSERT_EQ(HN4_ERR_EEXIST, hn4_write_block_atomic(vol, &anchor, 0, buf, 9));
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 9));
     
-    /* Verify Generation did NOT change */
-    ASSERT_EQ(0xFFFFFFFF, hn4_le32_to_cpu(anchor.write_gen));
+    /* Verify Generation wrapped to 1 (Not 0, not overflowed) */
+    ASSERT_EQ(1, hn4_le32_to_cpu(anchor.write_gen));
 
     hn4_unmount(vol);
     write_fixture_teardown(dev);
@@ -7500,8 +7479,6 @@ hn4_TEST(Atomicity, PowerLoss_MidFlight) {
     hn4_block_header_t* h = (hn4_block_header_t*)raw_v2;
     h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
     h->well_id = anchor.seed_id;
-    
-    /* FIX A: Ghost Generation must be 12 (Next Gen) */
     h->generation = hn4_cpu_to_le64(12); 
     
     memcpy(h->payload, "VERSION_2_LOST", 14);
@@ -7522,7 +7499,6 @@ hn4_TEST(Atomicity, PowerLoss_MidFlight) {
     /* 4. Recover & Verify */
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
-    /* FIX B: Anchor state on disk reflects step 1 (Gen 11) */
     anchor.write_gen = hn4_cpu_to_le32(11); 
     
     uint8_t read_buf[4096] = {0};

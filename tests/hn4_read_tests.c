@@ -422,13 +422,6 @@ hn4_TEST(Read, Read_Detects_Ghost_ID) {
  */
 hn4_TEST(Read, Read_Healing_Triggered) {
     hn4_hal_device_t* dev = read_fixture_setup();
-    
-    /* 
-     * FIX 1: Patch Superblock geometry.
-     * The default fixture leaves epoch_ring_block_idx at 0 (pointing to SB itself).
-     * This causes an Epoch CRC mismatch during mount -> Epoch Lost -> Force RO.
-     * We point it to the actual Epoch Ring start (Block 2 / LBA 16).
-     */
     hn4_superblock_t sb;
     hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
     
@@ -440,7 +433,6 @@ hn4_TEST(Read, Read_Healing_Triggered) {
     hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
 
     /* 
-     * FIX 2: Inject valid Epoch 1.
      * SB claims current_epoch_id=1. We must provide matching on-disk data
      * to satisfy the time-travel protection checks in hn4_mount.
      */
@@ -821,7 +813,6 @@ hn4_TEST(Stats, Read_CRC_Stats_Once) {
     uint8_t buf[4096];
     hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
     
-    /* Expect exactly 1 failure count (Fix 6/12 logic) */
     /* Note: If logic tracks per candidate *loop*, it might be 1. 
        If retry loop counts, it might be 2. 
        The FIX was to count once per failure event. */
@@ -832,7 +823,7 @@ hn4_TEST(Stats, Read_CRC_Stats_Once) {
 }
 
 /*
- * TEST: Read_CRC_Stats_Accumulation (Fix #5)
+ * TEST: Read_CRC_Stats_Accumulation 
  * Objective: Ensure stats.crc_failures increments exactly once per block read,
  *            even if multiple candidates fail.
  */
@@ -1165,7 +1156,7 @@ hn4_TEST(Recovery, Heal_Deep_Corruption) {
  *   Read returns Success.
  *   Heal Count = 0.
  *   REASON: We cannot blindly clone compressed blocks because we don't 
- *           decompress/recompress in the repair path (Fix #12).
+ *           decompress/recompress in the repair path.
  */
 hn4_TEST(Recovery, Skip_Heal_If_Compressed) {
     hn4_hal_device_t* dev = read_fixture_setup();
@@ -1540,7 +1531,7 @@ hn4_TEST(Safety, Generation_High_Bit_Attack) {
 
 
 /*
- * TEST: Read_Generation_32Bit_Strictness (Fix A)
+ * TEST: Read_Generation_32Bit_Strictness
  * OBJECTIVE: Verify that reader correctly handles 32-bit generation wrap-around
  *            by ignoring the upper 32-bits of the block header generation field,
  *            BUT strictly enforces equality on the lower 32-bits.

@@ -27,12 +27,6 @@
     * 3. RESILIENCE:
     *    - Structure detection prevents expansion attacks on high-entropy inputs.
     *    - DoS protection against quadratic overlap expansion.
-    *
-    * REVISION NOTES (v60.3 - COMPLETE):
-    *  - [FEAT] ARCH: Integrated HDD Deep Scan and NVM Stream Stores.
-    *  - [FIX] LOGIC: Corrected anchor rewind bug (Fix 12).
-    *  - [FIX] GRAMMAR: Defined strict HN4_MAX_TOKEN_LEN based on varint topology.
-    *  - [PERF] MEMORY: Added strict bounds checks for 4GB+ buffers.
     */
 
     #include "hn4.h"
@@ -282,14 +276,14 @@
     ) {
         if (lit_len == 0) return HN4_OK;
         
-        /* FIX 10: Explicit check against 4GB limit for API safety */
+        /* Explicit check against 4GB limit for API safety */
         if (lit_len > UINT32_MAX) return HN4_ERR_INVALID_ARGUMENT;
 
         uint8_t* op = *op_ptr;
         uint32_t len = (uint32_t)lit_len;
 
         while (len > 0) {
-            /* FIX 5: Chunk clamped to correct MAX_TOKEN_LEN (8223) */
+            /* Chunk clamped to correct MAX_TOKEN_LEN (8223) */
             uint32_t chunk = (len > HN4_MAX_TOKEN_LEN) ? HN4_MAX_TOKEN_LEN : len;
             
             /* Emit Header */
@@ -351,10 +345,6 @@
 
         /* 
         * MAIN COMPRESSION LOOP
-        * 
-        * FIX: Changed loop condition from (ip < ilimit) to (ip <= ilimit).
-        * The previous logic stopped exactly 8 bytes before end, causing the 
-        * last valid 8-byte window to be missed and flushed as literals.
         */
         while (ip <= ilimit) {
             
@@ -383,7 +373,7 @@
 
                 /* Emit Isotopes */
                 while (run_len >= HN4_TENSOR_MIN_SPAN) {
-                    /* FIX 5: Chunk clamp to correct limit */
+                    /* Chunk clamp to correct limit */
                     uint32_t max_encodable_span = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
                     uint32_t chunk = (run_len > max_encodable_span) ? max_encodable_span : (uint32_t)run_len;
                     
@@ -399,12 +389,6 @@
                     ip += chunk;
                 }
                 
-                /* 
-                * FIX 12: Anchor Logic. 
-                * 'ip' is now at the start of the residue (if any).
-                * We must start the next literal span EXACTLY here.
-                * Do NOT rewind by run_len, or we duplicate data!
-                */
                 anchor = ip;
                 continue;
             }
@@ -448,7 +432,7 @@
                         ip += chunk;
                     }
 
-                    /* FIX 12: Same Anchor Logic as Isotope */
+                    /* Same Anchor Logic as Isotope */
                     anchor = ip;
                     continue;
                 }
@@ -495,7 +479,7 @@
 
             /* 
             * VarInt Decode Logic
-            * FIX: Adjusted to correctly handle the "Remainder" byte.
+            * Adjusted to correctly handle the "Remainder" byte.
             * The loop continues only while the byte is 255.
             * The trailing byte (which is < 255 in a terminated sequence, or 
             * implicitly the last one if we hit limit) is added but NOT counted
@@ -514,7 +498,7 @@
                     len += s;
                     
                     /* 
-                    * FIX: Only count 0xFF as an extension byte.
+                    * Only count 0xFF as an extension byte.
                     * The logic: Base(63) + Ext(255) + ... + Rem(x).
                     * If s == 255, we consumed an extension slot.
                     */
@@ -526,7 +510,7 @@
             }
 
             /* 
-            * FIX: Semantic Length Check (Pre-Bias)
+            * Semantic Length Check (Pre-Bias)
             * Ensure the encoded length is valid within the grammar BEFORE adding
             * the compression bias.
             */
@@ -568,7 +552,7 @@
                     if (slope == 0 || slope == -128) return HN4_ERR_DATA_ROT;
 
                     /* 
-                     * FIX 2: Strict Range Pre-Validation
+                     * Strict Range Pre-Validation
                      * Calculate total delta using 32-bit math.
                      * If the total progression exceeds the byte range [0, 255]
                      * at the extremes, reject immediately.
