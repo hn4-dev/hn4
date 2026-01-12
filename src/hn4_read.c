@@ -30,7 +30,7 @@
  * CONSTANTS & MACROS
  * ========================================================================= */
 
-#define HN4_SHOTGUN_DEPTH           12 
+#define HN4_SHOTGUN_DEPTH           12
 
 /* Stack Pressure Relief */
 #if defined(_MSC_VER)
@@ -45,51 +45,53 @@
  * ERROR PRIORITY LOGIC (LOOKUP TABLE OPTIMIZATION)
  * ========================================================================= */
 
-/* 
+/*
  * Error Weighting: Higher values take precedence when merging results.
  * Inverted weights: Generation Skew > Data Rot.
  */
-static int _get_error_weight(hn4_result_t e) {
-    switch(e) {
+static int _get_error_weight(hn4_result_t e)
+{
+    switch (e) {
         /* CRITICAL INFRASTRUCTURE (90-100) */
         case HN4_ERR_CPU_INSANITY:      return 100;
         case HN4_ERR_HW_IO:             return 99;
         case HN4_ERR_NOMEM:             return 95;
-        
+
         /* LOGICAL CONSISTENCY (85-90) - TRANSACTION VIOLATIONS */
         case HN4_ERR_GENERATION_SKEW:   return 85;
         case HN4_ERR_PHANTOM_BLOCK:     return 82;
-        
+
         /* DATA INTEGRITY (75-80) */
         case HN4_ERR_DATA_ROT:          return 80;
         case HN4_ERR_HEADER_ROT:        return 80;
         case HN4_ERR_PAYLOAD_ROT:       return 80;
         case HN4_ERR_DECOMPRESS_FAIL:   return 79;
         case HN4_ERR_ALGO_UNKNOWN:      return 78;
-        
+
         /* LOGICAL MISMATCH (55-70) */
         case HN4_ERR_ID_MISMATCH:       return 60;
         case HN4_ERR_VERSION_INCOMPAT:  return 55;
-        
+
         /* EXPECTED / INFO (0-50) */
         case HN4_ERR_NOT_FOUND:         return 50;
         case HN4_INFO_SPARSE:           return 10;
         case HN4_OK:                    return 0;
-        
-        default:                        return 40; 
+
+        default:                        return 40;
     }
 }
 
-static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err) {
+static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)
+{
     if (current == HN4_OK) return new_err;
     if (new_err == HN4_OK) return current;
-    
+
     int w_cur = _get_error_weight(current);
     int w_new = _get_error_weight(new_err);
-    
+
     if (w_new > w_cur) return new_err;
     if (w_new < w_cur) return current;
-    
+
     /* Tie-breaker: Deterministic ordering (prefer lower numerical value) */
     return (new_err < current) ? new_err : current;
 }
@@ -110,26 +112,27 @@ static hn4_result_t _validate_block(
 
     /* Hardware Defense: Ensure IO buffer is complete */
     if (HN4_UNLIKELY(len < vol->vol_block_size)) {
-        HN4_LOG_ERR("Block Validation: Short Read. Got %u, Need %u", 
+        HN4_LOG_ERR("Block Validation: Short Read. Got %u, Need %u",
                     len, vol->vol_block_size);
         return HN4_ERR_HW_IO;
     }
 
     /* 1. Magic Check & Poison Detection */
     uint32_t magic_val = hn4_le32_to_cpu(hdr->magic);
-    
+
     if (magic_val == 0xCCCCCCCC) {
         /* Poison Heuristic: Scan first cache line to confirm strict poisoning */
         const uint64_t* scan = (const uint64_t*)buffer;
         bool is_poison = true;
+
         /* Check 64 bytes (8 x 64-bit words) */
-        for(int i=0; i<8; i++) {
+        for (int i = 0; i < 8; i++) {
             if (scan[i] != 0xCCCCCCCCCCCCCCCCULL) {
                 is_poison = false;
                 break;
             }
         }
-        
+
         if (is_poison) {
             HN4_LOG_CRIT("DMA Failure: Buffer contains strict poison pattern.");
             return HN4_ERR_HW_IO;
@@ -137,14 +140,14 @@ static hn4_result_t _validate_block(
     }
 
     if (magic_val != HN4_BLOCK_MAGIC) {
-        return HN4_ERR_PHANTOM_BLOCK; 
+        return HN4_ERR_PHANTOM_BLOCK;
     }
 
     /* 2. Header Integrity Check */
     size_t   header_boundary = offsetof(hn4_block_header_t, header_crc);
     uint32_t stored_hcrc     = hn4_le32_to_cpu(hdr->header_crc);
     uint32_t calc_hcrc       = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, header_boundary);
-    
+
     if (stored_hcrc != calc_hcrc) return HN4_ERR_HEADER_ROT;
 
     /* 3. Identity Check */
@@ -153,7 +156,7 @@ static hn4_result_t _validate_block(
         return HN4_ERR_ID_MISMATCH;
     }
 
-    /* 
+    /*
      * 4. Freshness Check (STRICT ATOMICITY)
      * Architectural wrap risk documented.
      * We strictly enforce generation equality. Writer wraps at 32-bit boundary.
@@ -164,14 +167,14 @@ static hn4_result_t _validate_block(
     uint32_t exp_gen_32 = (uint32_t)expected_gen;
 
     if (blk_gen_32 != exp_gen_32) {
-        return HN4_ERR_GENERATION_SKEW; 
+        return HN4_ERR_GENERATION_SKEW;
     }
 
     /* 5. Data Integrity */
     uint32_t payload_sz = HN4_BLOCK_PayloadSize(vol->vol_block_size);
     uint32_t comp_meta  = hn4_le32_to_cpu(hdr->comp_meta);
     uint32_t c_size     = comp_meta >> HN4_COMP_SIZE_SHIFT;
-    
+
     if (c_size > payload_sz) {
         HN4_LOG_WARN("Block Validation: Meta Corruption (CSize %u > Payload %u)", c_size, payload_sz);
         return HN4_ERR_HEADER_ROT;
@@ -179,7 +182,7 @@ static hn4_result_t _validate_block(
 
     uint32_t stored_dcrc = hn4_le32_to_cpu(hdr->data_crc);
     uint32_t calc_dcrc   = hn4_crc32(HN4_CRC_SEED_DATA, hdr->payload, payload_sz);
-    
+
     if (stored_dcrc != calc_dcrc) {
         HN4_LOG_WARN("Block Validation: Payload CRC Mismatch");
         return HN4_ERR_PAYLOAD_ROT;
@@ -214,31 +217,31 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 1. Permissions Gate */
-    uint32_t perms = hn4_le32_to_cpu(anchor.permissions);
+    uint32_t perms  = hn4_le32_to_cpu(anchor.permissions);
     uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
-    
+
     if (!(perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))) return HN4_ERR_ACCESS_DENIED;
-    if ((perms & HN4_PERM_ENCRYPTED) || (dclass & HN4_HINT_ENCRYPTED)) return HN4_ERR_ACCESS_DENIED; 
+    if ((perms & HN4_PERM_ENCRYPTED) || (dclass & HN4_HINT_ENCRYPTED)) return HN4_ERR_ACCESS_DENIED;
 
     /* 2. Physics & Geometry Extraction */
     uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
-    
+
     uint64_t V = 0;
     memcpy(&V, anchor.orbit_vector, 6);
     V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
-    
+
     uint16_t   M          = hn4_le16_to_cpu(anchor.fractal_scale);
     hn4_u128_t well_id    = hn4_le128_to_cpu(anchor.seed_id);
     uint64_t   anchor_gen = (uint64_t)hn4_le32_to_cpu(anchor.write_gen);
 
     uint32_t              bs   = vol->vol_block_size;
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    
+
     if (HN4_UNLIKELY(!caps)) return HN4_ERR_INTERNAL_FAULT;
 
     uint32_t ss = caps->logical_block_size;
     if (HN4_UNLIKELY(ss == 0 || (bs % ss) != 0)) return HN4_ERR_ALIGNMENT_FAIL;
-    
+
     uint32_t sectors = bs / ss;
 
     /* 3. Hardware Profile Tuning */
@@ -250,7 +253,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     switch (profile) {
         case HN4_PROFILE_PICO:
-            depth_limit = 1;
+            depth_limit   = 1;
             allow_healing = false;
             break;
         case HN4_PROFILE_USB:
@@ -268,62 +271,65 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 4. Candidate Generation */
-    uint64_t candidates[HN4_SHOTGUN_DEPTH] = {0};
-    hn4_result_t candidate_errors[HN4_SHOTGUN_DEPTH]; 
+    uint64_t     candidates[HN4_SHOTGUN_DEPTH] = {0};
+    hn4_result_t candidate_errors[HN4_SHOTGUN_DEPTH];
     hn4_result_t probe_error = HN4_OK;
-    int valid_candidates = 0;
-    uint64_t max_blocks = vol->vol_capacity_bytes / bs;
+    int          valid_candidates = 0;
+    uint64_t     max_blocks = vol->vol_capacity_bytes / bs;
 
-    for(int i = 0; i < HN4_SHOTGUN_DEPTH; i++) candidate_errors[i] = HN4_ERR_NOT_FOUND;
+    for (int i = 0; i < HN4_SHOTGUN_DEPTH; i++) candidate_errors[i] = HN4_ERR_NOT_FOUND;
 
     if (dclass & HN4_HINT_HORIZON) {
         uint16_t safe_M = (M > 63) ? 63 : M;
-        uint64_t stride = (1ULL << safe_M); 
-        
+        uint64_t stride = (1ULL << safe_M);
+
         if (block_idx < (UINT64_MAX / stride)) {
             uint64_t linear_lba = G + (block_idx * stride);
             if (linear_lba < max_blocks) {
                 bool allocated;
                 hn4_result_t op_res = _bitmap_op(vol, linear_lba, BIT_TEST, &allocated);
-                
+
                 if (op_res != HN4_OK) {
                     probe_error = _merge_error(probe_error, op_res);
                 } else if (allocated) {
-                    candidates[0] = linear_lba;
+                    candidates[0]    = linear_lba;
                     valid_candidates = 1;
                 }
             }
         }
     } else {
-        if (HN4_UNLIKELY(dev_type == HN4_DEV_TAPE)) return HN4_ERR_GEOMETRY; 
+        if (HN4_UNLIKELY(dev_type == HN4_DEV_TAPE)) return HN4_ERR_GEOMETRY;
 
         for (uint8_t k = 0; k < depth_limit; k++) {
-            /* 
+            /*
              * Trajectory Jitter.
              * For higher orbits (k >= 8), apply a secondary swizzle to 'G' (Gravity Center)
              * to force candidates into uncorrelated physical regions (Anti-Wordline Bias).
              */
             uint64_t effective_G = (k >= 8) ? (G ^ hn4_swizzle_gravity_assist(G)) : G;
             uint64_t effective_V = (k >= 4) ? hn4_swizzle_gravity_assist(V) : V;
-            
+
             uint64_t lba = _calc_trajectory_lba(vol, effective_G, effective_V, block_idx, M, k);
-            
+
             if (lba == HN4_LBA_INVALID || lba >= max_blocks) continue;
 
             bool duplicate = false;
             for (int d = 0; d < valid_candidates; d++) {
-                if (candidates[d] == lba) { duplicate = true; break; }
+                if (candidates[d] == lba) {
+                    duplicate = true;
+                    break;
+                }
             }
             if (duplicate) continue;
 
             bool is_allocated;
             hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
-            
+
             if (op_res != HN4_OK) {
                 probe_error = _merge_error(probe_error, op_res);
-                continue; 
+                continue;
             }
-            
+
             if (is_allocated && valid_candidates < HN4_SHOTGUN_DEPTH) {
                 candidates[valid_candidates++] = lba;
             }
@@ -331,7 +337,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* Trajectory Collapse Detection */
-     if (depth_limit >= 2 && valid_candidates == 1) {
+    if (depth_limit >= 2 && valid_candidates == 1) {
         atomic_fetch_add(&vol->stats.trajectory_collapse_counter, 1);
         HN4_LOG_WARN("Trajectory Collapse: Only 1 candidate found (Limit %d)", depth_limit);
     }
@@ -351,57 +357,57 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     if (!io_buf) return HN4_ERR_NOMEM;
 
     hn4_result_t deep_error = HN4_ERR_NOT_FOUND;
-    int winner_idx = -1;
-    uint32_t failed_mask = 0; 
+    int          winner_idx = -1;
+    uint32_t     failed_mask = 0;
 
     for (int i = 0; i < valid_candidates; i++) {
         uint64_t target_lba = candidates[i];
-        
+
         if (target_lba > (UINT64_MAX / sectors)) {
             failed_mask |= (1U << i);
             candidate_errors[i] = HN4_ERR_GEOMETRY;
-            deep_error = _merge_error(deep_error, HN4_ERR_GEOMETRY);
+            deep_error          = _merge_error(deep_error, HN4_ERR_GEOMETRY);
             continue;
         }
-        
+
         hn4_addr_t phys_sector = hn4_lba_from_blocks(target_lba * sectors);
 
         int max_retries = (vol->sb.info.hw_caps_flags & HN4_HW_NVM) ? 1 : 2;
-        int tries = 0;
+        int tries       = 0;
         hn4_result_t io_res;
-        
+
         do {
-            /* 
+            /*
              * L10 OPTIMIZATION: Partial Poison.
-             * Only poison the header/cache-line (64 bytes). The validation logic 
+             * Only poison the header/cache-line (64 bytes). The validation logic
              * checks the first 64 bytes for the 0xCC signature to detect DMA ghosts.
              * Wiping the payload (bs) is unnecessary bandwidth waste.
              */
-            memset(io_buf, 0xCC, 64); 
-            
+            memset(io_buf, 0xCC, 64);
+
             io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_sector, io_buf, sectors);
-            
+
             if (io_res == HN4_OK) {
                 hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen);
-                
+
                 if (val_res == HN4_OK) {
                     /* Bitmap Race Window Check */
                     bool still_alloc;
                     if (_bitmap_op(vol, target_lba, BIT_TEST, &still_alloc) == HN4_OK && !still_alloc) {
                         io_res = HN4_ERR_PHANTOM_BLOCK;
                     } else {
-                        /* 
+                        /*
                          * Pre-emptive Healing Trigger.
-                         * If the HAL reported a Soft Error (INFO_HEALED) during the read, 
+                         * If the HAL reported a Soft Error (INFO_HEALED) during the read,
                          * mark this candidate as needing repair (failed_mask) despite success.
                          * This forces Auto-Medic to rewrite the degrading block.
                          */
                         if (io_res == HN4_INFO_HEALED) {
-                            failed_mask |= (1ULL << i); 
+                            failed_mask |= (1ULL << i);
                             /* Set error code to ROT to signal repair logic */
-                            candidate_errors[i] = HN4_ERR_DATA_ROT; 
+                            candidate_errors[i] = HN4_ERR_DATA_ROT;
                         }
-                        
+
                         io_res = HN4_OK;
                     }
                     break;
@@ -409,7 +415,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
                 if (val_res != HN4_ERR_DATA_ROT && val_res != HN4_ERR_PAYLOAD_ROT) {
                     io_res = val_res;
-                    break; 
+                    break;
                 }
                 io_res = val_res;
             }
@@ -418,17 +424,16 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 hn4_hal_micro_sleep(retry_sleep);
             }
         } while (io_res != HN4_OK && tries < max_retries);
-        
+
         candidate_errors[i] = io_res;
 
         if (io_res == HN4_OK) {
-            
-            hn4_block_header_t* hdr = (hn4_block_header_t*)io_buf;
-            uint32_t comp_meta = hn4_le32_to_cpu(hdr->comp_meta);
-            uint8_t  algo      = comp_meta & HN4_COMP_ALGO_MASK;
-            uint32_t c_size    = comp_meta >> HN4_COMP_SIZE_SHIFT;
-            uint32_t max_payload = payload_cap; 
-            hn4_result_t decomp_res = HN4_OK;
+            hn4_block_header_t* hdr    = (hn4_block_header_t*)io_buf;
+            uint32_t comp_meta         = hn4_le32_to_cpu(hdr->comp_meta);
+            uint8_t  algo              = comp_meta & HN4_COMP_ALGO_MASK;
+            uint32_t c_size            = comp_meta >> HN4_COMP_SIZE_SHIFT;
+            uint32_t max_payload       = payload_cap;
+            hn4_result_t decomp_res    = HN4_OK;
 
             switch (algo) {
                 case HN4_COMP_NONE:
@@ -443,12 +448,12 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                     }
                     break;
                 }
-                
+
                 case HN4_COMP_TCC:
                 {
                     uint32_t actual_out_size = 0;
                     decomp_res = hn4_decompress_block(hdr->payload, c_size, out_buffer, buffer_len, &actual_out_size);
-                    
+
                     /* Map internal buffer exhaustion to semantic API error */
                     if (decomp_res == HN4_ERR_NOMEM) {
                         decomp_res = HN4_ERR_DECOMPRESS_FAIL;
@@ -461,7 +466,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                     }
                     break;
                 }
-                
+
                 default:
                     decomp_res = HN4_ERR_ALGO_UNKNOWN;
                     break;
@@ -480,7 +485,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
         } else {
             failed_mask |= (1U << i);
             deep_error = _merge_error(deep_error, io_res);
-            
+
             /* Telemetry Split */
             if (io_res == HN4_ERR_HEADER_ROT || io_res == HN4_ERR_PAYLOAD_ROT || io_res == HN4_ERR_DATA_ROT) {
                 atomic_fetch_add(&vol->stats.crc_failures, 1);
@@ -490,29 +495,28 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     /* 6. Auto-Medic */
     if (HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0) {
-        
+
         hn4_block_header_t* w_hdr = (hn4_block_header_t*)io_buf;
         uint32_t w_meta = hn4_le32_to_cpu(w_hdr->comp_meta);
-        uint8_t algo = w_meta & HN4_COMP_ALGO_MASK;
-        
+        uint8_t algo    = w_meta & HN4_COMP_ALGO_MASK;
+
         if (algo == HN4_COMP_NONE) {
             if (vol->read_only) {
                 HN4_LOG_WARN("READ_ATOMIC: Skipping Auto-Medic (RO).");
             } else {
-                
                 for (int i = 0; i < valid_candidates; i++) {
                     if (i == winner_idx) continue;
-                
+
                     if (failed_mask & (1U << i)) {
                         hn4_result_t err = candidate_errors[i];
                         if (err == HN4_ERR_GENERATION_SKEW || err == HN4_ERR_ID_MISMATCH) continue;
 
-                        uint64_t bad_lba_idx = candidates[i];
-                        hn4_addr_t bad_phys = hn4_lba_from_blocks(bad_lba_idx * sectors);
-                        
+                        uint64_t   bad_lba_idx = candidates[i];
+                        hn4_addr_t bad_phys    = hn4_lba_from_blocks(bad_lba_idx * sectors);
+
                         /* Re-verify CRC before writing back to disk */
                         size_t h_bound = offsetof(hn4_block_header_t, header_crc);
-                        
+
                         /* Polish: Save original CRC to restore state after write attempt */
                         uint32_t saved_crc = w_hdr->header_crc;
 
@@ -533,7 +537,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     hn4_hal_mem_free(io_buf);
-    
+
     if (winner_idx == -1) {
         /* Do not wipe output buffer on error */
         return deep_error;
