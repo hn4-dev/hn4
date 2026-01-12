@@ -16,147 +16,201 @@
 
 ---
 
-## ⚡ Why HN4? (The Physics of Speed)
+## 1. System Overview
 
-Standard filesystems (ext4, NTFS, XFS) use **Trees** to manage data. To find a file block, the CPU must traverse metadata nodes.
-**HN4 uses Math.** To find a block, it calculates a ballistic trajectory.
+HN4 is a freestanding, deterministic file system driver designed for high-performance and constrained computing environments. Unlike traditional file systems (EXT4, XFS, NTFS) that rely on B-Tree or extent-tree structures for block allocation, HN4 utilizes **Ballistic Addressing**.
 
-### 1. The Speed of Math (Latency)
-In traditional systems, finding data is a search operation ($O(\log N)$). In HN4, it is a calculation ($O(1)$).
+This architecture eliminates tree traversal overhead, providing **amortized $O(1)$** allocation and lookup time complexity. The driver is designed to link directly into kernels, bootloaders, or bare-metal firmware without dependencies on `libc`, `malloc`, or POSIX threads.
 
-```c
-// Standard FS (Tree Search)
-Block = Root -> Node A -> Node B -> Leaf; // Latency: Microseconds
-
-// HN4 (Ballistic Calculation)
-LBA = Gravity_Center + (Velocity * N);    // Latency: Nanoseconds
-```
-
-**Benchmark Visualization: Lookup Latency vs File Size**
-```mermaid
-%%{init: {'theme': 'dark'}}%%
-xychart-beta
-    title "Read Latency (Lower is Better)"
-    x-axis ["1GB (Standard)", "1GB (HN4)", "100GB (Standard)", "100GB (HN4)", "1TB (Standard)", "1TB (HN4)"]
-    y-axis "Latency (µs)" 0 --> 100
-    bar [10, 1, 60, 1, 95, 1]
-```
-
-
-### 2. The "Shotgun" Protocol (Throughput)
-Modern NVMe drives have 128+ hardware queues. Standard filesystems read sequentially, leaving bandwidth on the table.
-HN4's **Shotgun Protocol** fires multiple trajectory requests ($k=0..3$) simultaneously across NAND channels.
-
-```text
-[ NVMe Hardware Queues ]
-Standard FS:  [ R ][ . ][ . ][ . ]  (Sequential Bottleneck)
-HN4 Engine:   [ R ][ R ][ R ][ R ]  (Bus Saturation)
-```
+### Key Capabilities
+*   **Deterministic Latency:** Read/Write performance remains constant regardless of volume fragmentation or capacity utilization.
+*   **Embedded to Enterprise:** Scales from 1MB micro-volumes (IoT/Embedded) to 18 Exabytes (Server/ZNS).
+*   **Crash Consistency:** Uses an Epoch-based transaction ring to guarantee atomic state transitions without a journaling penalty.
 
 ---
 
-## 🏗️ Architecture: A Paradigm Shift
+## 2. Architectural Concepts
 
-HN4 is not just "faster"; it is architecturally distinct from anything in the POSIX world.
+HN4 replaces standard file system nomenclature with physics-based allocation models to describe its deterministic behavior.
 
-### 🌌 The Void Engine (Ballistic Allocator)
-We do not scan bitmaps for free space. We calculate entropy holes.
-*   **No Fragmentation:** On Flash/NVMe, scattering data maximizes parallelism.
-*   **No Degradation:** Performance remains deterministic even at 99% capacity.
+### 2.1. Ballistic Allocation (The Void Engine)
+Instead of scanning allocation bitmaps for free blocks, HN4 calculates the physical location of data using a trajectory function.
+*   **Mechanism:** Data placement is determined by a file's **Gravity Center ($G$)**, **Orbit Vector ($V$)**, and **Fractal Scale ($M$)**.
+*   **Formula:**
+    $$ LBA_{phys} = \left( G + (Sequence \times V) \right) \pmod{Capacity} $$
+*   **Collision Resolution:** If the calculated block is occupied, the engine applies a **Gravity Assist** (bitwise XOR rotation) to the vector to select a deterministic alternative candidate ($k=0..12$).
 
-### 🧬 The Helix (Auto-Medic)
-**Single-Drive Self-Healing.**
-Most filesystems rely on RAID for repair. HN4 writes data to a primary trajectory ($k=0$) and parity/redundancy to alternate orbits ($k>0$).
-*   If a block is rot/toxic, the **Auto-Medic** calculates the alternate trajectory, reads the replica, heals the primary, and returns the data—all transparently to the user.
-
-### 🧠 Tensor Tunnels (GPU Direct)
-Built for AI. HN4 supports **Direct Memory Access (DMA)** from storage directly to NPU/GPU memory, bypassing the CPU copy overhead completely via the `HN4_ALLOC_TENSOR` alignment strategy.
-
-### ⏳ Wormholes (Time Travel)
-The **Epoch Ring** is not just a journal; it is a time machine.
-*   Mount the filesystem state from 5 seconds ago or 5 days ago.
-*   Snapshots are lightweight pointer offsets, not heavy copy-on-write chains.
+### 2.2. Atomic Persistence (Shadow Hop)
+HN4 enforces strict out-of-place update semantics.
+*   **Mechanism:** Updates are never written in-place. New data is written to a calculated "Shadow" LBA.
+*   **Commit:** A hardware barrier (FLUSH) is issued. Only after data persistence is confirmed is the file's **Anchor** (metadata node) updated in RAM to point to the new generation.
+*   **Eclipse:** The old data block is atomically deallocated (bitmap cleared) after the metadata update is durable.
 
 ---
 
-## 🎛️ Simplicity via Profiles
+## 3. AI & Tensor Stream Architecture
 
-The internal math (Gravity Assist, Morton Codes, Hamming ECC) is complex. The interface is not.
-The **Profile System** abstracts the physics engine into 5 distinct modes, optimizing the math for the hardware automatically.
+HN4 includes a dedicated subsystem for Artificial Intelligence workloads (LLM Training/Inference) called the **Tensor Stream Layer**. This layer addresses the I/O bottlenecks inherent in loading multi-terabyte models across distributed topologies.
 
-| Profile | Target Hardware | Math Strategy ($V$) | Behavior |
+### 3.1. Tensor Virtualization
+Large AI models are often sharded across multiple physical storage anchors to prevent allocation lock-ups. The Tensor Layer (`hn4_tensor.c`) virtualizes these distributed shards into a single, contiguous byte-addressable stream.
+*   **Resonance Discovery:** The driver scans the Cortex metadata region using a **Bloom Filter**. It identifies all Anchors associated with a specific Model Tag (e.g., `model:llama3-70b`) in $O(N)$ linear time without directory traversal.
+*   **Monotonic Ordering:** Shards are automatically sequenced based on their 128-bit Seed IDs, presenting a unified address space to the inference engine.
+
+### 3.2. Topology Awareness (Path-Aware Striping)
+In multi-GPU environments (e.g., HGX H100 pods), data locality is critical. HN4 implements **Path-Aware Striping**:
+1.  **Topology Map:** At mount time, the driver queries the HAL for the system topology (NUMA nodes, PCIe switches).
+2.  **Affinity Bias:** When allocating storage for a specific Tensor shard, the allocator checks the calling thread's hardware context (via `hn4_hal_get_calling_gpu_id`).
+3.  **Local Placement:** The driver forces the allocation to occur in the physical Namespace or Zone physically closest to the requesting accelerator's PCIe root complex, minimizing QPI/UPI interconnect traffic during loading.
+
+---
+
+## 4. I/O Mechanics & Persistence Model
+
+HN4 separates the persistence of **Data** (Payload) from the persistence of **Metadata** (Allocation Maps). This hybrid model ensures performance while maintaining consistency.
+
+### 4.1. How Data is Written (The Shadow Hop)
+HN4 updates data by shifting its ballistic trajectory rather than overwriting in place.
+
+1.  **Trajectory Calculation:** To overwrite a logical block, the driver calculates a **new** physical location. This is done by incrementing the file's Generation counter, which alters the input variables for the ballistic equation ($G, V, k$).
+2.  **Shadow Write:** The data is written to this new, empty physical block (the "Shadow" block).
+3.  **Barrier:** The driver issues a hardware flush (FUA) to ensure the data is durable on the media.
+4.  **Anchor Update:** Once durability is confirmed, the file's Anchor (metadata) is updated in **RAM** to reflect the new Generation count.
+5.  **Eclipse:** The old physical block associated with the previous generation is immediately marked as free in the in-memory bitmap.
+
+### 4.2. How Data is Read (Ballistic Projection)
+Reading does not involve looking up block pointers in a table. It involves re-calculating where the data *must* be.
+
+1.  **Projection:** The driver reads the file's Anchor to load the physics parameters ($G, V, M$) and the current Generation.
+2.  **Calculation:** It computes the target LBA for the requested logical offset using the ballistic formula.
+3.  **Shotgun Probe:** Because write collisions may have forced the data into a secondary orbit ($k>0$), the reader checks the calculated LBA.
+4.  **Verification:** The driver reads the block and verifies:
+    *   **CRC32:** Data integrity.
+    *   **Well ID:** Ensures the block belongs to this file.
+    *   **Sequence & Generation:** Ensures this is the specific byte-range and version requested, not stale data or a hash collision.
+5.  **Iteration:** If validation fails (e.g., collision), the driver calculates the next orbital position ($k+1$) and repeats until the valid block is found.
+
+### 4.3. How State is Saved (Global Persistence)
+While data blocks are flushed immediately, the filesystem structure (Bitmaps and Anchors) is cached in RAM to maximize throughput. Global persistence occurs during **Sync** or **Unmount**:
+
+1.  **Bitmap Flush:** The in-memory allocation bitmaps (Void Bitmap) and quality masks are written to their reserved regions on disk.
+2.  **Cortex Flush:** Modified Anchors are written to the Cortex region.
+3.  **Epoch Advance:** The global transaction counter is incremented and written to the Epoch Ring. This acts as the "Commit" timestamp.
+4.  **Superblock Broadcast:** The volume Superblock is updated and broadcast to 4 physical locations (North, East, West, South) to ensure redundancy against physical media rot.
+
+---
+
+## 5. File Discovery (Namespace)
+
+HN4 uses a flat, content-addressable metadata region called the **Cortex (D0)**. There are no directory trees.
+
+### 5.1. The Resonance Scan
+To locate a file, the driver performs a scan of the Cortex region:
+1.  **Hashing:** The requested filename is hashed into a 64-bit Bloom Filter mask.
+2.  **Scan:** The driver iterates through Anchor slots in the Cortex.
+3.  **Filter Check:** It checks the Anchor's tag mask against the search hash.
+    *   Mismatch: The Anchor is skipped (Cost: ~3 CPU cycles).
+    *   Match: The driver performs a full string comparison to confirm identity.
+4.  **Load:** Upon a match, the Anchor is loaded, initializing the ballistic variables ($G, V$) for I/O operations.
+
+---
+
+## 6. Storage Profiles
+
+The physical layout of the volume adapts to the underlying media characteristics defined at format time.
+
+| Profile | Target Hardware | Block Size | Optimization Strategy |
 | :--- | :--- | :--- | :--- |
-| **PICO** | Microcontrollers (ESP32/ARM) | $V=1$ (Linear) | Minimal RAM usage. Zero-alloc streams. |
-| **ARCHIVE** | HDDs / Tape | $V=1$ (Linear) | Sequential I/O. Maximizes density. No seeking. |
-| **GAMING** | Consoles / NVMe | $V=17$ (Scatter) | Max random read speed. Shotgun Protocol active. |
-| **AI** | GPU Clusters | $V=17$ (Scatter) | 2MB Alignment. Tensor Tunneling enabled. |
-| **SYSTEM** | OS Boot Drives | Special | "Launchpad" layout. Data at LBA 0 for instant boot. |
+| **GENERIC** | NVMe / SATA SSD | 4KB | Standard Ballistic Allocation with full bitmap caching. |
+| **PICO** | Microcontrollers | 512B | **Zero-RAM Mode.** Disables in-memory bitmaps. Uses direct flash reads for allocation checks to minimize heap usage (<2KB RAM). |
+| **SYSTEM** | Bootloaders | 4KB | **The Launchpad.** Moves metadata to the physical center of the disk. Reserves the first 1GB for contiguous, linear boot files to optimize XIP. |
+| **GAMING** | Workstations | 64KB | **Outer Rim Bias.** Prioritizes allocation on the outer tracks of HDDs (highest angular velocity) for low-latency asset streaming. |
+| **AI** | H100 / Training Clusters | 64KB - 2MB | **Tensor Tunneling.** Uses large block alignment to match GPU page sizes. Enables path-aware striping based on topology maps. |
+| **ARCHIVE** | Tape / SMR HDD | 64KB+ | **Linear Append.** Enforces strictly sequential writes to accommodate Shingled Magnetic Recording (SMR) zones. |
 
 ---
 
-## 🛠️ Integration & Usage
+## 7. Developer Integration
 
-HN4 is written in strict **C99/C11**. It is designed for **Bare Metal** and **Kernel** environments.
+To integrate HN4 into a kernel or firmware project, the following requirements must be met:
 
-### Requirements
-*   No Heap Allocation (Optional)
-*   No OS Dependencies (Freestanding)
-*   128-bit Atomics (or software fallback)
+1.  **Compiler:** C99 or C11 compliant compiler (GCC, Clang, MSVC).
+2.  **Endianness:** The driver handles endianness internally, but `hn4_endians.h` must be configured if the target is Big Endian.
+3.  **Hardware Abstraction Layer (HAL):** You must implement `hn4_hal.c` to map the driver to your hardware. Required hooks:
+    *   `hn4_hal_mem_alloc(size_t)` / `hn4_hal_mem_free(void*)`: Map to `kmalloc` or system heap.
+    *   `hn4_hal_submit_io(...)`: Map to your block device driver (NVMe submission queue, AHCI, or SPI read/write).
+    *   `hn4_hal_get_time_ns()`: A monotonic clock source.
 
-### Example: Formatting a Drive
+---
+
+## 8. Build & Usage Instructions
+
+### Option A: Building a Simulation / Test Executable
+For testing, fuzzing, or user-space utilities, compile all sources into a single binary.
+
+```bash
+# Linux / macOS (GCC or Clang)
+gcc -std=c11 -O2 \
+    src/*.c \
+    test/sim_hal.c \
+    test/main_test.c \
+    -I include/ \
+    -D_GNU_SOURCE \
+    -o hn4_test
+
+# Run the architectural verification suite
+./hn4_test
+```
+
+### Option B: Building for Kernel / Bare Metal
+When building for a kernel module or firmware, compile the core object file without linking the test harness.
+
+```bash
+# Compile Core Driver Object
+gcc -std=c11 -O3 -ffreestanding -nostdlib \
+    -c src/hn4_core.c \
+    -c src/hn4_addr.c \
+    -c src/hn4_allocator.c \
+    -c src/hn4_read.c \
+    -c src/hn4_write.c \
+    -c src/hn4_tensor.c \
+    -I include/ \
+    -o hn4_driver.o
+
+# Link hn4_driver.o with your OS kernel or firmware image
+```
+
+### Option C: Mounting a Volume (Code Example)
+Once linked, the API is used as follows:
+
 ```c
 #include "hn4.h"
 
-// 1. Initialize the HAL (Hardware Abstraction Layer)
-hn4_hal_device_t* dev = my_driver_init("/dev/nvme0n1");
+void mount_example(hn4_hal_device_t* phys_dev) {
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t params = {0};
 
-// 2. Define Parameters
-hn4_format_params_t params = {
-    .label = "PS6_Game_Drive",
-    .target_profile = HN4_PROFILE_GAMING, // Optimized for random reads
-    .clone_uuid = false
-};
+    // 1. Initialize HAL
+    hn4_hal_init();
 
-// 3. Format (Returns O(1) success/fail)
-hn4_result_t res = hn4_format(dev, &params);
+    // 2. Mount Volume
+    // The driver automatically probes geometry and validates the superblock.
+    hn4_result_t res = hn4_mount(phys_dev, &params, &vol);
 
-if (res == HN4_OK) {
-    printf("Volume formatted. Shotgun Protocol engaged.\n");
+    if (res == HN4_OK) {
+        // 3. Resolve a File (Namespace Lookup)
+        hn4_anchor_t file_anchor;
+        res = hn4_ns_resolve(vol, "config/boot.cfg", &file_anchor);
+        
+        if (res == HN4_OK) {
+            // 4. Read Data (Ballistic Read)
+            char buffer[4096];
+            // Read logical block 0
+            hn4_read_block_atomic(vol, &file_anchor, 0, buffer, 4096);
+        }
+        
+        // 5. Unmount (Flushes Bitmaps and Anchors to disk)
+        hn4_unmount(vol);
+    }
 }
 ```
-
-### Example: Reading a File
-```c
-// Open handle (Zero metadata I/O if cached)
-hn4_handle_t* h = hn4_api_open(vol, "/data/level_map.bin", O_RDONLY);
-
-// Read directly into buffer (Zero-Copy DMA)
-// The engine calculates LBA = G + (V*N) and fires NVMe commands.
-uint64_t bytes_read;
-hn4_api_read(h, my_buffer, 1024*1024, &bytes_read);
-```
-
----
-
-## 📊 Comparison
-
-| Feature | HN4 | ext4 / XFS | ZFS |
-| :--- | :--- | :--- | :--- |
-| **Lookup Algo** | **Math ($O(1)$)** | B-Tree ($O(\log n)$) | B-Tree ($O(\log n)$) |
-| **Integrity** | **Self-Healing (Helix)** | Journaling (Metadata only) | Checksums + RAID |
-| **Latency** | **Nanoseconds** | Microseconds | Microseconds |
-| **Full Disk Perf** | **Deterministic** | Degrades | Degrades |
-| **Directory List** | Slow (Linear Scan) | Fast (Tree Walk) | Fast (Tree Walk) |
-| **OS Support** | Embedded / Custom | Linux Standard | BSD / Linux |
-
-**Final Verdict:**
-*   Use **ext4/ZFS** for general-purpose servers and desktop OSs where `ls -la` performance matters.
-*   Use **HN4** for embedded systems, game consoles, AI training clusters, and high-frequency trading logs where **raw I/O latency** and **CPU efficiency** are paramount.
-
----
-
-## 📜 License
-Apache 2.0 — free for commercial and private use with attribution and patent grant.
-
----
-*Built for the void.*
