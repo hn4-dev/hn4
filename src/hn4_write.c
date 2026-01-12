@@ -440,7 +440,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
                 
                 /* Zero-fill remainder of payload slot is handled by memset(io_buf, 0) above */
                 
-                final_algo = HN4_COMP_ORE;
+                final_algo = HN4_COMP_TCC;
                 stored_len = comp_size; /* Store compressed size in meta */
                 HN4_LOG_CRIT("WRITE_ATOMIC: Compression Success. %u -> %u bytes.", len, comp_size);
             } 

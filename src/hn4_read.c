@@ -444,7 +444,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                     break;
                 }
                 
-                case HN4_COMP_ORE:
+                case HN4_COMP_TCC:
                 {
                     uint32_t actual_out_size = 0;
                     decomp_res = hn4_decompress_block(hdr->payload, c_size, out_buffer, buffer_len, &actual_out_size);

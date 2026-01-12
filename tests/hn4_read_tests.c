@@ -1185,7 +1185,7 @@ hn4_TEST(Recovery, Skip_Heal_If_Compressed) {
     h->well_id = hn4_cpu_to_le128(anchor.seed_id);
     h->generation = hn4_cpu_to_le64(30);
     /* Flag as ORE */
-    h->comp_meta = hn4_cpu_to_le32((10 << HN4_COMP_SIZE_SHIFT) | HN4_COMP_ORE);
+    h->comp_meta = hn4_cpu_to_le32((10 << HN4_COMP_SIZE_SHIFT) | HN4_COMP_TCC);
     
     /* Calc Valid CRC with Domain Seeds */
     uint32_t cap = bs - sizeof(hn4_block_header_t);
@@ -1832,7 +1832,7 @@ hn4_TEST(Performance, Read_Candidate_Deduplication) {
 }
 
 /*
- * TEST: Compression.Read_ORE_Decompression_Success
+ * TEST: Compression.Read_TCC_Decompression_Success
  * OBJECTIVE: Verify that the reader correctly handles the ORE (Orbital Redundancy Encoding)
  *            format, including "Flux Distortion" hashing and "Orbit Delta" reconstruction.
  * SCENARIO:
@@ -1842,12 +1842,12 @@ hn4_TEST(Performance, Read_Candidate_Deduplication) {
  *   3. Read back and verify decompression matches original plaintext.
  */
 /*
- * TEST: Compression.Read_ORE_Decompression_Success
+ * TEST: Compression.Read_TCC_Decompression_Success
  * REASON FOR FIX:
  *   Updated manual bitstream construction to match v40.0 Tensor-Core grammar.
  *   - Uses ISOTOPE op (0x40) for RLE instead of old ECHO op.
  */
-hn4_TEST(Compression, Read_ORE_Decompression_Success) {
+hn4_TEST(Compression, Read_TCC_Decompression_Success) {
     hn4_hal_device_t* dev = read_fixture_setup();
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
@@ -1921,7 +1921,7 @@ hn4_TEST(Compression, Read_ORE_Decompression_Success) {
     uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
     memset(hdr->payload + comp_len, 0xCC, payload_cap - comp_len);
 
-    uint32_t meta = (comp_len << 4) | 3; /* HN4_COMP_ORE = 3 */
+    uint32_t meta = (comp_len << 4) | 3; /* HN4_COMP_TCC = 3 */
     hdr->comp_meta = hn4_cpu_to_le32(meta);
 
     /* CRC covers Data + Garbage */
@@ -1980,7 +1980,7 @@ hn4_TEST(Compression, Read_ORE_Decompression_Success) {
     read_fixture_teardown(dev);
 }
 /*
- * TEST: Integration.Cycle_WriteRead_ORE_Compression
+ * TEST: Integration.Cycle_WriteRead_TCC_Compression
  * OBJECTIVE: Verify the full lifecycle of ORE compression:
  *            Write (Structure Detect -> Compress -> Obfuscate) -> Disk -> Read (De-Obfuscate -> Decompress).
  * SCENARIO:
@@ -1988,7 +1988,7 @@ hn4_TEST(Compression, Read_ORE_Decompression_Success) {
  *   2. Read back via API and verify plaintext match.
  *   3. Read back via Raw HAL and verify the on-disk size is significantly smaller (Compression Active).
  */
-hn4_TEST(Integration, Cycle_WriteRead_ORE_Compression) {
+hn4_TEST(Integration, Cycle_WriteRead_TCC_Compression) {
     hn4_hal_device_t* dev = read_fixture_setup();
     
     /* FIX 1: Use ARCHIVE profile to force compression attempts on all blocks */
@@ -2161,10 +2161,10 @@ hn4_TEST(Resilience, Read_All_Orbits_Corrupt) {
 }
 
 /*
- * TEST: Compression.Read_ORE_Zero_Length_Payload
+ * TEST: Compression.Read_TCC_Zero_Length_Payload
  * OBJECTIVE: Verify decompression logic handles 0-byte output safely.
  */
-hn4_TEST(Compression, Read_ORE_Zero_Length_Payload) {
+hn4_TEST(Compression, Read_TCC_Zero_Length_Payload) {
     hn4_hal_device_t* dev = read_fixture_setup();
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
@@ -2192,11 +2192,11 @@ hn4_TEST(Compression, Read_ORE_Zero_Length_Payload) {
     uint32_t c_size = 0;
     /* Payload left as 0x00 via calloc, which is valid for 0-length */
 
-    #ifndef HN4_COMP_ORE
-    #define HN4_COMP_ORE 3
+    #ifndef HN4_COMP_TCC
+    #define HN4_COMP_TCC 3
     #endif
     
-    h->comp_meta = hn4_cpu_to_le32((c_size << 4) | HN4_COMP_ORE);
+    h->comp_meta = hn4_cpu_to_le32((c_size << 4) | HN4_COMP_TCC);
     
     /* 
      * Calculate Checksums
@@ -2671,7 +2671,7 @@ hn4_TEST(Read, Phantom_Block) {
 }
 
 /* 
- * TEST 19: Read_ORE_Zero_Length
+ * TEST 19: Read_TCC_Zero_Length
  * OBJECTIVE: Compressed payload length is 0 (Valid).
  */
 hn4_TEST(Read, ORE_Zero_Length) {

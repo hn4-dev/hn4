@@ -350,16 +350,16 @@ typedef struct HN4_PACKED {
 /* Compression Meta Macros */
 #define HN4_COMP_ALGO_MASK      0x0F
 #define HN4_COMP_NONE           0
-#define HN4_COMP_ORE            3
+#define HN4_COMP_TCC            3
 #define HN4_COMP_SIZE_SHIFT     4   /* Bits 4-31 are size */
 
 #define HN4_CRC_SEED_HEADER 0xFFFFFFFFU
 #define HN4_CRC_SEED_DATA   0x00000000U
 /* Wire Format Grammar */
-#define HN4_ORE_CMD_CARRIER     0x00    /* Raw Literals */
-#define HN4_ORE_CMD_FLAG_ECHO   0x80    /* Back-Reference Indicator */
-#define HN4_ORE_LEN_MASK        0x7F
-#define HN4_ORE_EXT_SENTINEL    0xFF    /* Extension Byte for VarInt */
+#define HN4_TCC_CMD_CARRIER     0x00    /* Raw Literals */
+#define HN4_TCC_CMD_FLAG_ECHO   0x80    /* Back-Reference Indicator */
+#define HN4_TCC_LEN_MASK        0x7F
+#define HN4_TCC_EXT_SENTINEL    0xFF    /* Extension Byte for VarInt */
 
 
 /* 8.1 The Anchor Layout (128 Bytes) - Aligned to 2x CPU Cache Lines */

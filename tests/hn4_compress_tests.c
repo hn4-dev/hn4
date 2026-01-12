@@ -875,33 +875,6 @@ hn4_TEST(CompressBench, Topology_Variance) {
 }
 
 /*
- * Test: ORE_Signature_Flux
- * Scenario: Compress two blocks with same data but different context history.
- * Goal: Prove that the output token stream differs (or internal hash state differs).
- * 
- * Note: Since ORE v1 doesn't output the hash, we infer this by checking
- * if the Gravity Well behavior changes (collision avoidance).
- * But we can verify "Context Flux" logic by checking if identical sequences
- * produce different output? 
- * 
- * Actually, ORE output is deterministic based on input. 
- * "Signature Masking" refers to the *internal* hash table lookup.
- * We can't easily test this from outside without introspection.
- * 
- * Instead, we test if a pattern shifted by 1 byte (changing alignment)
- * still compresses (robustness) or if context changes suppression.
- */
-hn4_TEST(CompressBench, Signature_Masking) {
-    /* 
-     * This test is theoretical for black-box testing.
-     * We validate that the algorithm functions consistently.
-     */
-    printf("Signature Masking is an internal security property (Anti-Fingerprint).\n");
-    printf("Verified by code review of _ore_compute_gravity.\n");
-    ASSERT_TRUE(true);
-}
-
-/*
  * Test: ORE_Text_Compression_Weakness
  * Scenario: "The quick brown fox..." repeated.
  * LZ would compress 2nd instance to ~3 bytes.
