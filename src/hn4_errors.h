@@ -238,7 +238,7 @@ typedef int32_t hn4_result_t;
 /* Cryptographic key expired or revoked. */
 #define HN4_ERR_KEY_EXPIRED             -0x613
 
-
+#define HN4_ERR_INTERNAL                -0x614
 /* =========================================================================
  * 7. UTILITY FUNCTIONS
  * ========================================================================= */

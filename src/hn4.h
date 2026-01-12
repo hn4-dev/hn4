@@ -547,10 +547,27 @@ typedef struct HN4_PACKED HN4_ALIGNED(16) {
     #include <stdatomic.h>
 #endif
 
+
+#define HN4_MEDIC_QUEUE_SIZE 64
+
+
 typedef struct {
     atomic_flag flag;
     uint32_t    pad; 
 } hn4_spinlock_t;
+
+
+typedef struct {
+    uint32_t anchor_idx;
+    uint32_t score; /* (Density * Entropy) */
+} hn4_medic_entry_t;
+
+typedef struct {
+    hn4_medic_entry_t entries[HN4_MEDIC_QUEUE_SIZE];
+    uint32_t count;
+    hn4_spinlock_t lock;
+} hn4_medic_queue_t;
+
 
 /* The Synapse Handle (Open File Context) */
 typedef struct {
@@ -619,7 +636,7 @@ typedef struct {
         _Atomic uint64_t barrier_failures;
         _Atomic uint32_t trajectory_collapse_counter;
     } stats;
-
+    hn4_medic_queue_t medic_queue;
     int64_t last_log_ts; /* For rate limiting */
 
 } hn4_volume_t;
@@ -720,6 +737,7 @@ typedef enum {
     BIT_TEST, 
     BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
 } hn4_bit_op_t;
+
 
 
 /* =========================================================================
