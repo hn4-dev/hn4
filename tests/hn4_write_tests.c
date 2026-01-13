@@ -8626,3 +8626,148 @@ hn4_TEST(Concurrency, Toxic_Silicon_Race) {
     }
     ASSERT_EQ(expected, q_word);
 }
+
+
+hn4_TEST(Thaw, Partial_Update_Data_Preservation) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.orbit_vector[0] = 1;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 1. Establish Baseline: Fill with 'A' */
+    uint8_t* base_data = malloc(payload_cap);
+    memset(base_data, 'A', payload_cap);
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, base_data, payload_cap));
+
+    /* 2. Partial Overwrite: Write 'B' in the middle */
+    uint32_t offset = 100;
+    uint32_t patch_len = 50;
+    uint8_t* patch_data = malloc(patch_len);
+    memset(patch_data, 'B', patch_len);
+    
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, patch_data, patch_len));
+
+    /* 3. Read Verification */
+    uint8_t* read_buf = malloc(bs);
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs));
+
+    /* Bytes 0..49 should be 'B' */
+    ASSERT_EQ(0, memcmp(read_buf, patch_data, patch_len));
+    
+    /* Bytes 50..end should be 'A' (Preserved by Thaw) */
+    /* If Thaw failed, these would be 0 (from memset) */
+    ASSERT_EQ('A', read_buf[patch_len]); 
+    ASSERT_EQ('A', read_buf[payload_cap - 1]);
+
+    free(base_data); free(patch_data); free(read_buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Thaw, Decompression_Before_Patch) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x456;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    /* Enable Compression Hint */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_COMPRESSED);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 1. Write Compressible Data (All 'Z') */
+    uint8_t* zero_buf = calloc(1, payload_cap);
+    memset(zero_buf, 'Z', payload_cap);
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, zero_buf, payload_cap));
+
+    /* Verify it WAS compressed (Internal check or inference via raw read) */
+    /* We infer: If Thaw logic for compression is broken, the next step fails. */
+
+    /* 2. Partial Overwrite (Write 'A' at start) */
+    uint32_t patch_len = 10;
+    uint8_t patch[10]; memset(patch, 'A', 10);
+    
+    /* This forces read-modify-write. The driver sees HN4_COMP_TCC in old block header.
+       It must decompress 'Z's to buffer, then copy 'A's over first 10 bytes. */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, patch, patch_len));
+
+    /* 3. Read Back */
+    uint8_t* read_buf = malloc(bs);
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs));
+
+    /* Verify Head is 'A' */
+    ASSERT_EQ(0, memcmp(read_buf, patch, 10));
+    
+    /* Verify Tail is 'Z' (Decompression worked) */
+    /* If decompression failed/was skipped, this would be garbage or zero */
+    ASSERT_EQ('Z', read_buf[10]);
+    ASSERT_EQ('Z', read_buf[payload_cap - 1]);
+
+    free(zero_buf); free(read_buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Thaw, Defer_Refreeze_Optimization) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x789;
+    anchor.orbit_vector[0] = 1;
+    /* Hint Compressed */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_COMPRESSED);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    uint64_t G = 1000;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+
+    /* 1. Initial Write (Highly Compressible) */
+    uint8_t* data = calloc(1, 1024); // Zeros
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, 1024));
+    
+    /* Verify V1 is compressed (Check raw header) */
+    uint64_t lba_v1 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0);
+    uint8_t* raw = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba_v1 * spb), raw, spb);
+    hn4_block_header_t* h1 = (hn4_block_header_t*)raw;
+    uint32_t meta1 = hn4_le32_to_cpu(h1->comp_meta);
+    ASSERT_EQ(HN4_COMP_TCC, meta1 & HN4_COMP_ALGO_MASK); /* V1 Compressed */
+
+    /* 2. Overwrite (Trigger Thaw + Refreeze Deferral) */
+    /* Even if data is still compressible, driver should skip compression logic */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, 1024));
+
+    /* 3. Verify V2 (k=1) is RAW (HN4_COMP_NONE) */
+    uint64_t lba_v2 = _calc_trajectory_lba(vol, G, 1, 0, 0, 1);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba_v2 * spb), raw, spb);
+    hn4_block_header_t* h2 = (hn4_block_header_t*)raw;
+    uint32_t meta2 = hn4_le32_to_cpu(h2->comp_meta);
+    
+    /* Expectation: Defer logic forced RAW */
+    ASSERT_EQ(HN4_COMP_NONE, meta2 & HN4_COMP_ALGO_MASK);
+
+    free(data); free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}

@@ -395,16 +395,54 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
      */
     memset(io_buf, 0, bs);
 
+    /* 
+     * THAW PROTOCOL (Spec 20.5): 
+     * If overwriting a block partially, we must Read-Modify-Write to preserve data.
+     */
+    if (old_lba != HN4_LBA_INVALID && len < payload_cap) {
+        void* thaw_buf = hn4_hal_mem_alloc(bs);
+        if (thaw_buf) {
+            hn4_addr_t old_phys = hn4_lba_from_blocks(old_lba * sectors);
+            
+            /* 1. Read Old Block */
+            if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, old_phys, thaw_buf, sectors) == HN4_OK) {
+                hn4_block_header_t* old_hdr = (hn4_block_header_t*)thaw_buf;
+                hn4_block_header_t* new_hdr_view = (hn4_block_header_t*)io_buf;
+
+                if (hn4_le32_to_cpu(old_hdr->magic) == HN4_BLOCK_MAGIC) {
+                    uint32_t meta = hn4_le32_to_cpu(old_hdr->comp_meta);
+                    uint8_t algo  = meta & HN4_COMP_ALGO_MASK;
+                    uint32_t csz  = meta >> HN4_COMP_SIZE_SHIFT;
+                    
+                    /* 2. Decompress/Copy Old Data into New Buffer */
+                    if (algo == HN4_COMP_TCC) {
+                         uint32_t out_sz = 0;
+                         hn4_decompress_block(old_hdr->payload, csz, new_hdr_view->payload, payload_cap, &out_sz);
+                    } else {
+                         memcpy(new_hdr_view->payload, old_hdr->payload, payload_cap);
+                    }
+                }
+            }
+            hn4_hal_mem_free(thaw_buf);
+        }
+    }
+
     /* 4. Prepare Payload (With Compression Logic) */
     hn4_block_header_t* hdr = (hn4_block_header_t*)io_buf;
 
     uint32_t final_algo = HN4_COMP_NONE;
     uint32_t stored_len = len;
 
-    /* Check Hints: Do we try to compress? */
-    /* Only attempt if hint is set OR profile is Archive */
     bool try_compress = (dclass_check & HN4_HINT_COMPRESSED) ||
                         (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE);
+
+    /* 
+     * If this is an Overwrite (old_lba valid), do NOT re-compress immediately.
+     * Write as RAW to minimize latency. The Scavenger will Refreeze later.
+     */
+    if (old_lba != HN4_LBA_INVALID) {
+        try_compress = false;
+    }
 
     if (try_compress && len > 128) {
         /* Calculate worst-case bound */
