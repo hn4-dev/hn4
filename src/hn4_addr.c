@@ -115,3 +115,4 @@ bool hn4_addr_try_u64(hn4_addr_t addr, uint64_t* out) {
 #endif
     return true;
 }
+

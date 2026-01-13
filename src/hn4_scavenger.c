@@ -127,7 +127,7 @@ static void _clear_delta(uint64_t old_lba) {
  * ========================================================================= */
 
 typedef struct {
-    uint64_t lbas[HN4_REAPER_BATCH_SIZE];
+    hn4_addr_t lbas[HN4_REAPER_BATCH_SIZE];
     uint32_t count;
     uint32_t block_size;
     bool     secure_shred; /* HN4_FLAG_SHRED support */
@@ -373,12 +373,14 @@ static hn4_result_t _reap_tombstone(
         }
 
         if (found_lba != UINT64_MAX) {
-            /* 
-             * SAFE: The anchor is gone. We can now queue the block for deletion.
-             * _reaper_add handles the batching and flushing (Physical Trim -> Logical Free).
-             */
-            _reaper_add(vol, batch, found_lba * sectors_per_blk);
-        }
+            #ifdef HN4_USE_128BIT
+                hn4_u128_t f_blk = hn4_u128_from_u64(found_lba);
+                hn4_addr_t p_sec = hn4_u128_mul_u64(f_blk, sectors_per_blk);
+                _reaper_add(vol, batch, p_sec); 
+            #else
+                _reaper_add(vol, batch, found_lba * sectors_per_blk);
+            #endif
+            }
     }
 
     hn4_hal_mem_free(vbuf);

@@ -680,7 +680,12 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     _pack_header(hdr, hn4_le128_to_cpu(anchor->seed_id), block_idx, next_gen, d_crc, comp_meta);
 
     /* 7. Commit Data to Media (The Shadow Write) */
+   #ifdef HN4_USE_128BIT
+    hn4_u128_t blk_128 = hn4_u128_from_u64(target_lba);
+    hn4_addr_t phys_sector = hn4_u128_mul_u64(blk_128, sectors);
+#else
     hn4_addr_t phys_sector = hn4_lba_from_sectors(target_lba * sectors);
+#endif
     hn4_result_t io_res;
 
     /* OPTIMIZATION: ZNS ZONE APPEND (Spec 13.2) */

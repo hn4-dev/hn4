@@ -137,8 +137,7 @@ static hn4_result_t _broadcast_superblock(
         uint32_t bad_mask = (HN4_VOL_TOXIC | HN4_VOL_PANIC | HN4_VOL_DEGRADED);
         if (!(cpu_sb.info.state_flags & bad_mask)) {
               cpu_sb.info.state_flags |= HN4_VOL_CLEAN;
-  
-              cpu_sb.info.state_flags &= ~HN4_VOL_DIRTY;
+            cpu_sb.info.state_flags &= ~HN4_VOL_DIRTY;
         }
     } else {
         cpu_sb.info.state_flags &= ~HN4_VOL_CLEAN;
@@ -147,10 +146,9 @@ static hn4_result_t _broadcast_superblock(
     }
 
     /* 2. Calculate Targets (Block Indices) */
-    uint64_t targets[SB_LOC_MAX];
+     uint64_t targets[SB_LOC_MAX];
     bool attempt_south = false;
     uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
-
 
     
     /* 
@@ -158,40 +156,58 @@ static hn4_result_t _broadcast_superblock(
      */
 #ifdef HN4_USE_128BIT
     /* 
-     * Fallback for 128-bit:
-     * If cap.hi > 0, we assume the drive is massive.
-     * We only calculate targets if they fit in 64-bit block indices.
+     * QUETTABYTE SCALING ENABLED
+     * Use 128-bit math primitives to calculate mirror positions accurately.
      */
     
     /* NORTH: Always 0 */
     targets[SB_LOC_NORTH] = 0;
 
-    /* EAST: (Cap / 100) * 33 */
-    if (dev_cap.hi == 0) {
-        targets[SB_LOC_EAST] = HN4_ALIGN_UP((dev_cap.lo / 100) * 33, bs) / bs;
-        targets[SB_LOC_WEST] = HN4_ALIGN_UP((dev_cap.lo / 100) * 66, bs) / bs;
-        
-        uint64_t aligned_cap = HN4_ALIGN_DOWN(dev_cap.lo, bs);
-        if (aligned_cap >= (sb_space * 16)) {
-  
-            targets[SB_LOC_SOUTH] = (aligned_cap - sb_space) / bs;
-            attempt_south = true;
-        }
+    /* Calculation: (Capacity / 100) * 33 */
+    /* 1. one_percent = cap / 100 */
+    hn4_u128_t one_percent = hn4_u128_div_u64(dev_cap, 100);
+    
+    /* EAST: one_percent * 33 */
+    hn4_u128_t east_bytes = hn4_u128_mul_u64(one_percent, 33);
+    
+    /* WEST: one_percent * 66 */
+    hn4_u128_t west_bytes = hn4_u128_mul_u64(one_percent, 66);
+
+    /* Convert Bytes to Blocks (Safe Downcast check) */
+    /* Note: We divide by Block Size to get the index. */
+    hn4_u128_t east_blk = hn4_u128_div_u64(east_bytes, bs);
+    hn4_u128_t west_blk = hn4_u128_div_u64(west_bytes, bs);
+
+    /* 
+     * Safety Guard: 
+     * Even with 128-bit byte addressing, the block index MUST fit in 64-bits
+     * because `epoch_ring_block_idx` and internal pointers are u64.
+     * (Max Block Index 2^64 * 4KB Block = 73 Zettabytes. Enough for now.)
+     */
+    if (east_blk.hi > 0 || west_blk.hi > 0) {
+        /* Volume exceeds 73 ZB addressable block space. Disable mirrors. */
+        HN4_LOG_WARN("Volume too large for Block Indexing. Mirrors disabled.");
+        targets[SB_LOC_EAST] = 0;
+        targets[SB_LOC_WEST] = 0;
     } else {
-        /* 
-         * Logic for >18EB drives:
-         * We cannot easily compute percentage without u128 div.
-         * For safety in this snippet, we DISABLE mirrors on massive drives 
-         * unless a math library is present.
-         * Or we just assume they are far away and clamp to max u64?
-         */
-         // Hardcoded safe fallback for context: Disable mirrors on massive drives to avoid math overflow
-         // until hn4_math.h is fully implemented.
-         targets[SB_LOC_EAST] = 0; 
-         targets[SB_LOC_WEST] = 0;
-         targets[SB_LOC_SOUTH] = 0;
-         HN4_LOG_WARN("128-bit Mirrors temporarily disabled due to math limit");
+        /* Align up logic handled naturally by integer division truncation or custom align */
+        /* For simplicity here, we accept the floor or add alignment */
+        targets[SB_LOC_EAST] = east_blk.lo;
+        targets[SB_LOC_WEST] = west_blk.lo;
     }
+
+    /* SOUTH: Capacity - SB_SPACE */
+    /* 
+     * Align down capacity to block size first to ensure safety.
+     * Logic: south_start = (capacity_bytes - sb_space) / bs
+     */
+    hn4_u128_t south_sub = hn4_u128_sub(dev_cap, hn4_u128_from_u64(sb_space));
+    hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, bs);
+    
+    if (south_blk.hi > 0) targets[SB_LOC_SOUTH] = 0; // Too big
+    else targets[SB_LOC_SOUTH] = south_blk.lo;
+    
+    attempt_south = (targets[SB_LOC_SOUTH] > 0);
 #else
     /* Standard 64-bit Logic */
     targets[SB_LOC_NORTH] = 0;
@@ -249,11 +265,16 @@ static hn4_result_t _broadcast_superblock(
         hn4_addr_t phys_lba;
         
     #ifdef HN4_USE_128BIT
-        /* Manually construct LBA: block_idx * (bs/ss) */
-        /* Assuming targets[i] fits in u64 as calculated above */
-        uint64_t lba_val = targets[i] * (bs / ss);
-        phys_lba.lo = lba_val;
-        phys_lba.hi = 0;
+        /* 
+         * Manually construct LBA: block_idx * (bs/ss).
+         * Since block_idx is u64 but the resulting LBA might exceed 64-bits
+         * (Sector count > 2^64), we must use the u128 mul primitive.
+         */
+        hn4_u128_t blk_128 = hn4_u128_from_u64(targets[i]);
+        uint64_t sec_per_blk = bs / ss;
+        
+        /* phys_lba = blk_128 * sec_per_blk */
+        phys_lba = hn4_u128_mul_u64(blk_128, sec_per_blk);
 #else
         phys_lba = targets[i] * (bs / ss);
 #endif

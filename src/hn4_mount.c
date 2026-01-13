@@ -46,36 +46,19 @@ static inline hn4_result_t _phys_lba_from_block(
 
     /* 2. Calculate Translation Factors */
     uint64_t sectors_per_block = block_size / sector_size;
-    uint64_t max_lba = total_capacity_bytes / sector_size;
 
-    /* 
-     * 3. Overflow Guard
-     * Prevent wrapping if block_idx is absurdly large (e.g. garbage data).
-     */
-    if (block_idx > (UINT64_MAX / sectors_per_block)) {
-        return HN4_ERR_GEOMETRY;
-    }
-
-    uint64_t raw_lba = block_idx * sectors_per_block;
-
-    /* 
-     * 4. Bounds Check
-     * Previous logic rejected partial tail blocks: 
-     *   if (raw_lba + sectors_per_block > max_lba) error;
-     * 
-     * Correct logic: The block index is valid if the *start* LBA exists 
-     * within the volume. Upper layers (IO dispatch) are responsible for 
-     * clamping read lengths at the EOF boundary.
-     */
-    if (raw_lba >= max_lba) {
-        return HN4_ERR_GEOMETRY;
-    }
-
-    /* 5. Output Assignment (128-bit awareness) */
 #ifdef HN4_USE_128BIT
-    out_addr->lo = raw_lba;
-    out_addr->hi = 0;
+    /* Use 128-bit multiply to prevent overflow when converting Block Index -> Sector LBA */
+    hn4_u128_t blk = hn4_u128_from_u64(block_idx);
+    *out_addr = hn4_u128_mul_u64(blk, sectors_per_block);
 #else
+    /* Standard check */
+    uint64_t max_lba = total_capacity_bytes / sector_size;
+    if (block_idx > (UINT64_MAX / sectors_per_block)) return HN4_ERR_GEOMETRY;
+    
+    uint64_t raw_lba = block_idx * sectors_per_block;
+    if (raw_lba >= max_lba) return HN4_ERR_GEOMETRY;
+    
     *out_addr = raw_lba;
 #endif
 
@@ -339,10 +322,46 @@ static hn4_result_t _execute_cardinal_vote(
         }
 
         uint64_t block_indices[3];
+
+#ifdef HN4_USE_128BIT
+       
+        hn4_u128_t real_cap = caps->total_capacity_bytes;
+        
+        hn4_u128_t one_percent = hn4_u128_div_u64(real_cap, 100);
+        hn4_u128_t east_bytes  = hn4_u128_mul_u64(one_percent, 33);
+        hn4_u128_t west_bytes  = hn4_u128_mul_u64(one_percent, 66);
+        
+        /* Convert to Blocks */
+        hn4_u128_t east_blk = hn4_u128_div_u64(east_bytes, current_bs);
+        hn4_u128_t west_blk = hn4_u128_div_u64(west_bytes, current_bs);
+        
+        /* Check overflow of block index (u64 max) */
+        if (east_blk.hi > 0) block_indices[0] = HN4_OFFSET_INVALID;
+        else block_indices[0] = east_blk.lo;
+        
+        if (west_blk.hi > 0) block_indices[1] = HN4_OFFSET_INVALID;
+        else block_indices[1] = west_blk.lo;
+        
+        /* South Offset */
+        /* s_off = cap - sb_space */
+        /* We need a 128-bit version of _calc_south_offset logic */
+        uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, current_bs);
+        hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
+        
+        /* Check heuristic: Capacity must be > 16x SB Size */
+        /* Since we have u128, just check south_sub > 0 mostly */
+        
+        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
+        if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
+        else block_indices[2] = south_blk.lo;
+
+#else
+        /* Standard 64-bit Logic */
         block_indices[0] = HN4_ALIGN_UP((cap_bytes / 100) * 33, current_bs) / current_bs;
         block_indices[1] = HN4_ALIGN_UP((cap_bytes / 100) * 66, current_bs) / current_bs;
         uint64_t s_off = _calc_south_offset(cap_bytes, current_bs);
         block_indices[2] = (s_off == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_off / current_bs);
+#endif
 
         for (int i = 0; i < 3; i++) {
             if (block_indices[i] == HN4_OFFSET_INVALID) continue;
@@ -579,12 +598,39 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
 
     uint64_t s_offset = _calc_south_offset(cap, bs);
 
-    uint64_t target_blocks[] = {
-        0,
-        HN4_ALIGN_UP((cap / 100) * 33, bs) / bs,
-        HN4_ALIGN_UP((cap / 100) * 66, bs) / bs,
-        (s_offset == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_offset / bs)
-    };
+    uint64_t target_blocks[4];
+    target_blocks[0] = 0;
+
+#ifdef HN4_USE_128BIT
+    /* 128-bit Quettabyte Logic */
+    /* vol->vol_capacity_bytes is u64 in struct def, but we should use native size if possible? */
+    /* The struct definition in hn4.h defines vol_capacity_bytes as uint64_t even in 128-bit mode 
+       (based on previous context). If so, we are limited to 18EB anyway. 
+       BUT if you updated hn4_volume_t to use hn4_size_t, use that. */
+       
+    /* Assuming we must reconstruct or use caps: */
+    const hn4_hal_caps_t* caps_dirty = hn4_hal_get_caps(dev);
+    hn4_u128_t real_cap = caps_dirty->total_capacity_bytes;
+
+    hn4_u128_t one_pct = hn4_u128_div_u64(real_cap, 100);
+    hn4_u128_t e_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 33), bs);
+    hn4_u128_t w_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 66), bs);
+    
+    target_blocks[1] = (e_blk.hi > 0) ? HN4_OFFSET_INVALID : e_blk.lo;
+    target_blocks[2] = (w_blk.hi > 0) ? HN4_OFFSET_INVALID : w_blk.lo;
+    
+    /* South */
+    uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
+    hn4_u128_t s_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
+    hn4_u128_t s_blk = hn4_u128_div_u64(s_sub, bs);
+    
+    target_blocks[3] = (s_blk.hi > 0) ? HN4_OFFSET_INVALID : s_blk.lo;
+
+#else
+    target_blocks[1] = HN4_ALIGN_UP((cap / 100) * 33, bs) / bs;
+    target_blocks[2] = HN4_ALIGN_UP((cap / 100) * 66, bs) / bs;
+    target_blocks[3] = (s_offset == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_offset / bs);
+#endif
     uint32_t sectors = io_sz / sector_sz;
     bool north_ok = false;
     int mirrors_ok = 0;

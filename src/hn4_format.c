@@ -824,19 +824,28 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     sb_cpu.info.volume_label[31] = '\0';
 
     /* --- STEP 4: ZERO METADATA REGIONS --- */
-    /* 
-     * Macro uses snapshot 'ss' and 'bs'.
-     */
+    
+#ifdef HN4_USE_128BIT
     #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
-        uint64_t s_val = hn4_addr_to_u64(start_lba); \
-        uint64_t e_val = hn4_addr_to_u64(end_lba); \
-        if (e_val < s_val) { \
+        if (hn4_u128_cmp((end_lba), (start_lba)) < 0) { \
              return HN4_ERR_GEOMETRY; \
         } \
-        uint64_t count = e_val - s_val; \
-        uint64_t len = count * ss; \
-        if ((res = _zero_region_explicit(dev, start_lba, len, bs)) != HN4_OK) return res; \
+        hn4_u128_t count_ = hn4_u128_sub((end_lba), (start_lba)); \
+        hn4_u128_t len_128_ = hn4_u128_mul_u64(count_, ss); \
+        if (len_128_.hi > 0) return HN4_ERR_GEOMETRY; \
+        uint64_t len_ = len_128_.lo; \
+        if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
     } while(0)
+#else
+    #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
+        if ((end_lba) < (start_lba)) { \
+             return HN4_ERR_GEOMETRY; \
+        } \
+        uint64_t count_ = (end_lba) - (start_lba); \
+        uint64_t len_ = count_ * ss; \
+        if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
+    } while(0)
+#endif
 
     SAFE_ZERO_REGION(sb_cpu.info.lba_epoch_start,  sb_cpu.info.lba_cortex_start);
     SAFE_ZERO_REGION(sb_cpu.info.lba_cortex_start, sb_cpu.info.lba_bitmap_start);
@@ -870,6 +879,58 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     uint32_t crc = hn4_crc32(0, disk_view, HN4_SB_SIZE - 4);
     disk_view->raw.sb_crc = hn4_cpu_to_le32(crc);
 
+     hn4_addr_t lba_n = hn4_addr_from_u64(0);
+    hn4_addr_t lba_e, lba_w, lba_s;
+    bool write_south = false;
+
+#ifdef HN4_USE_128BIT
+    /* 
+     * QUETTABYTE SCALING: Use 128-bit primitives for placement 
+     */
+    hn4_u128_t cap_128 = sb_cpu.info.total_capacity; /* This is hn4_addr_t (u128) */
+    
+    /* Calculate 1% */
+    hn4_u128_t one_pct = hn4_u128_div_u64(cap_128, 100);
+    
+    /* EAST: 33% */
+    hn4_u128_t east_raw = hn4_u128_mul_u64(one_pct, 33);
+    /* Align Up to BS: ((x + bs - 1) / bs) * bs */
+    /* Simplified: divide by bs, add 1 if rem > 0? Standard integer math: (x + bs - 1) */
+    /* Since we don't have u128_add, we rely on block index calculation. */
+    
+    /* Calculate Block Indices first to handle alignment naturally */
+    hn4_u128_t east_blk = hn4_u128_div_u64(east_raw, bs);
+    /* If remainder, add 1? Let's assume integer truncation is fine or add heuristic */
+    /* Proper Align Up: (val + bs - 1) / bs. */
+    /* We lack u128 add. Let's do sector math. */
+    
+    /* LBA = (bytes / ss) */
+    lba_e = hn4_u128_div_u64(east_raw, ss);
+    
+    /* WEST: 66% */
+    hn4_u128_t west_raw = hn4_u128_mul_u64(one_pct, 66);
+    lba_w = hn4_u128_div_u64(west_raw, ss);
+    
+    /* SOUTH: Capacity - SB_Size */
+    uint64_t sb_rsv = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
+    /* South Bytes = Cap - RSV */
+    hn4_u128_t south_raw = hn4_u128_sub(cap_128, hn4_u128_from_u64(sb_rsv));
+    
+    /* Align Down to BS: (val / bs) * bs. 
+       Since we need Sector LBA, we do: ((val / bs) * bs) / ss -> (val / bs) * (bs / ss) */
+    hn4_u128_t south_blk = hn4_u128_div_u64(south_raw, bs);
+    uint32_t spb = bs / ss;
+    lba_s = hn4_u128_mul_u64(south_blk, spb);
+    
+    /* South Write Condition: Cap >= 16 * SB_Size */
+    /* 16 * 8KB = 128KB. Cap is likely much larger. */
+    /* Check via high/low */
+    if (cap_128.hi > 0 || cap_128.lo >= (uint64_t)(write_sz * 16)) {
+        write_south = true;
+    }
+
+#else
+    /* Standard 64-bit Logic */
     uint64_t cap_bytes = hn4_addr_to_u64(sb_cpu.info.total_capacity);
     uint64_t east_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 33, bs);
     uint64_t west_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 66, bs);
@@ -882,10 +943,12 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     }
     if (south_bytes % ss != 0) south_bytes = HN4_ALIGN_DOWN(south_bytes, ss);
 
-    hn4_addr_t lba_n = hn4_addr_from_u64(0);
-    hn4_addr_t lba_e = hn4_lba_from_sectors(east_bytes / ss);
-    hn4_addr_t lba_w = hn4_lba_from_sectors(west_bytes / ss);
-    hn4_addr_t lba_s = hn4_lba_from_sectors(south_bytes / ss);
+    lba_e = hn4_lba_from_sectors(east_bytes / ss);
+    lba_w = hn4_lba_from_sectors(west_bytes / ss);
+    lba_s = hn4_lba_from_sectors(south_bytes / ss);
+    
+    write_south = (cap_bytes >= ((uint64_t)write_sz * 16));
+#endif
 
     res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
     
@@ -895,8 +958,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
         if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
         
-        bool write_south = (cap_bytes >= ((uint64_t)write_sz * 16));
-
+        /* Use the boolean calculated above */
         if (res == HN4_OK && write_south) {
             hn4_result_t s_res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs);
             

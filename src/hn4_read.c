@@ -376,7 +376,12 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             continue;
         }
 
+    #ifdef HN4_USE_128BIT
+        hn4_u128_t blk_128 = hn4_u128_from_u64(target_lba);
+        hn4_addr_t phys_sector = hn4_u128_mul_u64(blk_128, sectors);
+    #else
         hn4_addr_t phys_sector = hn4_lba_from_blocks(target_lba * sectors);
+    #endif
 
         int max_retries = (vol->sb.info.hw_caps_flags & HN4_HW_NVM) ? 1 : 2;
         int tries       = 0;

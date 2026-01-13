@@ -2198,14 +2198,20 @@ hn4_alloc_genesis(
  */
 _Check_return_ hn4_result_t hn4_alloc_horizon(
     HN4_INOUT hn4_volume_t* vol,
-    HN4_OUT uint64_t* out_phys_lba
+    HN4_OUT hn4_addr_t* out_phys_lba /* Updated Signature */
 )
 {
-    uint64_t start_sect, end_sect;
-    if (!hn4_addr_try_u64(vol->sb.info.lba_horizon_start, &start_sect)) return HN4_ERR_GEOMETRY;
-    if (!hn4_addr_try_u64(vol->sb.info.journal_start, &end_sect)) return HN4_ERR_GEOMETRY;
-    if (end_sect <= start_sect) return HN4_ERR_ENOSPC;
+    /* 
+     * 1. LOAD GEOMETRY (Abstract Types)
+     * Use native address types from the superblock to support full range.
+     */
+    hn4_addr_t start_addr = vol->sb.info.lba_horizon_start;
+    hn4_addr_t end_addr   = vol->sb.info.journal_start;
 
+    /* 
+     * 2. CALCULATE CAPACITY
+     * Horizon Capacity = Journal_Start - Horizon_Start
+     */
     uint32_t bs = vol->vol_block_size;
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     
@@ -2217,17 +2223,41 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
     }
     uint32_t spb = bs / ss;
 
-    uint64_t capacity_sectors = end_sect - start_sect;
-    uint64_t capacity_blocks = capacity_sectors / spb;
+    uint64_t capacity_blocks;
+
+#ifdef HN4_USE_128BIT
+    /* 128-bit: Use math primitives for difference and division */
+    if (hn4_u128_cmp(end_addr, start_addr) <= 0) return HN4_ERR_ENOSPC;
+
+    hn4_u128_t diff_sectors = hn4_u128_sub(end_addr, start_addr);
+    hn4_u128_t cap_blocks_128 = hn4_u128_div_u64(diff_sectors, spb);
+    
+    /* 
+     * Safety Check:
+     * The Block Index (offset into Horizon Ring) MUST fit in 64-bits.
+     * Max Capacity = 2^64 * 4KB = 73 Zettabytes. This is sufficient.
+     */
+    if (cap_blocks_128.hi > 0) {
+        HN4_LOG_CRIT("Horizon Capacity exceeds 73 Zettabytes. Unsupported.");
+        return HN4_ERR_GEOMETRY;
+    }
+    capacity_blocks = cap_blocks_128.lo;
+
+#else
+    /* 64-bit: Standard arithmetic */
+    uint64_t start_sect = hn4_addr_to_u64(start_addr);
+    uint64_t end_sect   = hn4_addr_to_u64(end_addr);
+    
+    if (end_sect <= start_sect) return HN4_ERR_ENOSPC;
+    
+    capacity_blocks = (end_sect - start_sect) / spb;
+#endif
+
     if (capacity_blocks == 0) return HN4_ERR_ENOSPC;
 
    /* 
-     * SPEC COMPLIANCE: STRICT O(1) CONSTANT TIME
-     * The Horizon acts as a high-velocity Ring Buffer. We do NOT scan for holes.
-     * If the Write Head catches the Tail (Occupied Block), the Horizon is FULL.
-     *
-     * We allow a minimal retry limit (4) solely to resolve atomic contention 
-     * between threads racing for the global 'horizon_write_head'.
+     * 3. RING ALLOCATION LOOP
+     * The Horizon acts as a high-velocity Ring Buffer.
      */
     uint64_t max_probes = 4;
 
@@ -2235,28 +2265,62 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
         uint64_t head = atomic_fetch_add(&vol->horizon_write_head, 1);
         uint64_t block_offset = head % capacity_blocks;
         
-        uint64_t abs_lba = start_sect + (block_offset * spb);
-        uint64_t global_block_idx = abs_lba / spb;
+        /* 
+         * 4. CALCULATE ABSOLUTE LBA
+         * Abs_LBA = Start + (Offset * SectorsPerBlock)
+         * Must use 128-bit aware addition.
+         */
+#ifdef HN4_USE_128BIT
+        /* diff = offset * spb */
+        /* Assuming block_offset * spb fits in u64 (it should if capacity is reasonable) */
+        /* Wait, if block_offset is large, this mul could overflow u64. Use primitive. */
+        hn4_u128_t offset_128 = hn4_u128_from_u64(block_offset);
+        hn4_u128_t byte_off_128 = hn4_u128_mul_u64(offset_128, spb);
+        
+        /* Add to start address (u128 + u128) - Need u128 add helper */
+        /* Since hn4_addr_add takes u64 inc, we must implement u128 add or verify limits. */
+        /* Let's assume hn4_u128_add exists or inline it. */
+        
+        hn4_addr_t abs_lba = start_addr;
+        /* Inline u128 add: result = a + b */
+        uint64_t old_lo = abs_lba.lo;
+        abs_lba.lo += byte_off_128.lo;
+        abs_lba.hi += byte_off_128.hi + ((abs_lba.lo < old_lo) ? 1 : 0);
+
+#else
+        uint64_t abs_lba = hn4_addr_to_u64(start_addr) + (block_offset * spb);
+#endif
+
+        /* 
+         * 5. BITMAP RESERVATION
+         * Calculate global block index for bitmap tracking.
+         * Global_Idx = Abs_LBA / SPB
+         */
+        uint64_t global_block_idx;
+        
+#ifdef HN4_USE_128BIT
+        /* Use div primitive */
+        hn4_u128_t g_idx_128 = hn4_u128_div_u64(abs_lba, spb);
+        if (g_idx_128.hi > 0) return HN4_ERR_GEOMETRY; /* Bitmap index overflow */
+        global_block_idx = g_idx_128.lo;
+#else
+        global_block_idx = abs_lba / spb;
+#endif
         
         bool state_changed;
         hn4_result_t res = _bitmap_op(vol, global_block_idx, BIT_SET, &state_changed);
         if (res != HN4_OK) return res;
 
         if (state_changed) {
-            *out_phys_lba = abs_lba;
+            *out_phys_lba = abs_lba; /* Return abstract type */
             return HN4_OK;
         }
-        /* 
-         * FAILURE: The bit was already set.
-         * In a true Ring Buffer, this means we lapped the ring and hit valid data.
-         * We do NOT continue scanning. We yield and try once more or fail.
-         * The loop limit (4) ensures we exit essentially immediately.
-         */
     }
 
     /* Saturation: Head caught Tail. */
     return HN4_ERR_ENOSPC;
 }
+
 
 void hn4_free_block(HN4_INOUT hn4_volume_t* vol, uint64_t phys_lba) {
     if (!vol->target_device) return;
