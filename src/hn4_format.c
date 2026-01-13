@@ -550,7 +550,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     offset = HN4_ALIGN_UP(offset, bs);
 
     /* Epoch Ring */
-    uint64_t epoch_sz = HN4_EPOCH_RING_SIZE; 
+    uint64_t epoch_sz = pid == HN4_PROFILE_PICO ?  epoch_sz = 2 * bs : HN4_EPOCH_RING_SIZE; 
     epoch_sz = HN4_ALIGN_UP(epoch_sz, bs);
     
     /* Use from_sectors, as (offset/ss) yields a sector index */

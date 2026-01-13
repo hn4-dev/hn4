@@ -306,7 +306,19 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     } else {
         if (HN4_UNLIKELY(dev_type == HN4_DEV_TAPE)) return HN4_ERR_GEOMETRY;
 
-        for (uint8_t k = 0; k < depth_limit; k++) {
+        /* Determine target Orbit (k) from Anchor Hint (2 bits per cluster) */
+        uint8_t  target_k   = 0;
+        uint64_t cluster_idx = block_idx >> 4;   /* 16 blocks per cluster */
+
+        if (cluster_idx < 16) {
+            uint32_t hints = hn4_le32_to_cpu(anchor.orbit_hints);
+            uint32_t shift = (uint32_t)(cluster_idx * 2);
+            target_k = (uint8_t)((hints >> shift) & 0x3u);
+        }
+
+        /* Only scan the specific target orbit */
+        uint8_t k = target_k;
+        {
             /*
              * Trajectory Jitter.
              * For higher orbits (k >= 8), apply a secondary swizzle to 'G' (Gravity Center)
@@ -317,27 +329,15 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
             uint64_t lba = _calc_trajectory_lba(vol, effective_G, effective_V, block_idx, M, k);
 
-            if (lba == HN4_LBA_INVALID || lba >= max_blocks) continue;
+            if (lba != HN4_LBA_INVALID && lba < max_blocks) {
+                bool is_allocated;
+                hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
 
-            bool duplicate = false;
-            for (int d = 0; d < valid_candidates; d++) {
-                if (candidates[d] == lba) {
-                    duplicate = true;
-                    break;
+                if (op_res != HN4_OK) {
+                    probe_error = _merge_error(probe_error, op_res);
+                } else if (is_allocated) {
+                    candidates[valid_candidates++] = lba;
                 }
-            }
-            if (duplicate) continue;
-
-            bool is_allocated;
-            hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
-
-            if (op_res != HN4_OK) {
-                probe_error = _merge_error(probe_error, op_res);
-                continue;
-            }
-
-            if (is_allocated && valid_candidates < HN4_SHOTGUN_DEPTH) {
-                candidates[valid_candidates++] = lba;
             }
         }
     }

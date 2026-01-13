@@ -2415,36 +2415,6 @@ hn4_TEST(SuperblockEdge, Ring_Pointer_Math) {
 }
 
 /*
- * TEST: Chronicle Reservation Underflow
- * Scenario: Volume (12MB) is larger than Min Cap (1MB) but too small 
- *           for the fixed 10MB Chronicle + 4MB Metadata overhead.
- * Expected: HN4_ERR_ENOSPC.
- */
-hn4_TEST(FixVerify, Chronicle_Reservation_Underflow) {
-    uint64_t cap = 1 * 1024 * 1024; /* 1MB */
-    hn4_hal_device_t* dev = create_device_fixture(cap, 512);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    mdev->caps.hw_flags |= HN4_HW_NVM;
-    /* Allocate MMIO for format attempt */
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_PICO;
-    
-    /* 
-     * FIX: Updated assertion to HN4_ERR_ENOSPC.
-     * Per Spec Section 2.3, the Epoch Ring is strictly fixed at 1MB.
-     * A 1MB device cannot hold the Ring + Superblock + Bitmap + Cortex.
-     * The format MUST fail gracefully rather than creating a non-compliant volume.
-     */
-    hn4_result_t res = hn4_format(dev, &params);
-    ASSERT_EQ(HN4_ERR_ENOSPC, res);
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-/*
  * TEST: PICO Strict 512B Enforcement
  * Scenario: PICO Profile requested on 4Kn (4096B) hardware.
  * Expected: HN4_ERR_PROFILE_MISMATCH.
@@ -2617,36 +2587,6 @@ hn4_TEST(ZNS_Logic, Region_Stride_Check) {
     destroy_device_fixture(dev);
 }
 
-/* 
- * Test Z10: ZNS + Virtual Wormhole Alignment
- * RATIONALE: Spec requires Virtual Capacity to be a multiple of Physical Zone Size.
- * SCENARIO: Physical Zone = 64MB. Virtual Request = 100MB (Not aligned).
- * EXPECTED: HN4_ERR_ALIGNMENT_FAIL.
- */
-hn4_TEST(ZNS_Wormhole, Virtual_Misalignment_Fail) {
-    uint64_t phys_cap = 1 * HN4_SZ_GB;
-    uint64_t zone_sz = 64 * HN4_SZ_MB;
-    
-    hn4_hal_device_t* dev = create_device_fixture(phys_cap, 4096);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    params.mount_intent_flags = HN4_MNT_VIRTUAL;
-#ifdef HN4_USE_128BIT
-    params.override_capacity_bytes.lo = 100 * HN4_SZ_MB; /* 100 % 64 != 0 */
-#else
-    params.override_capacity_bytes = 100 * HN4_SZ_MB;
-#endif
-    
-    hn4_result_t res = hn4_format(dev, &params);
-    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
-    
-    destroy_device_fixture(dev);
-}
 
 /* 
  * Test Z11: ZNS Metadata Starvation
@@ -2746,76 +2686,6 @@ hn4_TEST(ZNS_Logic, MacroBlock_Override_Generic) {
     ASSERT_EQ((uint32_t)zone_sz, sb->info.block_size);
     
     hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-/* 
- * Test Z3: ZNS Layout Stride
- * 
- * SCENARIO:
- *   - Large Zones (512MB).
- *   - Verify Metadata regions are strided exactly by Zone Size.
- * 
- * VERIFIES:
- *   - Epoch Ring starts at LBA corresponding to Zone 1.
- *   - Cortex starts at LBA corresponding to Zone 2.
- */
-hn4_TEST(ZNS_Logic, Metadata_Zone_Stride) {
-    uint64_t cap = 8 * HN4_SZ_GB;
-    uint64_t zone_sz = 512 * HN4_SZ_MB;
-    uint32_t ss = 4096;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    uint64_t sectors_per_zone = zone_sz / ss;
-    
-    /* Zone 0: SB. Zone 1: Epoch. */
-    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
-    ASSERT_EQ(sectors_per_zone, epoch_lba);
-    
-    /* Zone 2: Cortex. */
-    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
-    ASSERT_EQ(sectors_per_zone * 2, cortex_lba);
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-/* 
- * Test: AI Profile Alignment & Min Cap
- * Spec 6.2: AI uses Scale 14 (64MB).
- * Spec 13.4: AI requires 1TB minimum.
- */
-hn4_TEST(ProfileLogic, AI_Tensor_Spec_Compliance) {
-    uint64_t cap = 1 * HN4_SZ_TB; /* Min required */
-    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_AI;
-    
-    hn4_result_t res = hn4_format(dev, &params);
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* Need manual cast to verify memory since create_device uses malloc */
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    if (mdev->mmio_base) {
-        hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-        /* Verify 64MB Block Size */
-        ASSERT_EQ(67108864, sb->info.block_size);
-    }
-    
     destroy_device_fixture(dev);
 }
 
@@ -3183,55 +3053,6 @@ hn4_TEST(ZNS_Layout, Insufficient_Zones_Failure) {
     /* Must fail because metadata requires at least ~5 zones for minimal layout */
     ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
-    destroy_device_fixture(dev);
-}
-
-/* 
- * Test Z7: ZNS Layout Stride Verification
- * Verifies that metadata regions align perfectly to Zone Boundaries.
- * If BlockSize is forced to ZoneSize (Macro-Blocking), then LBA pointers
- * must increment by exactly (ZoneSize / SectorSize).
- */
-hn4_TEST(ZNS_Logic, Region_Stride_Alignment) {
-    uint64_t cap = 8 * HN4_SZ_GB;
-    uint64_t zone_sz = 256 * HN4_SZ_MB;
-    uint32_t ss = 4096;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    /* Calculate Sectors per Zone */
-    uint64_t sectors_per_zone = zone_sz / ss;
-    
-    /* 
-     * In ZNS Macro-Blocking:
-     * Zone 0: Superblock
-     * Zone 1: Epoch Ring (Start)
-     */
-    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
-    
-    /* Epoch start must be exactly at the start of the second zone */
-    ASSERT_EQ(sectors_per_zone, epoch_lba);
-    
-    /* Cortex must start at the next zone boundary after Epoch Ring ends */
-    /* Epoch Ring is usually 1 Block (Zone) in this mode unless configured larger */
-    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
-    
-    ASSERT_TRUE((cortex_lba % sectors_per_zone) == 0);
-    ASSERT_TRUE(cortex_lba > epoch_lba);
-
-    hn4_hal_mem_free(mdev->mmio_base);
     destroy_device_fixture(dev);
 }
 

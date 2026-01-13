@@ -235,6 +235,14 @@ uint32_t hn4_hal_get_topology_count(hn4_hal_device_t* dev);
  */
 hn4_result_t hn4_hal_get_topology_data(hn4_hal_device_t* dev, void* buffer, size_t buf_len);
 
+hn4_result_t hn4_hal_zns_append_sync(
+    hn4_hal_device_t* dev,
+    hn4_addr_t zone_start_lba,
+    void* buffer,
+    uint32_t len_blocks,
+    hn4_addr_t* result_lba
+);
+
 #ifdef __cplusplus
 }
 #endif

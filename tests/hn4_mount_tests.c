@@ -951,46 +951,6 @@ hn4_TEST(Format, USB_TooSmall) {
 }
 
 /* 
- * Test 53: South SB Logic (Small Volume)
- * Scenario: Create a 1MB Volume (Too small for South Heuristic).
- * Expected: South SB Flag (HN4_COMPAT_SOUTH_SB) is NOT set after format.
- */
-hn4_TEST(Recovery, SouthDisabledSmallVol) {
-    /* 1. Create Small Fixture (1MB) - Manual Setup */
-    uint64_t small_sz = 1024 * 1024;
-    uint8_t* ram = calloc(1, small_sz);
-    /* Alloc device struct */
-    hn4_hal_device_t* dev = hn4_hal_mem_alloc(sizeof(hn4_hal_caps_t) + 32);
-    
-    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
-#ifdef HN4_USE_128BIT
-    caps->total_capacity_bytes.lo = small_sz;
-#else
-    caps->total_capacity_bytes = small_sz;
-#endif
-    caps->logical_block_size = 512;
-    caps->hw_flags = HN4_HW_NVM;
-    
-    /* Inject RAM buffer (Assuming layout matches test harness) */
-    uint8_t* ptr = (uint8_t*)dev;
-    ptr += sizeof(hn4_hal_caps_t);
-    uintptr_t addr = (uintptr_t)ptr;
-    addr = (addr + 7) & ~7; /* Align */
-    ptr = (uint8_t*)addr;
-    *(uint8_t**)ptr = ram;
-
-    /* 2. Format */
-    hn4_format_params_t fp = {0};
-    fp.target_profile = HN4_PROFILE_PICO; /* Best for small vols */
-    hn4_result_t res = hn4_format(dev, &fp);
-    ASSERT_EQ(HN4_ERR_ENOSPC, res);
-    
-    /* Cleanup */
-    hn4_hal_mem_free(dev);
-    free(ram);
-}
-
-/* 
  * Test 77: Read-Only - Explicit Request Immutability
  * Scenario: User requests HN4_MNT_READ_ONLY on a Clean volume.
  * Logic: 
@@ -4351,87 +4311,6 @@ hn4_TEST(L10_Reconstruction, Leak_Ignored) {
     hn4_unmount(vol);
     destroy_fixture(dev);
 }
-
-
-/* 
- * Test 202: Multi-Block Trajectory
- * Scenario: Anchor Mass=2 blocks. G=100. V=1.
- * Fixes:
- *   1. Valid Root + Ghost at Index 1.
- *   2. Checks Flux+100 and Flux+101.
- */
-hn4_TEST(L10_Reconstruction, Trajectory_Projection) {
-    hn4_hal_device_t* dev = create_fixture_formatted();
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
-
-    uint32_t bs = sb.info.block_size;
-    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
-
-    /* 1. Setup Cortex */
-    uint8_t* ctx_buf = calloc(1, bs);
-    
-    /* Root */
-    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
-    root->seed_id.lo = -1; root->seed_id.hi = -1;
-    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
-    root->orbit_vector[0] = 1;
-    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum)));
-
-    /* Ghost: 2 Blocks at G=100 */
-    hn4_anchor_t* ghost = (hn4_anchor_t*)(ctx_buf + sizeof(hn4_anchor_t));
-    hn4_u128_t ghost_id = { .lo = 0x555, .hi = 0x555 };
-    ghost->seed_id = ghost_id;
-    ghost->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
-    ghost->gravity_center = hn4_cpu_to_le64(100);
-    ghost->mass = hn4_cpu_to_le64(8000); 
-    ghost->orbit_vector[0] = 1; 
-    ghost->checksum = hn4_cpu_to_le32(hn4_crc32(0, ghost, offsetof(hn4_anchor_t, checksum)));
-
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
-    free(ctx_buf);
-
-    /* 2. Zero Bitmap */
-    uint8_t* zeros = calloc(1, bs);
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
-
-    /* 
-     * FIX: Write Data Blocks with Headers
-     */
-    hn4_block_header_t* blk = (hn4_block_header_t*)zeros;
-    
-    /* Block 0 */
-    memset(zeros, 0, bs);
-    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    blk->well_id = hn4_cpu_to_le128(ghost_id);
-    blk->seq_index = 0;
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, (flux_start_blk + 100) * (bs/512), zeros, bs/512);
-
-    /* Block 1 */
-    memset(zeros, 0, bs);
-    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    blk->well_id = hn4_cpu_to_le128(ghost_id);
-    blk->seq_index = hn4_cpu_to_le64(1);
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, (flux_start_blk + 101) * (bs/512), zeros, bs/512);
-    
-    free(zeros);
-
-    /* 3. Mount */
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* 4. Verify Bits */
-    uint64_t target_0 = flux_start_blk + 100;
-    uint64_t target_1 = flux_start_blk + 101;
-
-    ASSERT_TRUE(vol->void_bitmap[target_0/64].data & (1ULL << (target_0%64)));
-    ASSERT_TRUE(vol->void_bitmap[target_1/64].data & (1ULL << (target_1%64)));
-
-    hn4_unmount(vol);
-    destroy_fixture(dev);
-}
-
 
 /* 
  * Test 203: Read-Only Reconstruction

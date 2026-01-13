@@ -604,6 +604,21 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
                 atomic_thread_fence(memory_order_release);
                 target_lba = candidate;
                 alloc_res = HN4_OK;
+
+                /* Update Orbit Hint in RAM Anchor */
+                uint64_t c_idx = block_idx >> 4;
+                if (c_idx < 16) {
+                    /* Repurpose reserved padding */
+                    uint32_t hints = hn4_le32_to_cpu(anchor->orbit_hints);
+                    
+                    /* Clear old 2 bits */
+                    hints &= ~(0x3 << (c_idx * 2));
+                    /* Set new k */
+                    hints |= (k << (c_idx * 2));
+                    
+                    anchor->orbit_hints = hn4_cpu_to_le32(hints);
+                }
+
                 break;
             }
         }
@@ -714,22 +729,28 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
          * TIMEOUT WATCHDOG:
          * Prevent infinite spin if HAL/Device wedges.
          */
-        hn4_time_t start_ts = hn4_hal_get_time_ns();
+       if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) {
 
-        while (!ctx.done) {
-            hn4_hal_poll(vol->target_device);
+        /* 1. Calculate Zone Start LBA */
+        uint32_t zone_bytes   = caps->zone_size_bytes;
+        uint64_t zone_sectors = zone_bytes / ss;
+        uint64_t raw_lba      = hn4_addr_to_u64(phys_sector);
+        uint64_t zone_start   = (raw_lba / zone_sectors) * zone_sectors;
 
-            if ((hn4_hal_get_time_ns() - start_ts) > HN4_ZNS_TIMEOUT_NS) {
-                HN4_LOG_CRIT("ZNS Append Timeout! Device stalled.");
-                ctx.res = HN4_ERR_ATOMICS_TIMEOUT;
-                break;
-            }
-        }
-        io_res = ctx.res;
+        /* 
+         * 2. CLEAN HAL CALL
+         * Replaces manual struct definition, callback, and polling loop.
+         */
+        io_res = hn4_hal_zns_append_sync(
+            vol->target_device,
+            hn4_addr_from_u64(zone_start),
+            io_buf,
+            sectors,
+            &phys_sector /* [OUT] Updated by Drive with actual LBA */
+        );
 
         if (io_res == HN4_OK) {
             /* 3. REVERSE ENGINEER GRAVITY */
-            phys_sector = req.result_lba;
             uint64_t actual_lba_idx = hn4_addr_to_u64(phys_sector) / sectors;
 
             if (actual_lba_idx != target_lba) {
@@ -742,7 +763,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
                 hn4_hal_mem_free(io_buf);
                 return HN4_ERR_GEOMETRY;
             }
-        }
+        }}
     } else {
 
         uint32_t retry_sleep = 1000; /* Default 1ms */

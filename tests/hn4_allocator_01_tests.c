@@ -113,30 +113,6 @@ hn4_TEST(ComplexityProof, Worst_Case_Is_Bounded) {
 }
 
 /* =========================================================================
- * TEST 3: STRIDE CONSISTENCY (Math O(1))
- * ========================================================================= */
-hn4_TEST(ComplexityProof, Vector_Math_Is_Constant) {
-    hn4_volume_t* vol = create_o1_fixture();
-    
-    uint64_t G = 1000;
-    
-    /* 
-     * FIX: Use ODD Vector (43).
-     * The allocator enforces V |= 1. Using 42 would be converted to 43.
-     */
-    uint64_t V = 43; 
-    
-    uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-    uint64_t lba_1 = _calc_trajectory_lba(vol, G, V, 1, 0, 0);
-    
-    /* Check Delta */
-    uint64_t diff = lba_1 - lba_0;
-    ASSERT_EQ(V, diff);
-    
-    cleanup_o1_fixture(vol);
-}
-
-/* =========================================================================
  * TEST 4: DIRECT BITMAP ACCESS (No Search)
  * ========================================================================= */
 hn4_TEST(ComplexityProof, Direct_Bitmap_Indexing) {

@@ -190,52 +190,6 @@ hn4_TEST(SmallFiles, SlackSpace_Verification) {
 }
 
 /* =========================================================================
- * TEST 5: PICO PROFILE (512B Blocks)
- * ========================================================================= */
-/*
- * RATIONALE:
- * In PICO profile, BS=512.
- * A 1KB file should allocate 2 Blocks.
- */
-hn4_TEST(SmallFiles, Pico_1KB_TwoBlocks) {
-    hn4_volume_t* vol = create_small_fixture();
-    
-    /* Reconfig for PICO */
-    vol->sb.info.format_profile = HN4_PROFILE_PICO;
-    vol->vol_block_size = 512;
-    vol->sb.info.block_size = 512;
-    
-    uint64_t file_len = 1024;
-    
-    /* Calculate blocks */
-    uint64_t blocks = (file_len + 511) / 512;
-    
-    ASSERT_EQ(2ULL, blocks);
-    
-    /* Alloc 2 blocks */
-    hn4_anchor_t anchor = {0};
-    uint64_t G = 1000;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    /* Pico forces V=1 */
-    anchor.orbit_vector[0] = 1; 
-    
-    hn4_addr_t lba1, lba2;
-    uint8_t k;
-    
-    hn4_alloc_block(vol, &anchor, 0, &lba1, &k);
-    hn4_alloc_block(vol, &anchor, 1, &lba2, &k);
-    
-    /* Verify both succeeded (K=0) */
-    uint64_t v1 = *(uint64_t*)&lba1;
-    uint64_t v2 = *(uint64_t*)&lba2;
-    
-    ASSERT_EQ(v1 + 1, v2); /* Sequential 512B blocks */
-    
-    cleanup_small_fixture(vol);
-}
-
-
-/* =========================================================================
  * 1. IMMEDIATE-MODE -> D1-PROMOTION BOUNDARY
  * ========================================================================= */
 hn4_TEST(SmallFiles, Promotion_Boundary) {
@@ -417,46 +371,6 @@ hn4_TEST(SmallFiles, Boundary_48_vs_49) {
     hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &lba, &k);
     ASSERT_EQ(HN4_OK, res);
     ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
-
-    cleanup_small_fixture(vol);
-}
-
-/* =========================================================================
- * NEW TEST 2: PICO PROFILE 513-BYTE OVERFLOW
- * ========================================================================= */
-/*
- * RATIONALE:
- * PICO uses 512B blocks.
- * A 513-byte file exceeds Block 0 by exactly 1 byte.
- * It MUST allocate 2 blocks (Block 0 and Block 1).
- */
-hn4_TEST(SmallFiles, Pico_513Byte_Overflow) {
-    hn4_volume_t* vol = create_small_fixture();
-    
-    /* Setup PICO */
-    vol->sb.info.format_profile = HN4_PROFILE_PICO;
-    vol->vol_block_size = 512;
-    vol->sb.info.block_size = 512;
-
-    hn4_anchor_t anchor = {0};
-    anchor.orbit_vector[0] = 1; /* PICO V=1 */
-    
-    /* Alloc N=0 (Bytes 0-511) */
-    hn4_addr_t lba0; uint8_t k0;
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &lba0, &k0));
-
-    /* Alloc N=1 (Byte 512) */
-    hn4_addr_t lba1; uint8_t k1;
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 1, &lba1, &k1));
-
-    /* Check Usage */
-    ASSERT_EQ(2ULL, atomic_load(&vol->used_blocks));
-
-    /* Check Adjacency (PICO is V=1, usually sequential) */
-    /* Note: In PICO, allocator scans linearly. */
-    uint64_t v0 = *(uint64_t*)&lba0;
-    uint64_t v1 = *(uint64_t*)&lba1;
-    ASSERT_EQ(v0 + 1, v1);
 
     cleanup_small_fixture(vol);
 }

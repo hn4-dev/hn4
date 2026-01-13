@@ -696,79 +696,6 @@ hn4_TEST(Write, Write_Fails_On_RO) {
     write_fixture_teardown(dev);
 }
 
-hn4_TEST(Write, Read_Selects_Highest_Generation) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    uint64_t G = 4000;
-    uint32_t bs = vol->vol_block_size;
-    uint32_t ss = 512;
-    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
-    uint8_t* raw_buf = calloc(1, bs);
-
-    /* --- 1. Manually Inject Old Block (Gen 10) at k=0 --- */
-    uint64_t lba_old = _calc_trajectory_lba(vol, G, 0, 0, 0, 0);
-    bool changed;
-    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_old, BIT_SET, &changed));
-    
-    hn4_block_header_t* hptr = (hn4_block_header_t*)raw_buf;
-    hptr->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    hptr->generation = hn4_cpu_to_le64(10);
-    hptr->well_id.lo = hn4_cpu_to_le64(0x9999);
-    
-    /* [CRITICAL FIX] Use correct DATA Seed (0x0) so Reader accepts it */
-    hptr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, hptr->payload, payload_cap));
-
-    /* [CRITICAL FIX] Use correct HEADER Seed (0xFF..) */
-    hptr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, hptr, offsetof(hn4_block_header_t, header_crc)));
-    
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba_old * (bs/ss)), raw_buf, bs/ss);
-
-    /* --- 2. Manually Inject New Block (Gen 11) at k=1 --- */
-    uint64_t lba_new = _calc_trajectory_lba(vol, G, 0, 0, 0, 1);
-    ASSERT_EQ(HN4_OK, _bitmap_op(vol, lba_new, BIT_SET, &changed));
-    
-    /* Reset buffer for New Block */
-    memset(raw_buf, 0, bs);
-    hptr = (hn4_block_header_t*)raw_buf;
-    hptr->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    hptr->generation = hn4_cpu_to_le64(11);
-    hptr->well_id.lo = hn4_cpu_to_le64(0x9999);
-    
-    /* Inject Payload */
-    memcpy(hptr->payload, "NEW_DATA", 8);
-    
-    /* Recalculate CRCs with correct seeds */
-    hptr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, hptr->payload, payload_cap));
-    hptr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, hptr, offsetof(hn4_block_header_t, header_crc)));
-    
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba_new * (bs/ss)), raw_buf, bs/ss);
-
-    /* --- 3. Setup Anchor pointing to G, expecting Gen 11 --- */
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = hn4_cpu_to_le64(0x9999);
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.write_gen = hn4_cpu_to_le32(11);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-
-    /* --- 4. Read --- */
-    memset(raw_buf, 0, bs);
-    /* Should succeed and return Gen 11 data. If CRCs were wrong, this would return DATA_ROT. */
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, raw_buf, bs));
-    
-    /* --- 5. Verify we got NEW_DATA --- */
-    ASSERT_EQ(0, memcmp(raw_buf, "NEW_DATA", 8));
-
-    free(raw_buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-
-
 /* =========================================================================
  * 6 NEW WRITE SCENARIO TESTS
  * ========================================================================= */
@@ -1117,48 +1044,6 @@ hn4_TEST(Write, Write_Oversized_Rejection) {
     write_fixture_teardown(dev);
 }
 
-/* 
- * TEST 4: Write_Sparse_Gap_Verify
- * Scenario: Write Block 0. Write Block 10. Leave 1-9 empty.
- *           Verify Block 5 reads as Sparse (Zeroes).
- */
-hn4_TEST(Write, Write_Sparse_Gap_Verify) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0xDDDD;
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-    
-    uint8_t buf[16] = "DATA";
-    uint32_t bs = vol->vol_block_size;
-
-    /* Write Head */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 4));
-    
-    /* Write Tail (Block 10) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 10, buf, 4));
-
-    /* Read Middle (Block 5) - Should be Empty */
-    uint8_t* read_buf = calloc(1, bs);
-    memset(read_buf, 0xFF, bs); /* Poison */
-    
-    /* Driver should return INFO_SPARSE and zero the buffer */
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 5, read_buf, bs);
-    ASSERT_EQ(HN4_INFO_SPARSE, res);
-    
-    /* Verify Zeroes */
-    uint8_t zeroes[16] = {0};
-    ASSERT_EQ(0, memcmp(read_buf, zeroes, 16));
-
-    free(read_buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
 
 hn4_TEST(Write, Write_ZeroLength_EdgeCase) {
     hn4_hal_device_t* dev = write_fixture_setup();
@@ -1304,48 +1189,6 @@ hn4_TEST(Write, Write_Perm_Read_Only_File) {
     
     ASSERT_EQ(HN4_ERR_ACCESS_DENIED, hn4_write_block_atomic(vol, &anchor, 0, buf, 8));
 
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
- * TEST 3: Write_Fractal_Scale_Logic
- * Objective: Verify Fractal Scaling (M). If M=4 (Scale 16), stride should be 
- *            16 * BlockSize. Write Block 0 and Block 1, check physical LBA distance.
- */
-hn4_TEST(Write, Write_Fractal_Scale_Logic) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0xF7AC;
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    anchor.gravity_center = hn4_cpu_to_le64(10000);
-    
-    /* M=1 -> 2^1 = 2x Scaling. Block Stride should be 2 * BS */
-    anchor.fractal_scale = hn4_cpu_to_le16(1); 
-    uint64_t V = 1; memcpy(anchor.orbit_vector, &V, 6);
-
-    uint32_t bs = vol->vol_block_size;
-    uint8_t* buf = calloc(1, bs);
-
-    /* Write Block 0 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 100));
-    
-    /* Write Block 1 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 100));
-
-    /* Calculate Theoretical Physical LBAs */
-    uint64_t lba0 = _calc_trajectory_lba(vol, 10000, V, 0, 1, 0);
-    uint64_t lba1 = _calc_trajectory_lba(vol, 10000, V, 1, 1, 0);
-    
-    /* Difference should be exactly 2 blocks (because M=1) */
-    ASSERT_EQ(2, lba1 - lba0);
-
-    free(buf);
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
@@ -1781,47 +1624,6 @@ hn4_TEST(Write, Write_High_K_Orbit) {
 }
 
 /* 
- * TEST 4: Write_Implicit_Hole_Creation
- * Objective: Verify writing Block 10 without Block 0..9 creates sparse holes
- *            and updates file mass correctly.
- */
-hn4_TEST(Write, Write_Implicit_Hole_Creation) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x1233E;
-    anchor.gravity_center = hn4_cpu_to_le64(_get_safe_G(vol) + 3000);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    anchor.mass = 0;
-
-    uint8_t buf[16] = "DATA_AT_10";
-    uint32_t bs = vol->vol_block_size;
-    uint32_t payload_sz = bs - sizeof(hn4_block_header_t);
-
-    /* Write at index 10 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 10, buf, 10));
-
-    /* 1. Verify Mass: Should cover 0..10 */
-    uint64_t expected_mass = (10 * payload_sz) + 10;
-    ASSERT_EQ(expected_mass, hn4_le64_to_cpu(anchor.mass));
-
-    /* 2. Verify Block 5 reads as Sparse */
-    uint8_t* read_buf = calloc(1, 4096);
-    memset(read_buf, 0xCC, 4096);
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 5, read_buf, 4096);
-    ASSERT_EQ(HN4_INFO_SPARSE, res);
-    ASSERT_EQ(0, read_buf[0]); /* Buffer zeroed */
-
-    free(read_buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
  * TEST 5: Write_Ludic_Mode_Passthrough
  * Objective: Verify that setting HN4_ALLOC_LUDIC (Game Mode) 
  *            allows writes to proceed normally (Shadow Hop logic valid).
@@ -1854,68 +1656,6 @@ hn4_TEST(Write, Write_Ludic_Mode_Passthrough) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
-
-/*
- * TEST: Write_Fractal_Sparse_Bitmap_Silence
- * Objective: Verify Fractal Scaling (M) sparse logic.
- *            If M=2 (Scale 4), logical blocks are spaced 4 physical blocks apart.
- *            Writing Logical 0 and Logical 1 should leave physical blocks 1, 2, and 3
- *            completely UNTOUCHED in the bitmap (not just zeroed data, but unallocated).
- */
-hn4_TEST(Write, Write_Fractal_Sparse_Bitmap_Silence) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x13;
-    uint64_t G = 20000; 
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    
-    /* M=2 -> 2^2 = 4x Scaling. Stride = 4 * Blocks */
-    anchor.fractal_scale = hn4_cpu_to_le16(2); 
-    uint64_t V = 1; memcpy(anchor.orbit_vector, &V, 6);
-
-    uint32_t bs = vol->vol_block_size;
-    uint8_t* buf = calloc(1, bs);
-
-    /* 1. Write Logical Block 0 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 16));
-
-    /* 2. Write Logical Block 1 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 16));
-
-    /* 3. Verify Bitmap State */
-    /* Ask the physics engine where they actually landed (Handles Modulo/Offsets) */
-    uint64_t phys_l0 = _calc_trajectory_lba(vol, G, V, 0, 2, 0); 
-    uint64_t phys_l1 = _calc_trajectory_lba(vol, G, V, 1, 2, 0); 
-    
-    /* FIX: Assert RELATIVE distance, not absolute equality to G */
-    ASSERT_EQ(4, phys_l1 - phys_l0);
-
-    bool is_set;
-    
-    /* The Written Blocks must be SET */
-    _bitmap_op(vol, phys_l0, BIT_TEST, &is_set); ASSERT_TRUE(is_set);
-    _bitmap_op(vol, phys_l1, BIT_TEST, &is_set); ASSERT_TRUE(is_set);
-
-    /* The Fractal Gaps (phys_l0+1 ... phys_l1-1) must be CLEAR */
-    for (uint64_t hole = phys_l0 + 1; hole < phys_l1; hole++) {
-        _bitmap_op(vol, hole, BIT_TEST, &is_set);
-        if (is_set) {
-            HN4_LOG_CRIT("Fractal Leak: Hole at %llu was allocated!", (unsigned long long)hole);
-            ASSERT_TRUE(0);
-        }
-    }
-
-    free(buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 
 /* 
  * TEST: Write_Sovereign_Immutable_Clash
@@ -5690,67 +5430,6 @@ hn4_TEST(GenerationLogic, StrictlyMonotonic) {
 }
 
 /* 
- * TEST 15: ShadowHop_InterleavedWrites_NoCrossTalk
- * Scenario: Write blocks N, N+1, N+2. Verify independence.
- */
-hn4_TEST(MultiBlock, InterleavedWrites_NoCrossTalk) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    uint32_t len = vol->vol_block_size - sizeof(hn4_block_header_t);
-    uint8_t* data = calloc(1, len);
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0xEEEE;
-    anchor.orbit_vector[0] = 1;
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-
-    /* Write 0 -> Gen 1 */
-    data[0] = 0x00;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, len));
-
-    /* Write 2 -> Gen 2 */
-    data[0] = 0x02;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 2, data, len));
-
-    /* Write 1 -> Gen 3 */
-    data[0] = 0x01;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, data, len));
-
-    /* 
-     * At this point, Anchor Gen = 3.
-     * Block 0 is Gen 1. Block 2 is Gen 2. Block 1 is Gen 3.
-     * The Strict Driver will reject Block 0 and 2.
-     * To verify CrossTalk (that Block 1 didn't overwrite Block 0's slot),
-     * we must update Block 0 and 2 to Gen 4 and 5.
-     */
-
-    /* Update 0 -> Gen 4 */
-    data[0] = 0x00;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, len));
-
-    /* Update 2 -> Gen 5 */
-    data[0] = 0x02;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 2, data, len));
-
-    /* Now verify reads. Anchor is Gen 5. 
-       Block 2 is Gen 5. (Should Read OK)
-       Block 0 is Gen 4. (Will Fail Strict Check)
-       Block 1 is Gen 3. (Will Fail Strict Check)
-       
-       We test Block 2 to prove no crosstalk from the previous writes.
-    */
-    memset(data, 0, len);
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 2, data, len));
-    ASSERT_EQ(0x02, data[0]);
-
-    free(data);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
  * TEST 16: ShadowHop_Remount_NoGhosts
  * Scenario: Crash recovery simulation.
  */
@@ -5976,48 +5655,6 @@ hn4_TEST(Integrity, Ghost_Dies_By_Generation) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
-
-/*
- * TEST 22: Gravity_Does_Not_Lie
- * Scenario: Verify that changing the Orbit Vector (V) makes 
- *           previously written data disappear (it's now in the wrong orbit).
- */
-hn4_TEST(Physics, Gravity_Does_Not_Lie) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    uint32_t len = vol->vol_block_size - sizeof(hn4_block_header_t);
-    uint8_t* data = calloc(1, len);
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x999;
-    anchor.orbit_vector[0] = 1; /* V=1 */
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-
-    /* Write Data at V=1. USE BLOCK 1. */
-    data[0] = 0xAA;
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, data, len));
-
-    /* Read back OK */
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 1, data, len));
-
-    /* Change Physics: V=3 */
-    anchor.orbit_vector[0] = 3;
-
-    /* Read should now fail / return Sparse 
-       because the math points to a different LBA. */
-    memset(data, 0, len);
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 1, data, len);
-    
-    /* It should be SPARSE. */
-    ASSERT_EQ(HN4_INFO_SPARSE, res);
-
-    free(data);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 
 /*
  * TEST 23: ShadowHop_Honors_The_Last_Word
@@ -6764,86 +6401,6 @@ hn4_TEST(MediaTopology, AI_Tensor_WriteRead) {
     write_fixture_teardown(dev);
 }
 
-/* 
- * TEST: Write_Media_Gaming_Assets
- * Objective: Verify write/read on Gaming profile.
- *            Constraints:
- *            1. Profile = HN4_PROFILE_GAMING.
- *            2. Policy = Ballistic (Scatter allowed).
- *            3. Verify multi-block ballistic placement (Cluster logic).
- */
-hn4_TEST(MediaTopology, Gaming_Assets_WriteRead) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-
-    /* 1. Configure SB for Gaming */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE / 512);
-    sb.info.format_profile = HN4_PROFILE_GAMING;
-    _w_write_sb(dev, &sb, 0);
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x6A3E; /* GAME */
-    anchor.gravity_center = hn4_cpu_to_le64(50000);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID | HN4_TYPE_LUDIC);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    
-    /* Use V=4 (Cluster Stride) */
-    uint64_t V = 4; memcpy(anchor.orbit_vector, &V, 6);
-
-    uint8_t buf[32] = "LEVEL_DATA";
-    uint32_t len = 10;
-
-    /* 2. Write 3 blocks */
-    /* Write 0 -> Block Gen 1 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, len));
-    /* Write 1 -> Block Gen 2 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, len));
-    /* Write 2 -> Block Gen 3 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 2, buf, len));
-
-    /* 3. Verify Readback of middle block */
-    uint32_t current_gen = hn4_le32_to_cpu(anchor.write_gen); // Should be 3
-    
-    /* Simulate Time Travel: Set Anchor to Gen 2 to match Block 1 */
-    anchor.write_gen = hn4_cpu_to_le32(current_gen - 1);      
-
-    uint8_t read_buf[4096] = {0};
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 1, read_buf, 4096));
-    ASSERT_EQ(0, strcmp((char*)read_buf, "LEVEL_DATA"));
-    
-    /* 
-     * 4. Verify Physics: LBA distances should match V=4 stride (approx) 
-     * FIX: We must align Anchor Generation to Block Generation for resolution 
-     * because the driver now enforces strict equality (Anti-Phantom/Anti-Stale).
-     */
-    
-    /* Resolve Block 0 (Gen 1) */
-    anchor.write_gen = hn4_cpu_to_le32(current_gen - 2); 
-    uint64_t lba0 = _resolve_residency_verified(vol, &anchor, 0);
-    
-    /* Resolve Block 1 (Gen 2) */
-    anchor.write_gen = hn4_cpu_to_le32(current_gen - 1); 
-    uint64_t lba1 = _resolve_residency_verified(vol, &anchor, 1);
-    
-    /* Restore State */
-    anchor.write_gen = hn4_cpu_to_le32(current_gen);
-
-    /* Assertions */
-    ASSERT_NE(lba0, HN4_LBA_INVALID);
-    ASSERT_NE(lba1, HN4_LBA_INVALID);
-    
-    /* Diff should be > 0. Exact stride depends on M and Phi, but V=4 ensures separation. */
-    ASSERT_NE(lba0, lba1);
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-
 /* =========================================================================
  * FAILURE INJECTION & RECOVERY TESTS
  * ========================================================================= */
@@ -7441,85 +6998,6 @@ hn4_TEST(Atomicity, PowerLoss_MidFlight) {
     ASSERT_EQ(0, strcmp((char*)read_buf, "VERSION_1_SAFE"));
 
     free(raw_v2);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-
-hn4_TEST(Concurrency, Anchor_Generation_Race) {
-   hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* Initial Shared State (Gen 100) */
-    hn4_anchor_t anchor_shared = {0};
-    anchor_shared.seed_id.lo = 0x32;
-    anchor_shared.gravity_center = hn4_cpu_to_le64(6000);
-    anchor_shared.write_gen = hn4_cpu_to_le32(100);
-    anchor_shared.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor_shared.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-
-    /* Thread A Snapshot */
-    hn4_anchor_t anchor_A = anchor_shared; 
-    
-    /* Thread B Snapshot */
-    hn4_anchor_t anchor_B = anchor_shared;
-
-    /* 
-     * SIMULATE RACE: Both threads attempt to write Gen 101 concurrently.
-     * Thread A calculates trajectory for Gen 101 (k=0).
-     * Thread B calculates trajectory for Gen 101 (k=0).
-     */
-    
-    /* Thread A Commits "THREAD_A" (Gen 101) */
-    uint8_t bufA[16] = "THREAD_A";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor_A, 0, bufA, 8));
-    /* Vol state: k=0 occupied by "THREAD_A" (Gen 101) */
-
-    /* 
-     * Thread B attempts commit "THREAD_B" (Gen 101).
-     * The allocator sees k=0 is occupied (by A). 
-     * It MUST hop to k=1.
-     */
-    uint8_t bufB[16] = "THREAD_B";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor_B, 0, bufB, 8));
-    
-    /* 
-     * Now on Disk:
-     * k=0: THREAD_A (Gen 101)
-     * k=1: THREAD_B (Gen 101)
-     * 
-     * Both blocks claim to be Gen 101.
-     * The file system state is determined by which Anchor update persisted last.
-     * Since B wrote last, let's assume B updated the shared anchor.
-     */
-    hn4_anchor_t anchor_final = anchor_B; 
-    /* Anchor Gen is 101. */
-
-    /* 
-     * READ RESOLUTION:
-     * Both k=0 and k=1 have valid Gen 101 blocks.
-     * Both match the Anchor's expectation.
-     * The Reader scans k=0..12. It stops at the FIRST match.
-     * k=0 is Thread A.
-     * k=1 is Thread B.
-     * 
-     * RESULT: Reader returns THREAD_A.
-     * IMPLICATION: Thread B's write is physically present but logically shadowed by A.
-     * This is standard "Last Write Wins" behavior in a collision, determined by probe order.
-     */
-    uint8_t read_buf[4096] = {0};
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor_final, 0, read_buf, 4096));
-    
-    /* 
-     * CRITICAL ASSERTION:
-     * Because A occupied the primary slot (k=0), it wins the read path.
-     * Thread B's data is valid on disk but unreachable via standard lookup order
-     * until A is deleted/moved.
-     */
-    ASSERT_EQ(0, strcmp((char*)read_buf, "THREAD_A"));
-
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }

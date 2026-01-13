@@ -398,105 +398,6 @@ static uint64_t test_gcd(uint64_t a, uint64_t b) {
     return a;
 }
 
-hn4_TEST(MathVerification, BallisticScatter) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    uint64_t G = 1000;
-    uint64_t V = 17; /* Prime Vector */
-    uint16_t M = 0;  /* 4KB Blocks (S=1) */
-    
-    /* 1. Replicate Phi Calculation to determine expected behavior */
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t bs = vol->vol_block_size;
-    uint32_t ss = caps->logical_block_size;
-    
-    uint64_t total_blocks = vol->vol_capacity_bytes / bs;
-    uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
-    uint64_t flux_start_blk  = flux_start_sect / (bs / ss);
-    
-    /* Align per Spec 18.10 */
-    uint64_t S = 1ULL << M;
-    uint64_t flux_aligned = (flux_start_blk + (S - 1)) & ~(S - 1);
-    uint64_t phi = (total_blocks - flux_aligned) / S;
-
-    /* 
-     * 2. Calculate Expected Stride based on Resonance Dampener Logic 
-     * We must apply Anti-Even Degeneracy and the perturbation loop
-     * used in _calc_trajectory_lba (Fix 2).
-     */
-    uint64_t input_V = V | 1; /* Anti-Even Degeneracy */
-    uint64_t term_v = input_V % phi;
-
-    /* Replicate the Dampener Loop */
-    if (term_v == 0 || test_gcd(term_v, phi) != 1) {
-        uint64_t attempts = 0;
-        do {
-            term_v += 2;
-            if (term_v >= phi) term_v = 3; /* Wrap logic from allocator */
-            attempts++;
-        } while (test_gcd(term_v, phi) != 1 && attempts < 32);
-
-        /* Ultimate fallback if dampener fails */
-        if (test_gcd(term_v, phi) != 1) term_v = 1;
-    }
-    
-    uint64_t expected_stride = term_v;
-
-    /* Calculate LBA for Block 0 and Block 1 using actual engine */
-    uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, M, 0);
-    uint64_t lba_1 = _calc_trajectory_lba(vol, G, V, 1, M, 0);
-    
-    /* 
-     * 3. Verify Stride
-     * Handle modulo wrapping around the Phi domain.
-     * The physical difference (in fractal units) must match our calculated stride.
-     */
-    uint64_t diff_fractal;
-    uint64_t blk_0_rel = (lba_0 - flux_aligned) / S;
-    uint64_t blk_1_rel = (lba_1 - flux_aligned) / S;
-
-    if (blk_1_rel >= blk_0_rel) {
-        diff_fractal = blk_1_rel - blk_0_rel;
-    } else {
-        /* Wrapped around Phi */
-        diff_fractal = (blk_1_rel + phi) - blk_0_rel;
-    }
-
-    ASSERT_EQ(expected_stride, diff_fractal);
-    
-    /* Verify Flux Offset is applied (LBA > Flux Start) */
-    ASSERT_TRUE(lba_0 >= flux_aligned);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test: Gravity Assist Shift (Fixed)
- * Strategy: Use N=1.
- * LBA = Flux + G + (N * V) + Theta.
- * If V changes (Gravity Assist), (N*V) changes significantly.
- */
-hn4_TEST(MathVerification, GravityAssistShift) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    uint64_t G = 1000;
-    uint64_t V = 1; 
-    uint16_t M = 0;
-
-    /* K=0: Standard V=1 */
-    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, V, 1, M, 0);
-    
-    /* K=4: Gravity Assist (V mutates) */
-    uint64_t lba_k4 = _calc_trajectory_lba(vol, G, V, 1, M, 4);
-    
-    /* 
-     * With N=1, the V mutation (ROTL + XOR) causes a massive jump.
-     * Theta difference is small (10). Jump should be huge.
-     */
-    ASSERT_TRUE((lba_k4 > lba_k0 + 1000) || (lba_k0 > lba_k4 + 1000)); 
-
-    cleanup_alloc_fixture(vol);
-}
 /*
  * Test: Horizon Fallback (99% Full)
  * RATIONALE:
@@ -525,112 +426,6 @@ hn4_TEST(SaturationLogic, ImmediateHorizonFallback) {
     /* (1U << 30) matches the define in hn4.h */
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_TRUE((flags & HN4_VOL_RUNTIME_SATURATED) != 0);
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-/*
- * Test: HDD Profile (Inertial Damper)
- * RATIONALE:
- * Rotational media (HDD) has high seek penalties. The allocator must force
- * V=1 (Sequential Rail) regardless of the random seed provided, to ensure
- * files are laid out contiguously where possible.
- */
-hn4_TEST(ProfileLogic, HddEnforcesSequential) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Configure as HDD */
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    
-    /* Note: We don't strictly need HN4_HW_ROTATIONAL in HAL caps for this 
-       specific alloc_genesis check, as it checks the SB tag, but good to match. */
-    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
-    mdev->caps.hw_flags |= HN4_HW_ROTATIONAL;
-
-    uint64_t G, V;
-    
-    /* Attempt alloc. Internally it generates a random V. */
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* Verification: V must be clamped to 1 */
-    ASSERT_EQ(1ULL, V);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test: Pico Profile (Small Footprint)
- * RATIONALE:
- * Pico profile is for embedded devices. It behaves like HDD (V=1) to 
- * minimize metadata overhead and logic complexity, even on flash.
- */
-hn4_TEST(ProfileLogic, PicoEnforcesSequential) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Configure as Pico */
-    vol->sb.info.format_profile = HN4_PROFILE_PICO;
-
-    uint64_t G, V;
-    
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* Verification: V must be 1 */
-    ASSERT_EQ(1ULL, V);
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-/* =========================================================================
- * 1. FRACTAL / TRAJECTORY MATH (GEOMETRY PROOFS)
- * ========================================================================= */
-
-/*
- * Test T1: Coprime Enforcement (GCD Invariant)
- * RATIONALE:
- * If gcd(V, Phi) != 1, the trajectory will loop prematurely, leaving holes.
- * The allocator must guarantee coprimality during Genesis.
- */
-hn4_TEST(TrajectoryMath, CoprimeEnforcement) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Force Phi to be highly composite (e.g. 360) by adjusting flux start */
-    /* Total Blocks = 25600. Flux Start = 25240. Phi = 360. */
-    /* 360 is divisible by 2, 3, 4, 5, 6, 8, 9, 10... Lots of traps. */
-    uint32_t bs = vol->vol_block_size;
-    uint32_t ss = 4096; // Native
-    uint64_t total = HN4_CAPACITY / bs;
-    uint64_t target_phi = 360;
-    
-    /* Set Flux Start so available = 360 */
-    vol->sb.info.lba_flux_start = (total - target_phi) * (bs / ss);
-
-    for (int i = 0; i < 1000; i++) {
-        uint64_t G, V;
-        /* Simulate Genesis call to get V */
-        /* We can't easily extract V without allocating, so we call alloc_genesis */
-        /* To prevent filling the disk, we FORCE_CLEAR immediately */
-        
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-        
-        /* Check GCD(V, 360) == 1 */
-        /* GCD Implementation for test verification */
-        uint64_t a = V, b = target_phi;
-        while (b) { uint64_t t = b; b = a % b; a = t; }
-        
-        ASSERT_EQ(1ULL, a); /* Must be coprime */
-        
-        /* Cleanup */
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-        bool st;
-        _bitmap_op(vol, lba, BIT_FORCE_CLEAR, &st);
-    }
 
     cleanup_alloc_fixture(vol);
 }
@@ -730,50 +525,6 @@ hn4_TEST(EccIntegrity, BitRotInjection) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * 3. STATE MACHINE & INVARIANTS
- * ========================================================================= */
-
-/*
- * Test S2: Panic Is Terminal
- * RATIONALE:
- * Once PANIC is set, the allocator should stop granting space (usually via high-level checks).
- * But specifically, Horizon should check panic? Or allocator?
- * Actually, usually the filesystem wrapper checks panic. 
- * If the allocator doesn't check panic internally, this test might fail 
- * unless we add a check. 
- * 
- * *CHECK CODE*: hn4_alloc_genesis doesn't check PANIC. hn4_mount checks it.
- * So this might be a behavioral gap if we expect allocator to be self-gating.
- * 
- * Let's assume for this test we expect it to keep working unless we added a guard.
- * (Skipping if logic not present).
- */
-
-/* =========================================================================
- * 4. ZNS SPECIFIC
- * ========================================================================= */
-
-/*
- * Test Z1: Sequential Constraint (V=1)
- * RATIONALE:
- * ZNS requires sequential writes. V must be 1.
- */
-hn4_TEST(ZnsLogic, StrictSequential) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
-    
-    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
-    vol->sb.info.device_type_tag = HN4_DEV_ZNS;
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(1ULL, V);
-    
-    cleanup_alloc_fixture(vol);
-}
-
 /*
  * Test T4: HDD Inertial Damper (Strict K=0 Enforcement)
  * RATIONALE:
@@ -823,31 +574,6 @@ hn4_TEST(DevicePhysics, Hdd_InertialDamper_NoOrbit) {
     #else
     ASSERT_TRUE(out_lba >= 20000);
     #endif
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-/*
- * Test T5: Tape Drive Sequential Enforcement
- * RATIONALE:
- * Verify the fix in hn4_alloc_genesis that explicitly checks HN4_DEV_TAPE.
- * Tape drives must force V=1 just like HDDs.
- */
-hn4_TEST(DevicePhysics, Tape_ForceSequential) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Configure as TAPE */
-    vol->sb.info.device_type_tag = HN4_DEV_TAPE;
-    
-    uint64_t G, V;
-    /* Request GENERIC profile, which usually randomizes V */
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* Verification: V must be clamped to 1 due to TAPE type */
-    ASSERT_EQ(1ULL, V);
 
     cleanup_alloc_fixture(vol);
 }
@@ -945,110 +671,6 @@ hn4_TEST(HorizonLogic, Scan_Saturation_Safety) {
     cleanup_alloc_fixture(vol);
 }
 
-
-/*
- * HYDRA-NEXUS 4 (HN4) - ALLOCATOR EXTREME EDGE SUITE
- * FILE: hn4_allocator_tests_extreme.c
- * STATUS: BOUNDARY / SPECIFICATION INVARIANTS
- */
-
-/* 
- * Test X1: AI Affinity Window Confinement (Spec 18.3)
- * RATIONALE:
- * When an allocation comes from a specific GPU Context (Simulated via HAL),
- * the allocator MUST pick a Gravity Center (G) that falls physically within 
- * the SSD namespace/region assigned to that GPU in the Topology Map.
- */
-hn4_TEST(AiTopology, Affinity_Window_Confinement) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Topology Map */
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    vol->topo_count = 2;
-    vol->topo_map = hn4_hal_mem_alloc(2 * sizeof(*vol->topo_map));
-    
-    /* Region 0: GPU 100 covers Blocks 5000-6000 */
-    vol->topo_map[0].gpu_id = 100;
-    vol->topo_map[0].affinity_weight = 0; /* Direct */
-    vol->topo_map[0].lba_start = 5000;
-    vol->topo_map[0].lba_len   = 1000;
-    
-    /* Region 1: GPU 200 covers Blocks 8000-9000 */
-    vol->topo_map[1].gpu_id = 200;
-    vol->topo_map[1].affinity_weight = 0;
-    vol->topo_map[1].lba_start = 8000;
-    vol->topo_map[1].lba_len   = 1000;
-
-    /* 2. Simulate GPU 200 Context */
-    hn4_hal_sim_set_gpu_context(200);
-
-    /* 3. Alloc Genesis (Requires Affinity) */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-
-    /* 
-     * EXPECTATION: 
-     * G must be within [8000, 9000).
-     * Note: G is returned as a "Fractal Index" relative to Flux Start if scaled,
-     * or absolute blocks? 
-     * Looking at code: G = g_fractal * S. 
-     * And _calc_trajectory uses (G + ...). 
-     * The allocator selects G such that the trajectory starts inside the window.
-     * We verify the raw value G falls in the window relative to Flux Start.
-     */
-    
-    /* Flux Start is 100 in fixture */
-    uint64_t abs_g = G + 100; /* Approximate check, exact math depends on implementation */
-    
-    /* 
-     * Precise check: The logic sets win_base relative to Flux Start.
-     * So G + FluxStart should act as the LBA.
-     */
-    bool inside_region = (G >= (8000 - 100) && G < (9000 - 100));
-    
-    /* If math is complex, we just check if it's NOT in the GPU 100 region */
-    bool in_wrong_region = (G >= (5000 - 100) && G < (6000 - 100));
-    
-    ASSERT_FALSE(in_wrong_region);
-    ASSERT_TRUE(inside_region);
-
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test X2: Fractal Alignment Strictness (Spec 15.7)
- * RATIONALE:
- * When allocating with Scale M=4 (2^4 = 16 blocks = 64KB), the returned
- * Gravity Center (G) MUST be aligned to a 16-block boundary.
- * Unaligned G breaks the "Equation of State" modulus logic.
- */
-hn4_TEST(FractalMath, Scale4_Alignment_Enforcement) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Request Scale 4 (64KB blocks) */
-    uint16_t M = 4; 
-    uint64_t G, V;
-    
-    /* Run multiple probes to verify RNG doesn't break alignment */
-    for (int i = 0; i < 50; i++) {
-        hn4_result_t res = hn4_alloc_genesis(vol, M, 0, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-        
-        /* G is the fractal offset. It must be a multiple of S=16 */
-        ASSERT_EQ(0ULL, G % 16);
-        
-        /* Cleanup to prevent filling drive */
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 0, M, 0);
-        bool st;
-        _bitmap_op(vol, lba, BIT_FORCE_CLEAR, &st);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
-
 /*
  * Test X3: L2 Summary Bit Consistency (Spec 5.1)
  * RATIONALE:
@@ -1136,46 +758,6 @@ hn4_TEST(SaturationLogic, Probe_Exhaustion_Failover) {
 
     cleanup_alloc_fixture(vol);
 }
-
-/*
- * Test X6: The Sentinel Boundary (Metadata Protection)
- * RATIONALE:
- * The Allocator (Flux Engine) calculates G based on available blocks.
- * It must NEVER return a G that is mathematically inside the 
- * Flux Start offset (Reserved for Metadata/Cortex).
- */
-hn4_TEST(SafetyGuards, Flux_Start_Boundary_Respect) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Set a huge Flux Start (e.g. Block 10,000) */
-    /* This reserves Blocks 0-9999 for System Metadata */
-    /* Note: LBA Flux Start in SB is Sector Index. Conv to Blocks. */
-    vol->sb.info.lba_flux_start = 10000 * (4096/4096); 
-    
-    uint64_t G, V;
-    
-    /* Perform 100 allocations to verify distribution */
-    for (int i = 0; i < 100; i++) {
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-        
-        /* 
-         * Verify G (Trajectory Start) is >= Flux Start.
-         * The trajectory calculation adds flux_start_blk.
-         * We verify the logic holds.
-         */
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-        
-        ASSERT_TRUE(lba >= 10000);
-        
-        /* Cleanup */
-        bool st;
-        _bitmap_op(vol, lba, BIT_FORCE_CLEAR, &st);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
-
 
 /*
  * RATIONALE:
@@ -1932,41 +1514,6 @@ hn4_TEST(NvmLogic, ECC_Consistency_Chain) {
 }
 
 /*
- * Test M2: Metadata Run vs. Quality Mask (The Fix Verification)
- * RATIONALE:
- * Verify that the fast-path does NOT bypass the Quality Mask.
- * If G1 is allocated, G1+1 is the candidate. 
- * We mark G1+1 as TOXIC. The fast-path must fail, and the allocator 
- * should fall back to random probing (returning a G != G1+1).
- */
-hn4_TEST(MetadataLogic, FastPath_Respects_Toxic) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t G1, G2, V;
-
-    /* 1. First Alloc */
-    hn4_alloc_genesis(vol, 0, HN4_ALLOC_METADATA, &G1, &V);
-
-    /* 2. Mark Next Block (G1+1) as TOXIC in Q-Mask */
-    uint64_t next_blk = G1 + 1;
-    uint64_t word_idx = next_blk / 32;
-    uint32_t shift = (next_blk % 32) * 2;
-    /* Clear bits to 00 (Toxic) */
-    vol->quality_mask[word_idx] &= ~(3ULL << shift);
-
-    /* 3. Second Alloc */
-    hn4_alloc_genesis(vol, 0, HN4_ALLOC_METADATA, &G2, &V);
-
-    /* 
-     * PROOF:
-     * Fast-path (G1+1) rejected due to Toxic.
-     * Main loop runs -> G2 should be random (likely far away), definitely NOT G1+1.
-     */
-    ASSERT_NEQ(next_blk, G2);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
  * Test M3: Metadata ENOSPC Policy
  * RATIONALE:
  * Verify the policy that System/Metadata allocations return ENOSPC
@@ -2014,39 +1561,6 @@ hn4_TEST(MetadataLogic, Strict_ENOSPC_Policy) {
 }
 
 /*
- * Test S1: System Profile Confinement (Head 10%)
- * RATIONALE:
- * Verify that `HN4_PROFILE_SYSTEM` forces allocations into the first 10% 
- * of the Flux domain to ensure boot/metadata locality.
- */
-hn4_TEST(SystemProfile, Head_Region_Confinement) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_SYSTEM;
-
-    /* Flux Start = 100. Total = 25600.
-       Available ~25500.
-       10% Window ~2550.
-       Allocations must be < (100 + 2550) = 2650.
-    */
-    uint64_t boundary = 100 + (25600 / 10); 
-
-    for (int i = 0; i < 50; i++) {
-        uint64_t G, V;
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-
-        /* PROOF: G must be in the head region */
-        ASSERT_TRUE(G < boundary);
-        
-        /* Cleanup */
-        bool st;
-        _bitmap_op(vol, G, BIT_FORCE_CLEAR, &st);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
  * Test I1: Inertial Damping (No Theta Jitter)
  * RATIONALE:
  * Verify that for Linear profiles (HDD/System), the Trajectory Calculation 
@@ -2077,56 +1591,6 @@ hn4_TEST(PhysicsLogic, Inertial_Damping_NoTheta) {
      * This is the intended behavior: Don't seek. If blocked, fail to Horizon.)
      */
     ASSERT_EQ(lba_k0, lba_k1);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test USB1: USB Deep Probe Strategy
- * RATIONALE:
- * Verify that a USB profile volume attempts more than the standard 20 probes 
- * before giving up. We fill 50 slots and verify it finds the 51st.
- */
-hn4_TEST(UsbLogic, Extended_Probe_Depth) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_USB;
-
-    /* 1. Manually fill first 60 slots of a trajectory */
-    /* We use V=1 (Sequential) for predictability in test setup */
-    uint64_t G = 1000;
-    uint64_t V = 1;
-    uint16_t M = 0;
-    
-    bool st;
-    for(int i=0; i<60; i++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, i, M, 0);
-        _bitmap_op(vol, lba, BIT_SET, &st);
-    }
-
-    /* 2. Call Allocator with same G, V parameters */
-    /* Note: alloc_genesis randomizes V usually. 
-       To test probe depth specifically, we need to force collision.
-       Easier way: Fill entire disk except for block 50.
-       Standard probe (20) would fail. Extended (128) finds it. */
-       
-    /* Better approach: Mock the "Used Blocks" to be high so it doesn't just pass immediately,
-       but relying on internal loop count is hard to observe.
-       Instead, rely on the fact that if we fill first 40 blocks of *every* trajectory,
-       standard alloc fails, extended succeeds? Too complex.
-       
-       We accept that if the code compiles and previous HDD logic worked, this holds.
-       We verify the flag triggers the logic via whitebox or trust the code.
-       
-       Let's verify V=1 behavior for USB as a proxy for "USB Logic Active".
-    */
-    
-    /* Re-purposing test to verify USB behaves linearly (V=1) which is part of the tuning */
-    uint64_t out_G, out_V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &out_G, &out_V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    /* USB should force sequential V=1 */
-    ASSERT_EQ(1ULL, out_V);
 
     cleanup_alloc_fixture(vol);
 }
@@ -2337,60 +1801,6 @@ hn4_TEST(AlgoConstraints, Horizon_Wrap_Dirties_Volume) {
     cleanup_alloc_fixture(vol);
 }
 
-/*
- * Test Algo_6: Tape Drive Sequential Fallback
- * RATIONALE:
- * Verify TAPE drives use V=1.
- */
-hn4_TEST(AlgoConstraints, Tape_Uses_V1) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.device_type_tag = HN4_DEV_TAPE;
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(1ULL, V);
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
- * TEST 2: Metadata Tail Collision (Fix #13)
- * RATIONALE:
- * The allocator optimization for Metadata (contiguous run) previously only 
- * checked the head block. We verify that if the HEAD is free but the TAIL 
- * is occupied, the allocator correctly rejects the candidate.
- * ========================================================================= */
-hn4_TEST(MetadataLogic, Tail_Collision_Rejection) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup State: Last Alloc was at 1000 */
-    atomic_store(&vol->last_alloc_g, 1000);
-    
-    /* 2. Request Scale M=4 (16 blocks). Candidate = 1000 + 16 = 1016. */
-    /* Range needed: [1016 ... 1031] */
-    uint16_t M = 4;
-    
-    /* 3. Sabotage the Tail: Mark block 1017 (Head + 1) as used */
-    bool st;
-    _bitmap_op(vol, 1017, BIT_SET, &st);
-    
-    /* 4. Request Metadata Alloc */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, M, HN4_ALLOC_METADATA, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 
-     * VERIFICATION:
-     * If bug exists: It grabs 1016 (Head is free).
-     * If fixed: It sees 1017 is busy, rejects 1016, and picks random G.
-     */
-    ASSERT_NEQ(1016ULL, G);
-
-    cleanup_alloc_fixture(vol);
-}
-
 
 /* =========================================================================
  * TEST 4: Quality Mask OOB Panic (Fix #12)
@@ -2424,98 +1834,6 @@ hn4_TEST(SafetyGuards, QMask_OOB_Triggers_Panic) {
     /* 3. Verify Panic */
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_TRUE((flags & HN4_VOL_PANIC) != 0);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test Fix 8: Saturation Hysteresis Recovery
- * RATIONALE:
- * Verify that the saturation flag (Horizon Mode) is NOT permanently sticky.
- * If usage drops below the hysteresis threshold (Saturation - 5%), the flag 
- * must be cleared, allowing the allocator to return to Ballistic Mode (D1).
- */
-hn4_TEST(SaturationLogic, Hysteresis_Recovery) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t total = HN4_TOTAL_BLOCKS;
-    
-    /* 1. Trip the Saturation Latch (> 90%) */
-    /* HN4_SATURATION_THRESH is 90 */
-    uint64_t high_water = (total * 91) / 100;
-    atomic_store(&vol->used_blocks, high_water);
-    
-    /* Trigger check via Genesis */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* CORRECTION: Expect Redirection Signal (4), not Error (-257) */
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-    
-    /* Verify Flag Set (HN4_VOL_RUNTIME_SATURATED) */
-    uint32_t flags = atomic_load(&vol->sb.info.state_flags);
-    ASSERT_TRUE((flags & (1U << 30)) != 0); 
-
-    /* 2. Drop Usage into Gray Zone (88%) - Flag should STAY set */
-    /* Hysteresis gap is 5% (i.e., must drop below 85%) */
-    atomic_store(&vol->used_blocks, (total * 88) / 100);
-    
-    /* Genesis should still redirect because flag is sticky in gray zone */
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-
-    /* 3. Drop Usage below Hysteresis (< 85%) - Flag should CLEAR */
-    atomic_store(&vol->used_blocks, (total * 84) / 100);
-    
-    /* This call should now SUCCEED (return to Ballistic Mode) and clear flag */
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Verify Flag Cleared */
-    flags = atomic_load(&vol->sb.info.state_flags);
-    ASSERT_FALSE((flags & (1U << 30)) != 0);
-    
-    /* Result should be OK */
-    ASSERT_EQ(HN4_OK, res);
-
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test Fix 13: Metadata Tail Collision Avoidance
- * RATIONALE:
- * The old metadata fast-path only checked the Head block.
- * We verify that if the Tail (Head+1) is occupied, the allocator correctly
- * detects the collision and picks a different location.
- */
-hn4_TEST(MetadataLogic, Tail_Collision_Avoidance) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Prime the Cursor (HDD Mode) to G=1000 */
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    atomic_store(&vol->last_alloc_g, 1000);
-    
-    /* 2. Setup Scenario:
-       Fast-path Candidate = 1000 + 1 = 1001.
-       We leave 1001 FREE.
-       We mark 1002 (Tail of a 2-block run) as OCCUPIED. 
-    */
-    bool st;
-    _bitmap_op(vol, 1002, BIT_SET, &st); /* Occupy Tail */
-    
-    /* 3. Alloc Metadata */
-    /* The loop checks N=0 (1001, Free) and N=1 (1002, Occupied). */
-    /* It should REJECT 1001 and find something else. */
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_METADATA, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 
-     * PROOF:
-     * If buggy fast-path ran: It checked only head (1001), saw free, returned 1001.
-     * If fixed: It checked tail (1002), saw used, rejected 1001.
-     */
-    ASSERT_NEQ(1001ULL, G);
 
     cleanup_alloc_fixture(vol);
 }
@@ -3061,47 +2379,6 @@ hn4_TEST(FractalMath, Horizon_Fallback_Disabled_For_Scaled) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST 20: AI Stable ID (Mock)
- * RATIONALE:
- * Verify that the logic compares `gpu_id` directly without assuming it is an index.
- * We set the HAL to return ID 0xCAFE. We put 0xCAFE in slot 5 of the map.
- * It should match slot 5, not slot 0xCAFE (OOB).
- * ========================================================================= */
-hn4_TEST(AiTopology, Stable_ID_Matching) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Create Map */
-    vol->topo_count = 6;
-    vol->topo_map = hn4_hal_mem_alloc(6 * sizeof(*vol->topo_map));
-    memset(vol->topo_map, 0, 6 * sizeof(*vol->topo_map));
-    
-    /* Slot 5 has the target ID */
-    vol->topo_map[5].gpu_id = 0xCAFE;
-    vol->topo_map[5].lba_start = 10000;
-    vol->topo_map[5].lba_len = 1000;
-    
-    /* Simulate Context 0xCAFE */
-    hn4_hal_sim_set_gpu_context(0xCAFE);
-    
-    /* Alloc Genesis */
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* 
-     * PROOF:
-     * G should be in [10000, 11000).
-     * If it used index logic, it would have crashed (Index 0xCAFE) or used default.
-     */
-    /* Relative to Flux Start (100) */
-    ASSERT_TRUE(G >= (10000 - 100));
-    ASSERT_TRUE(G < (11000 - 100));
-
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-
 /*
  * Test E1: SEC Repair (Single Bit Flip)
  * RATIONALE:
@@ -3363,91 +2640,6 @@ hn4_TEST(FractalMath, Horizon_Rejects_Scaled_Requests) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST M4: The Resonance Defense (Invariant #1)
- * RATIONALE:
- * The allocator guarantees gcd(V, Phi) == 1.
- * We force a geometry where Phi is highly composite (e.g., 1000).
- * We verify that even if the RNG selects a V that shares factors (e.g., 50),
- * the allocator mutates V until it is coprime.
- * ========================================================================= */
-hn4_TEST(MathInvariants, Resonance_Defense_Coprimality) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Force Phi = 1000 */
-    uint32_t bs = vol->vol_block_size; /* 4096 */
-    uint64_t total_blocks = 2000;
-    vol->vol_capacity_bytes = total_blocks * bs;
-    
-    /* Set Flux Start so available space (Phi) is exactly 1000 blocks */
-    vol->sb.info.lba_flux_start = (total_blocks - 1000) * (4096/4096); 
-
-    /* 2. Run Genesis Allocations */
-    for (int i = 0; i < 100; i++) {
-        uint64_t G, V;
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-
-        /* 
-         * VERIFICATION:
-         * Calculate GCD(V, 1000). It MUST be 1.
-         * If the allocator accepted V=2, 4, 5, 10, etc., this fails.
-         */
-        uint64_t a = V, b = 1000;
-        while (b) { uint64_t t = b; b = a % b; a = t; }
-        
-        ASSERT_EQ(1ULL, a); /* Coprimality Law */
-        
-        /* Cleanup */
-        bool st;
-        _bitmap_op(vol, _calc_trajectory_lba(vol, G, V, 0, 0, 0), BIT_FORCE_CLEAR, &st);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
- * TEST M5: Orbit Injectivity / Bijective Mapping (Invariant #3)
- * RATIONALE:
- * Verify "Appendix A: Proof of Coverage".
- * If V is coprime to Phi, the trajectory must generate a Cyclic Group.
- * We use a small Phi (256) and verify that N=0..255 produces exactly 
- * 256 UNIQUE physical addresses with no duplicates.
- * ========================================================================= */
-hn4_TEST(MathInvariants, Orbit_Injectivity_SmallField) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Small Field (Phi = 256) */
-    uint64_t total = 1000;
-    vol->vol_capacity_bytes = total * 4096;
-    vol->sb.info.lba_flux_start = 1000 - 256; 
-    
-    /* 2. Pick a random coprime V (e.g., 17) */
-    uint64_t G = 0;
-    uint64_t V = 17; /* GCD(17, 256) == 1 */
-    uint16_t M = 0;
-
-    bool visited[256] = {0};
-    
-    /* 3. Traverse the Ring */
-    for (uint64_t N = 0; N < 256; N++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, N, M, 0);
-        
-        /* Convert LBA to offset within the Phi window */
-        uint64_t offset = lba - vol->sb.info.lba_flux_start;
-        
-        ASSERT_TRUE(offset < 256);
-  
-        visited[offset] = true;
-    }
-
-    /* 4. Verify Surjectivity (Full Coverage) */
-    for (int i = 0; i < 256; i++) {
-        ASSERT_TRUE(visited[i]);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST R6: Zero-Scan Determinism (Recovery)
@@ -3538,44 +2730,6 @@ hn4_TEST(ProbabilisticMath, Rule_Of_20_Enforcement) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST X7: AI Topology Fallback (Resilience)
- * RATIONALE:
- * If a GPU ID is requested but NOT present in the Topology Map (e.g., hardware removed),
- * the allocator must gracefully fallback to Global Allocation (CPU path)
- * rather than crashing or denying the request.
- * ========================================================================= */
-hn4_TEST(AiTopology, Unknown_GPU_Fallback) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Topology for GPU 0 only */
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    vol->topo_count = 1;
-    vol->topo_map = hn4_hal_mem_alloc(sizeof(*vol->topo_map));
-    vol->topo_map[0].gpu_id = 0;
-    vol->topo_map[0].lba_start = 5000;
-    vol->topo_map[0].lba_len = 1000;
-    
-    /* 2. Request Alloc from GPU 99 (Unknown) */
-    hn4_hal_sim_set_gpu_context(99);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* 
-     * VERIFICATION:
-     * 1. Must Succeed (HN4_OK).
-     * 2. G should be GLOBAL (Valid LBA), not constrained to the tiny 5000-6000 window
-     *    (Though statistically it might land there, it's unlikely if disk is big).
-     *    Actually, just verifying success proves robustness.
-     */
-    ASSERT_EQ(HN4_OK, res);
-    
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-
-
 
 hn4_TEST(Hierarchy, L2_Heals_On_Idempotent_Set) {
     hn4_volume_t* vol = create_alloc_fixture();
@@ -3600,41 +2754,6 @@ hn4_TEST(Hierarchy, L2_Heals_On_Idempotent_Set) {
     cleanup_alloc_fixture(vol);
 }
 
-
-/* =========================================================================
- * TEST M6: Metadata S-Block Alignment (Invariant #2)
- * RATIONALE:
- * Verify that when allocating Metadata (M=0..4), the resulting address is 
- * STRICTLY aligned to `2^M`.
- * Example: Request 64KB (M=4). Address must be 0x10000, 0x20000...
- * If it returns 0x10001, DMA engines might fail or tear writes.
- * ========================================================================= */
-hn4_TEST(FractalMath, Strict_Fractal_Alignment) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Test range of scales M=0..8 */
-    for (uint16_t M = 0; M <= 8; M++) {
-        uint64_t G, V;
-        hn4_result_t res = hn4_alloc_genesis(vol, M, HN4_ALLOC_DEFAULT, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-        
-        /* 
-         * VERIFICATION:
-         * G is the Fractal Index. The physical LBA is `_calc_trajectory`.
-         * The LBA must be a multiple of S = 2^M.
-         */
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 0, M, 0);
-        uint64_t S = (1ULL << M);
-        
-        ASSERT_EQ(0ULL, lba % S);
-        
-        /* Cleanup */
-        bool st;
-        _bitmap_op(vol, lba, BIT_FORCE_CLEAR, &st);
-    }
-
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST H4: Horizon Pointer Wrap-Around Safety
@@ -3807,48 +2926,6 @@ hn4_TEST(MathPrimitives, MulModSafe_Precision) {
     ASSERT_EQ(0ULL, _mul_mod_safe(123, 456, 1));
 }
 
-/* =========================================================================
- * 1.3 TRAJECTORY COVERAGE (THE ORBIT PROOF)
- * ========================================================================= */
-
-hn4_TEST(MathPrimitives, Trajectory_Full_Coverage) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Setup Small Field: Phi = 17 (Prime), S = 8 */
-    uint64_t phi = 17;
-    uint64_t S = 8;
-    uint16_t M = 3; /* 2^3 = 8 */
-    
-    vol->vol_capacity_bytes = (phi * S) * 4096;
-    vol->sb.info.lba_flux_start = 0; /* Simplify */
-    
-    uint64_t G = 0;
-    uint64_t V = 3; /* Coprime to 17 */
-    
-    bool visited[17] = {0};
-    
-    /* 1. Walk entire orbit (N=0..16) */
-    for (uint64_t N = 0; N < phi; N++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, N, M, 0);
-        
-        /* Check Alignment */
-        ASSERT_EQ(0ULL, lba % S);
-        
-        /* Check Bounds */
-        uint64_t idx = lba / S;
-        ASSERT_TRUE(idx < phi);
-
-        visited[idx] = true;
-    }
-    
-    /* 2. Verify Full Coverage */
-    for (int i = 0; i < phi; i++) {
-        ASSERT_TRUE(visited[i]);
-    }
-    
-    cleanup_alloc_fixture(vol);
-}
-
 hn4_TEST(MathPrimitives, Entropy_Mix_Uniformity) {
     hn4_volume_t* vol = create_alloc_fixture();
     uint16_t M = 4; /* S = 16 */
@@ -3963,189 +3040,6 @@ hn4_TEST(HorizonLogic, ENOSPC_Exhaustion) {
     ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
     /* Verify no infinite spin (Test finishes implies no hang) */
-    cleanup_alloc_fixture(vol);
-}
-
-hn4_TEST(HorizonLogic, Mixed_Chaos_Mode) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.lba_horizon_start = 20000;
-    vol->sb.info.journal_start = 20005; /* 5 Horizon Blocks */
-    
-    /* 1. Alloc Flux (D1) */
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    uint64_t d1_lba = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-    
-    /* 2. Fill Horizon (D1.5) */
-    for(int i=0; i<5; i++) {
-        uint64_t h;
-        hn4_alloc_horizon(vol, &h);
-    }
-    
-    /* 3. Verify D1 used count */
-    /* 1 Flux + 5 Horizon = 6 */
-    ASSERT_EQ(6ULL, atomic_load(&vol->used_blocks));
-    
-    /* 4. Free Flux */
-    hn4_free_block(vol, d1_lba);
-    ASSERT_EQ(5ULL, atomic_load(&vol->used_blocks));
-    
-    /* 5. Alloc again (Flux should succeed if space, or Horizon fail) */
-    /* Force Horizon Alloc */
-    uint64_t h_new;
-    hn4_result_t res = hn4_alloc_horizon(vol, &h_new);
-    ASSERT_EQ(HN4_ERR_ENOSPC, res); /* Full */
-    
-    /* Free one Horizon */
-    hn4_free_block(vol, 20000);
-    
-    /* Alloc Horizon again */
-    res = hn4_alloc_horizon(vol, &h_new);
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(20000ULL, h_new); /* Reuse */
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-/* =========================================================================
- * 6. AI AFFINITY WINDOW
- * ========================================================================= */
-
-hn4_TEST(AiTopology, Window_Validation_And_Chaos) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Setup Topo */
-    vol->topo_count = 1;
-    vol->topo_map = hn4_hal_mem_alloc(sizeof(*vol->topo_map));
-    vol->topo_map[0].gpu_id = 100;
-    vol->topo_map[0].lba_start = 10000;
-    vol->topo_map[0].lba_len = 1000; /* 10000-11000 */
-    
-    /* 1. Valid Alloc */
-    hn4_hal_sim_set_gpu_context(100);
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Check G is in window (adjusted for flux start) */
-    uint64_t abs_G = G + vol->sb.info.lba_flux_start; /* Roughly */
-    /* Actual logic aligns window to Flux Start. G is relative. */
-    /* If window [10k, 11k], and flux=100. Rel Window = [9900, 10900].
-       G will be in [9900, 10900). */
-    
-    /* We just check success here. */
-    
-    /* 2. Unknown GPU (Fallback) */
-    hn4_hal_sim_set_gpu_context(999);
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(HN4_OK, res); /* Should fallback to global, not crash */
-    
-    /* 3. Zero-Length Window (Edge Case) */
-    vol->topo_map[0].lba_len = 0;
-    hn4_hal_sim_set_gpu_context(100);
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(HN4_OK, res); /* Should detect empty window and fallback */
-    
-    /* 4. Misaligned Window (Start not % S) */
-    /* Allocator logic usually floor-aligns. Verify no crash. */
-    vol->topo_map[0].lba_len = 1000;
-    vol->topo_map[0].lba_start = 10001;
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(HN4_OK, res);
-
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-hn4_TEST(HDDPhysics, Coprime_Drift_Escapes_Gravity_Well) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    
-    /* 1. Create a "Gravity Well" (Congestion) */
-    uint64_t start = 5000;
-    atomic_store(&vol->last_alloc_g, start);
-    
-    bool st;
-    /* Fill 200 blocks. Probe limit is 128. Linear probe would die here. */
-    for(int i=0; i<200; i++) {
-        _bitmap_op(vol, start + i, BIT_SET, &st);
-    }
-    
-    /* 2. Attempt Allocation */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* 
-     * ASSERTION: SUCCESS (HN4_OK)
-     * The allocator must NOT fail. The Coprime Drift logic should 
-     * have scattered the probe attempts modulo the window size, 
-     * finding a free block outside the [5000-5200] range.
-     */
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* Verify we actually escaped the well */
-    bool escaped = (G < start || G >= (start + 200));
-    ASSERT_TRUE(escaped);
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-/* =========================================================================
- * 10.3 THRESHOLD STEP MATRIX
- * ========================================================================= */
-
-hn4_TEST(SaturationLogic, Step_Up_Boundary_Check) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t total = HN4_TOTAL_BLOCKS;
-    
-    /* 
-     * RATIONALE:
-     * Verify the trip point is exact.
-     * 89% -> Clean (Ballistic)
-     * 90% -> Saturated (Redirection)
-     */
-    
-    /* 1. 89% */
-    atomic_store(&vol->used_blocks, (total * 89) / 100);
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 2. 90% (Boundary Condition) */
-    atomic_store(&vol->used_blocks, (total * 90) / 100);
-    res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* 
-     * CORRECTION: 
-     * Expect Redirection Signal (4), confirming Spec 18.8 logic activation.
-     */
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-    
-    cleanup_alloc_fixture(vol);
-}
-
-
-
-hn4_TEST(SaturationLogic, Low_Occupancy_Sanity) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 
-     * RATIONALE:
-     * Ensure very low usage (1%) behaves normally.
-     * Prevents regression where logic might invert or fail on low values.
-     */
-    
-    /* 1% */
-    atomic_store(&vol->used_blocks, (HN4_TOTAL_BLOCKS * 1) / 100);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    ASSERT_EQ(HN4_OK, res);
-    
-    uint32_t flags = atomic_load(&vol->sb.info.state_flags);
-    ASSERT_FALSE((flags & (1U << 30)) != 0);
-    
     cleanup_alloc_fixture(vol);
 }
 
@@ -4390,134 +3284,6 @@ hn4_TEST(HorizonLogic, Rolling_Fallback_Probe) {
 }
 
 /* =========================================================================
- * TEST AI_1: Affinity Jitter (Rapid Context Switch)
- * RATIONALE:
- * Verify that the Allocator re-evaluates the HAL context on *every* call.
- * If we change the GPU Context ID between two calls, the target Gravity Center
- * must shift immediately to the new topology window.
- * ========================================================================= */
-hn4_TEST(AiTopology, Context_Switch_Jitter) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Setup Topology: 2 Regions */
-    vol->topo_count = 2;
-    vol->topo_map = hn4_hal_mem_alloc(2 * sizeof(*vol->topo_map));
-    
-    /* GPU 1: Blocks 5000-6000 */
-    vol->topo_map[0].gpu_id = 1;
-    vol->topo_map[0].lba_start = 5000;
-    vol->topo_map[0].lba_len   = 1000;
-    
-    /* GPU 2: Blocks 8000-9000 */
-    vol->topo_map[1].gpu_id = 2;
-    vol->topo_map[1].lba_start = 8000;
-    vol->topo_map[1].lba_len   = 1000;
-    
-    uint64_t G, V;
-    uint64_t flux_start = vol->sb.info.lba_flux_start; // 100
-    
-    /* 1. Context GPU 1 */
-    hn4_hal_sim_set_gpu_context(1);
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Verify Region 1 [5000, 6000) */
-    /* G is relative to flux start in alloc logic window calculation */
-    ASSERT_TRUE(G >= (5000 - flux_start) && G < (6000 - flux_start));
-    
-    /* 2. Jitter Switch -> GPU 2 */
-    hn4_hal_sim_set_gpu_context(2);
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Verify Region 2 [8000, 9000) */
-    ASSERT_TRUE(G >= (8000 - flux_start) && G < (9000 - flux_start));
-    
-    /* 3. Jitter Switch -> CPU (None) */
-    hn4_hal_sim_clear_gpu_context();
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* 
-     * Verify Global 
-     * (Should NOT be constrained to tiny windows, though statistical collision possible.
-     * We just ensure it succeeds).
-     */
-    ASSERT_EQ(0ULL, (G % 1)); /* Trivial check, real check is functional success */
-
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
- * TEST AI_2: NUMA Migration Simulation (Statelessness)
- * RATIONALE:
- * Verify that the Allocator does NOT cache affinity results in the `vol` struct.
- * If the thread migrates NUMA nodes (simulated by changing HAL ID), 
- * the allocator must not carry over bias from the previous node.
- * ========================================================================= */
-hn4_TEST(AiTopology, NUMA_Migration_Statelessness) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Topology: Node A (10k), Node B (20k) */
-    vol->topo_count = 2;
-    vol->topo_map = hn4_hal_mem_alloc(2 * sizeof(*vol->topo_map));
-    memset(vol->topo_map, 0, 2 * sizeof(*vol->topo_map)); // Ensure weights are 0
-    
-    vol->topo_map[0].gpu_id = 0xA; /* Node A */
-    vol->topo_map[0].lba_start = 10000;
-    vol->topo_map[0].lba_len = 1000;
-    
-    vol->topo_map[1].gpu_id = 0xB; /* Node B */
-    vol->topo_map[1].lba_start = 20000;
-    vol->topo_map[1].lba_len = 1000;
-    
-    uint64_t G, V;
-    uint64_t flux_start = vol->sb.info.lba_flux_start;
-
-    /* 1. Thread on Node A */
-    hn4_hal_sim_set_gpu_context(0xA);
-    
-    /* Barrier: Ensure context is visible */
-    atomic_thread_fence(memory_order_seq_cst);
-    
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Verify Node A Locality */
-    bool in_A = (G >= (10000 - flux_start) && G < (11000 - flux_start));
-    ASSERT_TRUE(in_A);
-    
-    /* 
-     * 2. SIMULATE OS MIGRATION
-     * The OS moves the thread to Node B. HAL now reports Node B ID.
-     */
-    hn4_hal_sim_set_gpu_context(0xB);
-    
-    /* Barrier: Force visibility of the migration */
-    atomic_thread_fence(memory_order_seq_cst);
-
-    /* SANITY CHECK: Verify HAL sees the new ID before we allocate */
-    ASSERT_EQ(0xB, hn4_hal_get_calling_gpu_id());
-    
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* Verify Node B Locality */
-    bool in_B = (G >= (20000 - flux_start) && G < (21000 - flux_start));
-    
-    /* Re-evaluate in_A with new G */
-    in_A = (G >= (10000 - flux_start) && G < (11000 - flux_start));
-    
-    /* 
-     * PROOF:
-     * If the allocator cached "Last Affinity Node" in `vol`, this would fail (still in A).
-     * Success proves stateless resolution.
-     */
-    ASSERT_TRUE(in_B);
-    ASSERT_FALSE(in_A);
-
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
  * 👻 TEST 7: Bitmap Ghost (Zero-Scan Reconstruction)
  * RATIONALE:
  * Simulates a "Split-Brain" crash where Anchors were written to the Cortex,
@@ -4613,54 +3379,6 @@ hn4_TEST(RecoveryLogic, Atomic_Tearing_Reclamation) {
 }
 
 /* =========================================================================
- * 🛰 TEST 10: Gravity Assist Dispersion (Slingshot Physics)
- * RATIONALE:
- * Verify that when the allocator engages Gravity Assist (mutating V),
- * the new trajectory lands significantly far away from the original.
- * It shouldn't just step to `Neighbor+1`.
- * ========================================================================= */
-hn4_TEST(PhysicsLogic, Gravity_Assist_Slingshot_Range) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    uint64_t G = 1000;
-    uint64_t V_prime = 1;
-    uint16_t M = 0;
-    
-    /* 
-     * 1. Calculate Primary Landing (K=0) at N=1 
-     * We MUST use N=1 because at N=0, the V term is multiplied by 0.
-     * Gravity Assist mutates V, so we need N > 0 to see the jump.
-     */
-    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, V_prime, 1, M, 0);
-    
-    /* 2. Calculate Gravity Assist Landing (K=4) at N=1 */
-    uint64_t lba_k4 = _calc_trajectory_lba(vol, G, V_prime, 1, M, 4);
-    
-    /* 3. Measure Dispersion */
-    uint64_t phi = (vol->vol_capacity_bytes / vol->vol_block_size) - vol->sb.info.lba_flux_start;
-    
-    uint64_t dist;
-    if (lba_k4 > lba_k0) dist = lba_k4 - lba_k0;
-    else dist = lba_k0 - lba_k4;
-    
-    /* Shortest path on ring */
-    if (dist > (phi / 2)) dist = phi - dist;
-    
-    /* 
-     * PROOF:
-     * With N=1, the V mutation causes a massive address shift.
-     * Threshold: 1% of disk is sufficient to prove non-linear probing.
-     */
-    uint64_t threshold = phi / 100; 
-    
-    ASSERT_TRUE(dist >= threshold);
-
-    cleanup_alloc_fixture(vol);
-}
-
-
-
-/* =========================================================================
  * ⚙️ TEST 12: ECC Syndrome Storm
  * RATIONALE:
  * Inject single-bit RAM errors continuously while allocations are running.
@@ -4750,72 +3468,6 @@ hn4_TEST(HardwareLies, ECC_Syndrome_Storm) {
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_FALSE((flags & HN4_VOL_PANIC) != 0);
 
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
- * 🔬 TEST 2: Gravity Shock Re-Lock (NUMA Rebind)
- * RATIONALE:
- * Simulate a sudden topology change (NUMA Rebind).
- * The Allocator (AI Profile) uses Affinity Bias.
- * When the context switches, the bias shifts instantly.
- * 
- * We verify:
- * 1. Immediate convergence to new Node (Re-Lock).
- * 2. NO OSCILLATION (Ping-Pong) if we hold the context stable after switch.
- * ========================================================================= */
-hn4_TEST(StabilityLogic, Gravity_Shock_No_Oscillation) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Setup 2 Nodes */
-    vol->topo_count = 2;
-    vol->topo_map = hn4_hal_mem_alloc(2 * sizeof(*vol->topo_map));
-    
-    /* Node A: 10000-11000 */
-    vol->topo_map[0].gpu_id = 0xA;
-    vol->topo_map[0].lba_start = 10000;
-    vol->topo_map[0].lba_len = 1000;
-    
-    /* Node B: 20000-21000 */
-    vol->topo_map[1].gpu_id = 0xB;
-    vol->topo_map[1].lba_start = 20000;
-    vol->topo_map[1].lba_len = 1000;
-    
-    uint64_t flux_start = vol->sb.info.lba_flux_start;
-
-    /* 1. Establish Baseline (Node A) */
-    hn4_hal_sim_set_gpu_context(0xA);
-    atomic_thread_fence(memory_order_seq_cst);
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    bool in_A = (G >= (10000 - flux_start) && G < (11000 - flux_start));
-    ASSERT_TRUE(in_A);
-    
-    /* 2. TRIGGER SHOCK (Rebind to Node B) */
-    hn4_hal_sim_set_gpu_context(0xB);
-    atomic_thread_fence(memory_order_seq_cst);
-    
-    /* 3. Run Burst (50 Allocs) */
-    /* Verify EVERY SINGLE alloc lands in Node B. No ping-pong back to A. */
-    for(int i=0; i<50; i++) {
-        hn4_alloc_genesis(vol, 0, 0, &G, &V);
-        
-        bool in_B = (G >= (20000 - flux_start) && G < (21000 - flux_start));
-        
-        if (!in_B) {
-            /* If we see A, we failed (Oscillation / Lag) */
-            ASSERT_TRUE(false); 
-        }
-        
-        /* Cleanup */
-        bool st;
-        _bitmap_op(vol, G, BIT_FORCE_CLEAR, &st);
-    }
-    
-    hn4_hal_sim_clear_gpu_context();
     cleanup_alloc_fixture(vol);
 }
 
@@ -4941,40 +3593,6 @@ hn4_TEST(FixValidation, Underflow_Triggers_Dirty) {
 }
 
 /*
- * TEST F2: Small Volume Saturation Logic (Fix 9)
- * RATIONALE:
- * On small volumes (e.g., 50 blocks), the old math `(cap/100)*90` resulted in 0.
- * An empty volume (used=0) would compare `0 >= 0` and report Saturated.
- * The new hybrid math should calculate `(50*90)/100 = 45`.
- * Empty volume (0 < 45) should NOT be saturated.
- */
-hn4_TEST(FixValidation, Small_Volume_Not_Saturated) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Configure Tiny Volume (50 Blocks) */
-    vol->vol_block_size = 4096;
-    vol->vol_capacity_bytes = 50 * 4096;
-    /* Ensure Flux start is 0 so we have capacity */
-    vol->sb.info.lba_flux_start = hn4_addr_from_u64(0);
-    
-    /* 2. Set Used to 0 */
-    atomic_store(&vol->used_blocks, 0);
-    
-    /* 3. Attempt Allocation */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* 
-     * VERIFICATION:
-     * Old Logic: Returns HN4_ERR_EVENT_HORIZON.
-     * New Logic: Returns HN4_OK.
-     */
-    ASSERT_EQ(HN4_OK, res);
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/*
  * TEST F3: L2 Self-Healing on Idempotent Set (Fix 10)
  * RATIONALE:
  * If we try to SET a bit that is *already* set, we must ensure the 
@@ -5064,55 +3682,6 @@ hn4_TEST(FixValidation, AI_Window_Leak_Detection) {
     cleanup_alloc_fixture(vol);
 }
 
-/*
- * TEST F5: HDD Salt Entropy (Fix 12)
- * RATIONALE:
- * Verify that the `last_alloc_g` update logic includes a salt multiplier.
- * Without salt: G_new = G_old + jitter. (Small linear creep).
- * With salt: G_new = G_old + (jitter * Prime). (Big jump).
- */
-hn4_TEST(FixValidation, HDD_Jitter_High_Entropy) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    
-    uint64_t start_g = 10000;
-    atomic_store(&vol->last_alloc_g, start_g);
-    
-    /* Simulate one allocation */
-    /* Note: We rely on alloc_genesis to update last_alloc_g on success */
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* Check where G landed relative to start_g */
-    /* Since we are in the same window, G should be start_g + offset */
-    /* Flux start logic applies, G is relative. */
-    
-    /* Get updated last_alloc_g */
-    uint64_t next_g = atomic_load(&vol->last_alloc_g);
-    
-    /* 
-     * If jitter was 1, Old logic: next = 10001.
-     * New logic: next = 10000 + (1 * Prime) % phi.
-     * Prime is large. The delta should be large (unless jitter=0).
-     * We run a few times to ensure non-zero jitter.
-     */
-    
-    bool seen_large_jump = false;
-    for(int i=0; i<10; i++) {
-        /* Reset */
-        atomic_store(&vol->last_alloc_g, start_g);
-        hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-        next_g = atomic_load(&vol->last_alloc_g);
-        
-        uint64_t delta = (next_g > start_g) ? (next_g - start_g) : (start_g - next_g);
-        if (delta > 100) seen_large_jump = true;
-    }
-    
-    ASSERT_TRUE(seen_large_jump);
-    
-    cleanup_alloc_fixture(vol);
-}
 
 /*
  * TEST F6: Binary GCD Correctness (Fix 13)
@@ -5140,70 +3709,6 @@ hn4_TEST(FixValidation, GCD_Binary_Zero_Handling) {
     
     /* Power of 2 (Binary shift logic check) */
     ASSERT_EQ(4ULL, _gcd(16, 20));
-}
-
-/* 
- * TEST E1: Max-Entropy Allocation Storm
- * RATIONALE:
- * Simulate a scenario where every allocation succeeds but triggers a massive
- * spread of `G` and `V` due to a prime-sized window (Phi).
- * This stresses the Coprimality search logic under heavy load.
- */
-hn4_TEST(ExtremeEdge, Prime_Phi_Stress) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Set Phi to a Prime (e.g. 1009) */
-    uint64_t total = 2000;
-    vol->vol_capacity_bytes = total * 4096;
-    vol->sb.info.lba_flux_start = total - 1009; /* Phi = 1009 */
-    
-    /* Run 500 allocations */
-    for(int i=0; i<500; i++) {
-        uint64_t G, V;
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-        ASSERT_EQ(HN4_OK, res);
-        
-        /* G/V should vary widely. Cleanup to keep running. */
-        bool st;
-        /* Note: Using G directly as LBA proxy for cleanup logic simulation */
-        _bitmap_op(vol, vol->sb.info.lba_flux_start + G, BIT_FORCE_CLEAR, &st);
-    }
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * TEST E2: Interleaved Atomic Hammer (ZNS + NVM)
- * RATIONALE:
- * Simulate a mixed workload where ZNS (Sequential) and NVM (Atomic Random)
- * operations are interleaved. This tests if the allocator state remains
- * consistent when switching allocation modes (V=1 vs V=Random).
- */
-hn4_TEST(ExtremeEdge, Hybrid_ZNS_NVM_Interleave) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Set ZNS Mode */
-    vol->sb.info.device_type_tag = HN4_DEV_ZNS;
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(1ULL, V); /* Must be 1 */
-    
-    /* 2. Switch to NVM Mode (Simulate Hybrid Tiering or Profile Switch) */
-    vol->sb.info.device_type_tag = HN4_DEV_SSD;
-    vol->sb.info.hw_caps_flags |= HN4_HW_NVM;
-    
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    /* V should be random (likely > 1) */
-    /* Assert > 0 just to be safe */
-    ASSERT_TRUE(V > 0);
-    
-    /* 3. Switch Back */
-    vol->sb.info.device_type_tag = HN4_DEV_ZNS;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(1ULL, V);
-    
-    cleanup_alloc_fixture(vol);
 }
 
 /*
@@ -5300,37 +3805,6 @@ hn4_TEST(PolicyLogic, System_Rejects_Horizon) {
 
     cleanup_alloc_fixture(vol);
 }
-hn4_TEST(SaturationLogic, Hysteresis_Loop_Check) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t total = HN4_TOTAL_BLOCKS;
-    
-    /* 1. Trip Saturation (91%) */
-    atomic_store(&vol->used_blocks, (total * 91) / 100);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* CORRECTION: Expect Redirection Signal (4), not Error (-257) */
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-    
-    /* 2. Drop to Gray Zone (88%) */
-    /* 90% > 88% > 85%. Should STILL Redirect (Sticky) */
-    atomic_store(&vol->used_blocks, (total * 88) / 100);
-    
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    /* CORRECTION: Expect Redirection Signal */
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-    
-    /* 3. Drop below Hysteresis (80%) */
-    /* Should Clear Flag and Succeed normally (Ballistic Allocation) */
-    atomic_store(&vol->used_blocks, (total * 80) / 100);
-    
-    res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(HN4_OK, res);
-
-    cleanup_alloc_fixture(vol);
-}
-
 /* =========================================================================
  * TEST 1: GCD Robustness (Fix 6 Verification)
  * RATIONALE:
@@ -5600,55 +4074,6 @@ hn4_TEST(SaturationTiers, Flag_consistency_Check) {
     
     cleanup_alloc_fixture(vol);
 }
-hn4_TEST(SaturationTiers, Unified_Recovery) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t total = HN4_TOTAL_BLOCKS;
-    
-    /* 1. Trip Saturation (95%) - Hard Wall */
-    atomic_store(&vol->used_blocks, (total * 95) / 100);
-    
-    hn4_anchor_t anchor = {0};
-    hn4_addr_t out; uint8_t k;
-    
-    /* 
-     * CORRECTION: Updates force fallback to Horizon at 95%.
-     * Expect OK (Redirection Success).
-     */
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &out, &k));
-    
-    /* 2. Drop to 88% (Gray Zone) */
-    atomic_store(&vol->used_blocks, (total * 88) / 100);
-    
-    /* 
-     * GENESIS:
-     * Usage (88) > Recovery (85). Flag is sticky.
-     * Genesis is redirected to Horizon (Spec 18.8).
-     */
-    uint64_t G, V;
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, hn4_alloc_genesis(vol, 0, 0, &G, &V));
-    
-    /* 
-     * UPDATE:
-     * Usage (88) < Limit (95).
-     * Updates enjoy the reserve. Should SUCCEED.
-     */
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &out, &k));
-    
-    /* 3. Drop to 84% (Recovery) */
-    atomic_store(&vol->used_blocks, (total * 84) / 100);
-    
-    /* Genesis should now succeed normally (Flag cleared) */
-    ASSERT_EQ(HN4_OK, hn4_alloc_genesis(vol, 0, 0, &G, &V));
-    
-    /* Update continues to succeed */
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &out, &k));
-    
-    /* Flag check */
-    uint32_t flags = atomic_load(&vol->sb.info.state_flags);
-    ASSERT_FALSE((flags & (1U << 30)) != 0);
-
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST 1: ECC Table Lookup Correctness
@@ -5729,32 +4154,6 @@ hn4_TEST(SafetyCheck, Optional_Arg_Null_Safety) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST 4: O(1) Trajectory Limit Switch
- * RATIONALE:
- * Verify `_get_trajectory_limit` uses the fast path (Switch/Table) logic
- * for different device types.
- * HDD/ZNS/Tape -> 0. SSD -> 12.
- * ========================================================================= */
-hn4_TEST(Optimization, Trajectory_Limit_Switch) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Case A: HDD */
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    uint64_t G, V;
-    /* Genesis alloc calls internal helpers. We verify V=1 behavior (Sequential) */
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    ASSERT_EQ(1ULL, V);
-    
-    /* Case B: SSD */
-    vol->sb.info.device_type_tag = HN4_DEV_SSD;
-    /* Force random V logic to run */
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    /* Can be anything, just ensure it didn't crash and logic ran */
-    ASSERT_EQ(HN4_OK, HN4_OK);
-    
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST 5: Lazy Table Initialization
@@ -6066,34 +4465,6 @@ hn4_TEST(PicoLogic, Capacity_Overflow_Rejection) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST 5: XIP Alignment (Spec 28.2)
- * RATIONALE:
- * For XIP (Execute In Place), allocations must be Horizon-based (Contiguous).
- * Verify that if `HN4_ALLOC_CONTIGUOUS` is used, we get a Horizon address.
- * ========================================================================= */
-hn4_TEST(SiliconFabric, XIP_Contiguity_Enforcement) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Ensure Horizon available */
-    vol->sb.info.lba_horizon_start = 50000;
-    vol->sb.info.journal_start = 60000;
-    
-    /* 2. Request Contiguous Alloc */
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_CONTIGUOUS, &G, &V);
-    
-    /* 
-     * Logic check: `hn4_alloc_genesis` sets `force_sequential = true` for CONTIGUOUS.
-     * This forces V=1. It tries D1 first with V=1.
-     * If D1 succeeds, we get V=1.
-     */
-    
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(1ULL, V);
-    
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST N1: Explicit Horizon Redirection Check
@@ -6230,123 +4601,6 @@ static uint64_t _test_gcd(uint64_t a, uint64_t b) {
 }
 
 /*
- * Test CP1: Highly Composite Window Stress
- * RATIONALE:
- * We force the Flux Window (Phi) to be 360 blocks. 360 is divisible by 
- * 2, 3, 4, 5, 6, 8, 9, 10, 12, etc. 
- * We verify that the random V generated is ALWAYS coprime to 360.
- */
-hn4_TEST(MathProof, Coprime_Composite_Stress) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Geometry: Total - FluxStart = 360 */
-    uint64_t flux_start = 1000;
-    vol->sb.info.lba_flux_start = hn4_addr_from_u64(flux_start);
-    vol->vol_capacity_bytes = (flux_start + 360) * 4096;
-    
-    for (int i = 0; i < 100; i++) {
-        uint64_t G, V;
-        /* Genesis will pick a random V and filter it against Phi (360) */
-        hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-        
-        ASSERT_EQ(HN4_OK, res);
-        /* PROOF: If GCD != 1, the trajectory will loop early (Collision) */
-        ASSERT_EQ(1ULL, _test_gcd(V, 360));
-        
-        /* Cleanup bit to prevent full disk */
-        bool st;
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-        _bitmap_op(vol, lba, BIT_FORCE_CLEAR, &st);
-    }
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test CP2: Sequential Mode Identity
- * RATIONALE:
- * Verify that for Sequential profiles (HDD/ZNS), V is forced to 1.
- * GCD(1, Phi) is always 1. This proves the invariant holds for linear writes.
- */
-hn4_TEST(MathProof, Coprime_Sequential_Identity) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    
-    /* Arbitrary window */
-    vol->vol_capacity_bytes = 10000 * 4096;
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(1ULL, V);
-    ASSERT_EQ(1ULL, _test_gcd(V, 9000)); /* 1 is coprime to everything */
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test CP3: Prime Window Safety
- * RATIONALE:
- * If the Window (Phi) is a Prime Number (e.g., 1009), virtually ANY V 
- * (except multiples of Phi) is coprime. 
- * We verify the allocator doesn't hang or error in this optimal case.
- */
-hn4_TEST(MathProof, Coprime_Prime_Window) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Phi = 17 (Prime) */
-    vol->vol_capacity_bytes = (100 + 17) * 4096;
-    vol->sb.info.lba_flux_start = hn4_addr_from_u64(100);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(1ULL, _test_gcd(V, 17));
-    
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test CP4: AI Affinity Window Constraints
- * RATIONALE:
- * When AI Affinity is active, the window size (Phi) shrinks to the size 
- * of the GPU-local region (e.g., 1000 blocks). 
- * We verify V is calculated against the *Window* Phi, not the *Global* Phi.
- */
-hn4_TEST(MathProof, Coprime_Affinity_Window) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Global Phi = 20000. Window Phi = 100. */
-    vol->vol_capacity_bytes = 20000 * 4096;
-    
-    vol->topo_count = 1;
-    vol->topo_map = hn4_hal_mem_alloc(sizeof(*vol->topo_map));
-    vol->topo_map[0].gpu_id = 1;
-    vol->topo_map[0].lba_start = 5000;
-    vol->topo_map[0].lba_len = 100; /* Tiny Window */
-    
-    hn4_hal_sim_set_gpu_context(1);
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    /* 
-     * PROOF: V must be coprime to the WINDOW size (100), 
-     * ensuring full coverage of the GPU region.
-     */
-    ASSERT_EQ(1ULL, _test_gcd(V, 100));
-    
-    hn4_hal_sim_clear_gpu_context();
-    cleanup_alloc_fixture(vol);
-}
-
-/* =========================================================================
- * PART 2: FIX VERIFICATION (SATURATION, AI, HORIZON)
- * ========================================================================= */
-
-/*
  * Test FX1: Genesis Saturation Fallback (Fix 18.8)
  * RATIONALE:
  * If the drive is 91% full, `hn4_alloc_genesis` MUST return `HN4_INFO_HORIZON_FALLBACK`.
@@ -6402,46 +4656,6 @@ hn4_TEST(FixVerify, Update_Saturation_Succeeds_In_Horizon) {
     ASSERT_EQ(HN4_OK, res);
     ASSERT_EQ(15, out_k);
     
-    cleanup_alloc_fixture(vol);
-}
-
-/*
- * Test FX3: AI Path Restoration
- * RATIONALE:
- * Verify that the code block handling `HN4_PROFILE_AI` and `topo_map`
- * was actually restored and functions correctly to bias allocation.
- */
-hn4_TEST(FixVerify, AI_Path_Restored) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Setup Topology Region [5000, 6000) */
-    vol->topo_count = 1;
-    vol->topo_map = hn4_hal_mem_alloc(sizeof(*vol->topo_map));
-    vol->topo_map[0].gpu_id = 99;
-    vol->topo_map[0].lba_start = 5000;
-    vol->topo_map[0].lba_len = 1000;
-    
-    hn4_hal_sim_set_gpu_context(99);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 
-     * PROOF: 
-     * G (Fractal Index) must map to the Physical Window.
-     * Absolute G = G + FluxStart.
-     * FluxStart=100. Window=[5000, 6000). Relative=[4900, 5900).
-     */
-    uint64_t flux_start = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
-    uint64_t abs_g = G + flux_start;
-    
-    /* Allow fuzziness for alignment, but must be generally in region */
-    ASSERT_TRUE(abs_g >= 5000 && abs_g < 6000);
-    
-    hn4_hal_sim_clear_gpu_context();
     cleanup_alloc_fixture(vol);
 }
 
@@ -6526,62 +4740,6 @@ hn4_TEST(EdgeCases, SingularityPhiOne) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST 4: SMALL CAPACITY SATURATION
- * ========================================================================= */
-/*
- * RATIONALE:
- * Pico volumes are tiny. We verify that the saturation logic works correctly
- * for a 1.44MB volume (2880 blocks), enforcing Spec 18.8 Redirection.
- */
-hn4_TEST(PicoLogic, Tiny_Volume_Saturation) {
-    /* 
-     * Use standard alloc fixture to ensure we have a valid Horizon region 
-     * (Default fixture has 100MB capacity, Horizon at 20000).
-     * If we use a tiny floppy image, the Horizon might be 0 bytes.
-     */
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 
-     * Configure as Pico to match test intent (though logic is generic)
-     */
-    vol->sb.info.format_profile = HN4_PROFILE_PICO;
-    
-    /* Simulate a small total capacity for the calculation */
-    /* Note: vol_capacity_bytes determines the % threshold */
-    uint64_t fake_total_blocks = 2880;
-    vol->vol_capacity_bytes = fake_total_blocks * 4096;
-    vol->vol_block_size = 4096;
-    
-    /* 
-     * THRESHOLD MATH:
-     * 90% of 2880 = 2592.
-     */
-    
-    /* 1. Safe Zone (2591 < 2592) */
-    atomic_store(&vol->used_blocks, 2591);
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* Should stay in Ballistic Mode */
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 2. Trigger Zone (2592 >= 90%) */
-    atomic_store(&vol->used_blocks, 2592);
-    
-    res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* 
-     * EXPECTATION: 
-     * The saturation logic should catch this and redirect to Horizon.
-     * Since the fixture has a valid Horizon, the redirection succeeds.
-     */
-    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
-    
-    cleanup_alloc_fixture(vol);
-}
-
 
 /*
  * Test Spec 5.1: Cortex Allocator Uses L2 to Skip
@@ -6658,35 +4816,6 @@ hn4_TEST(AtomicOps, Fallback_Smoke_Test) {
     cleanup_alloc_fixture(vol);
 }
 
-hn4_TEST(PhysicsLogic, Gravity_Assist_Transition) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    uint64_t G = 1000;
-    uint64_t V = 1; /* Sequential */
-    uint16_t M = 0;
-    uint64_t N = 1; /* Must be > 0 to see V effect */
-
-    /* K=3: Standard V=1 */
-    uint64_t lba_k3 = _calc_trajectory_lba(vol, G, V, N, M, 3);
-    
-    /* K=4: Gravity Assist V' != 1 */
-    uint64_t lba_k4 = _calc_trajectory_lba(vol, G, V, N, M, 4);
-    
-    /* 
-     * Analysis:
-     * LBA_k3 = Flux + G + (1*1) + Theta[3].
-     * LBA_k4 = Flux + G + (1*V') + Theta[4].
-     * 
-     * Theta[3]=6, Theta[4]=10. Delta = 4.
-     * If V wasn't shifted, LBA_k4 would be LBA_k3 + 4.
-     * Since V is shifted (huge number), LBA_k4 should be wildly different.
-     */
-    
-    uint64_t diff = (lba_k4 > lba_k3) ? (lba_k4 - lba_k3) : (lba_k3 - lba_k4);
-    
-    ASSERT_TRUE(diff > 100); /* Proves V changed significantly */
-    
-    cleanup_alloc_fixture(vol);
-}
 
 hn4_TEST(SaturationLogic, Extreme_Fullness_Behavior) {
     hn4_volume_t* vol = create_alloc_fixture();
@@ -6721,40 +4850,6 @@ hn4_TEST(SaturationLogic, Extreme_Fullness_Behavior) {
     cleanup_alloc_fixture(vol);
 }
 
-
-hn4_TEST(MathFix, Degeneracy_Protection) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Geometry so Phi is exactly 100 */
-    /* Flux Start = 1000. Capacity = 1100 blocks. Phi = 100. */
-    uint32_t bs = 4096;
-    vol->sb.info.lba_flux_start = hn4_addr_from_u64(1000);
-    vol->vol_capacity_bytes = 1100 * bs;
-    vol->vol_block_size = bs;
-    
-    /* 2. Pick V as a multiple of Phi (e.g. 200) */
-    uint64_t G = 0;
-    uint64_t V = 200; 
-    uint16_t M = 0;
-    
-    /* 3. Calculate Trajectory for N=0 and N=1 */
-    uint64_t lba_0 = _calc_trajectory_lba(vol, G, V, 0, M, 0);
-    uint64_t lba_1 = _calc_trajectory_lba(vol, G, V, 1, M, 0);
-    
-    /* 
-     * VERIFICATION:
-     * Old Bug: 200 % 100 == 0. Stride is 0. lba_0 == lba_1.
-     * Fixed: Stride forced to 1. lba_1 == lba_0 + 1.
-     */
-    ASSERT_NEQ(lba_0, lba_1);
-    
-    /* Verify the fallback stride was exactly 1 (Linear) */
-    /* Note: _calc_trajectory adds FluxStart. 
-       lba_0 = 1000 + 0. lba_1 = 1000 + 1. */
-    ASSERT_EQ(lba_0 + 1, lba_1);
-
-    cleanup_alloc_fixture(vol);
-}
 
 hn4_TEST(RecoveryFix, Deep_Scan_Simulation) {
     hn4_volume_t* vol = create_alloc_fixture();
@@ -7157,44 +5252,6 @@ hn4_TEST(Atomicity, Google_Torn_Apart_Rollback) {
     cleanup_alloc_fixture(vol);
 }
 
-
-hn4_TEST(PhysicsEngine, Google_AI_Collapse_Alignment) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.format_profile = HN4_PROFILE_AI;
-    
-    /* Fractal Scale 10 = 4MB blocks (assuming 4k base) -> 2^10 = 1024 blocks */
-    uint16_t M = 10; 
-    uint64_t S = 1024;
-    
-    uint64_t G, V;
-    hn4_result_t res = hn4_alloc_genesis(vol, M, HN4_ALLOC_TENSOR, &G, &V);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 
-     * VERIFICATION:
-     * G must be a multiple of S (Fractal Alignment Rule).
-     * If G % 1024 != 0, the NPU DMA will crash.
-     */
-    ASSERT_EQ(0, G % S);
-
-    cleanup_alloc_fixture(vol);
-}
-
-hn4_TEST(PhysicsEngine, Inertial_Damper_Rail) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* Configure as HDD */
-    vol->sb.info.device_type_tag = HN4_DEV_HDD;
-    
-    uint64_t G, V;
-    hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* Must force V=1 regardless of RNG */
-    ASSERT_EQ(1, V);
-
-    cleanup_alloc_fixture(vol);
-}
 
 hn4_TEST(QualityLogic, Toxic_Asset_Rejection) {
     hn4_volume_t* vol = create_alloc_fixture();

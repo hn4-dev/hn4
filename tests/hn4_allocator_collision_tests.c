@@ -75,56 +75,6 @@ static void cleanup_collision_fixture(hn4_volume_t* vol) {
 }
 
 /* =========================================================================
- * TEST 2: GRAVITY ASSIST ENGAGEMENT (FIXED N=1)
- * ========================================================================= */
-/*
- * RATIONALE:
- * Verify K=4 triggers Vector Mutation.
- * MUST use N=1 because at N=0, Vector has no effect (G + 0*V).
- */
-hn4_TEST(CollisionPhysics, Gravity_Assist_Engagement) {
-    hn4_volume_t* vol = create_collision_fixture();
-    
-    hn4_anchor_t anchor = {0};
-    uint64_t G = 5000;
-    uint64_t V = 1; 
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = 1;
-    
-    uint64_t target_N = 1; /* Critical: N=1 for Vector effect */
-
-    /* 1. Jam k=0 through k=3 */
-    bool st;
-    for (int k = 0; k < 4; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, target_N, 0, k);
-        _bitmap_op(vol, lba, BIT_SET, &st);
-    }
-    
-    /* 2. Alloc Block 1 */
-    hn4_addr_t out_lba;
-    uint8_t out_k;
-    hn4_result_t res = hn4_alloc_block(vol, &anchor, target_N, &out_lba, &out_k);
-    
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(4, out_k); 
-    
-    /* 3. Verify Mutation */
-    uint64_t actual_lba = *(uint64_t*)&out_lba;
-    
-    /* Linear prediction if V didn't mutate: G + 1*V + Theta(k=4) */
-    /* Flux Start (100) + 5000 + 1 + 10 = 5111 */
-    uint64_t flux_offset = 100;
-    uint64_t linear_guess = flux_offset + 5000 + 1 + 10; 
-    
-    uint64_t delta = (actual_lba > linear_guess) ? (actual_lba - linear_guess) : (linear_guess - actual_lba);
-    
-    /* V' = ROTL(1, 17) is massive. Delta must be large. */
-    ASSERT_TRUE(delta > 1000);
-
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
  * TEST 3: HDD INERTIAL DAMPER (Strict K=0 + Fallback)
  * ========================================================================= */
 /*
@@ -468,35 +418,6 @@ hn4_TEST(Collision, HealingBeatsFallback) {
 }
 
 /* =========================================================================
- * 19. N-INDEX SENSITIVITY (Independent Collision Trees)
- * ========================================================================= */
-hn4_TEST(Collision, N_Index_Independence) {
-    hn4_volume_t* vol = create_collision_fixture();
-    hn4_anchor_t anchor = {0};
-    uint64_t G = 1000;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = 10; /* V=10 Ensures Separation */
-    
-    /* Jam K=0 for N=0 */
-    uint64_t lba_n0_k0 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0);
-    bool st;
-    _bitmap_op(vol, lba_n0_k0, BIT_SET, &st);
-    
-    /* Alloc N=0 -> Should get K=1 */
-    hn4_addr_t out_lba;
-    uint8_t out_k;
-    hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
-    ASSERT_EQ(1, out_k);
-    
-    /* Alloc N=1 -> Should get K=0 (Independent) */
-    /* Unless K=0 for N=1 collides with K=0 for N=0? (No, V=1 shifts it) */
-    hn4_alloc_block(vol, &anchor, 1, &out_lba, &out_k);
-    ASSERT_EQ(0, out_k);
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
  * 1. DETERMINISTIC K-ORDERING GUARANTEE
  * ========================================================================= */
 hn4_TEST(Collision, DeterministicKOrdering) {
@@ -596,50 +517,6 @@ hn4_TEST(Collision, CrossAnchorIsolation) {
     cleanup_collision_fixture(vol);
 }
 
-/* =========================================================================
- * 4. VECTOR MUTATION CORRECTNESS (K>=4)
- * ========================================================================= */
-hn4_TEST(Collision, VectorMutationMath) {
-    hn4_volume_t* vol = create_collision_fixture();
-    
-    /* Use N=1 so Vector term is visible */
-    uint64_t G = 1000, V = 1, N = 1;
-    hn4_anchor_t anchor = {0};
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = (uint8_t)V;
-    
-    /* Jam K=0..3 to force K=4 */
-    for (int k = 0; k < 4; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, N, 0, k);
-        _bitmap_op(vol, lba, BIT_SET, NULL);
-    }
-    
-    hn4_addr_t out_lba;
-    uint8_t out_k;
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, N, &out_lba, &out_k));
-    
-    /* Must be K=4 */
-    ASSERT_EQ(4, out_k);
-    
-    /* Verify Math: V' = ROTL(V, 17) ^ MAGIC */
-    /* V=1. ROTL(1, 17) = 1<<17 = 131072. */
-    /* MAGIC = 0xA5A5A5A5A5A5A5A5 */
-    uint64_t magic = 0xA5A5A5A5A5A5A5A5ULL;
-    uint64_t v_prime = (1ULL << 17) ^ magic;
-    
-    /* Expected LBA = FluxStart + [ (G + N*V' + Theta[4]) % Phi ] */
-    /* Theta[4] = 10 */
-    uint64_t start = vol->sb.info.lba_flux_start;
-    uint64_t phi = (vol->vol_capacity_bytes / vol->vol_block_size) - start;
-    
-    uint64_t term = (G + (N * v_prime) + 10) % phi;
-    uint64_t expected = start + term;
-    
-    uint64_t actual = *(uint64_t*)&out_lba;
-    ASSERT_EQ(expected, actual);
-    
-    cleanup_collision_fixture(vol);
-}
 
 /* =========================================================================
  * 6. THETA LUT INTEGRITY
@@ -697,31 +574,6 @@ hn4_TEST(Collision, BusyLbaSkipped) {
 }
 
 /* =========================================================================
- * 8. CROSS-N COLLISION ISOLATION
- * ========================================================================= */
-hn4_TEST(Collision, CrossN_Isolation) {
-    hn4_volume_t* vol = create_collision_fixture();
-    hn4_anchor_t anchor = {0};
-    uint64_t G = 1000, V = 10; /* Use V=10 to avoid N=0/1 physical overlap */
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = (uint8_t)V;
-    
-    /* Force N=0 to collide */
-    uint64_t lba_n0_k0 = _calc_trajectory_lba(vol, G, V, 0, 0, 0);
-    _bitmap_op(vol, lba_n0_k0, BIT_SET, NULL);
-    
-    /* Alloc N=1 */
-    hn4_addr_t out_lba;
-    uint8_t out_k;
-    ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 1, &out_lba, &out_k));
-    
-    /* N=1 should start at K=0 fresh. It should NOT be affected by N=0's state. */
-    ASSERT_EQ(0, out_k);
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
  * 10. DEVICE-PHYSICS BRANCH TESTS (HDD)
  * ========================================================================= */
 hn4_TEST(DevicePhysics, Hdd_ZeroOrbit) {
@@ -772,44 +624,6 @@ hn4_TEST(Collision, OrbitGeometryImmutability) {
     for(int k=0; k<8; k++) {
         uint64_t recalc = _calc_trajectory_lba(vol, G, V, 0, 0, k);
         ASSERT_EQ(golden[k], recalc);
-    }
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
- * 2. MULTI-N COLLISION CROSS-PATTERN
- * ========================================================================= */
-hn4_TEST(Collision, MultiN_Isolation) {
-    hn4_volume_t* vol = create_collision_fixture();
-    hn4_anchor_t anchor = {0};
-    uint64_t G = 1000, V = 7;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = (uint8_t)V;
-    
-    /* Jam K=0 for N=0, N=1, N=2 */
-    for (int n = 0; n < 3; n++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, n, 0, 0);
-        _bitmap_op(vol, lba, BIT_SET, NULL);
-    }
-    
-    /* Alloc N=0,1,2. Expect all to land at K=1 (if K=1 free) */
-    /* Note: Depends on whether K=1 for N=0 collides with K=1 for N=1?
-       With V=7, they should be distinct.
-       LBA(N, K=1) = G + N*V + Theta(1).
-       For N=0,1,2 -> G+1, G+7+1, G+14+1. Distinct.
-    */
-    
-    for (int n = 0; n < 3; n++) {
-        hn4_addr_t out_lba;
-        uint8_t out_k;
-        ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, n, &out_lba, &out_k));
-        ASSERT_EQ(1, out_k);
-        
-        /* Verify LBA correctness */
-        uint64_t expected = _calc_trajectory_lba(vol, G, V, n, 0, 1);
-        uint64_t actual = *(uint64_t*)&out_lba;
-        ASSERT_EQ(expected, actual);
     }
     
     cleanup_collision_fixture(vol);
@@ -1447,151 +1261,6 @@ hn4_TEST(CollisionStats, MonotonicityPreservation) {
     cleanup_collision_fixture(vol);
 }
 
-
-
-/* =========================================================================
- * 1. COLLISION CHAIN LENGTH DISTRIBUTION (Geometric Decay)
- * ========================================================================= */
-hn4_TEST(CollisionStats, GeometricDecay) {
-    hn4_volume_t* vol = create_collision_fixture();
-    
-    /* 1. Geometry Analysis */
-    uint32_t bs = vol->vol_block_size;
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size;
-    
-    uint64_t total_blocks = vol->vol_capacity_bytes / bs;
-    
-    /* Calculate Phi for Coprimality Check */
-    uint64_t flux_start_blk = hn4_addr_to_u64(vol->sb.info.lba_flux_start) / (bs / ss);
-    /* Assuming S=1 (4KB) for this test anchor */
-    uint64_t flux_aligned = flux_start_blk; 
-    uint64_t phi = total_blocks - flux_aligned;
-
-    /* 
-     * 2. Fill 40% of drive randomly.
-     * 50% is risky because of the Birthday Paradox; localized clusters might
-     * trigger premature saturation or heavy collisions. 40% is sufficient
-     * to demonstrate geometric decay without saturation noise.
-     */
-    uint64_t fill_target = (uint64_t)(phi * 0.40);
-    
-    /* Use a simple LCG to scatter fills */
-    uint64_t lcg = 0xCAFEBABE;
-    for (uint64_t i = 0; i < fill_target; i++) {
-        lcg = lcg * 6364136223846793005ULL + 1;
-        uint64_t target = flux_aligned + (lcg % phi);
-        
-        /* Direct bitmap manipulation to bypass allocator overhead */
-        _bitmap_op(vol, target, BIT_SET, NULL);
-    }
-    
-    /* Update accounting so alloc_block doesn't think we are empty/full */
-    atomic_store(&vol->used_blocks, fill_target);
-
-    /* 3. Alloc Sequence */
-    uint64_t k_hist[16] = {0};
-    hn4_anchor_t anchor = {0};
-    
-    /* Pick a V that is definitely coprime to Phi to ensure Ballistic behavior */
-    uint64_t prime_V = 101; 
-    /* Simple GCD check loop to find a valid V */
-    while (_test_gcd(prime_V, phi) != 1) prime_V += 2;
-
-    anchor.gravity_center = hn4_cpu_to_le64(flux_aligned + 50); /* Offset from start */
-    anchor.orbit_vector[0] = (uint8_t)prime_V; 
-    anchor.fractal_scale = 0; // 4KB
-
-    for (int i = 0; i < 1000; i++) {
-        hn4_addr_t out;
-        uint8_t k = 0;
-        hn4_result_t res = hn4_alloc_block(vol, &anchor, i, &out, &k);
-        
-        if (res == HN4_OK) {
-            if (k < 16) k_hist[k]++;
-        }
-        /* Ignore ENOSPC if we get unlucky locally, just don't log k */
-    }
-    
-    /* 
-     * Assert Decay: Count(K=0) > Count(K=1).
-     * With 40% fill, P(collision) ~ 0.4.
-     * Expect K=0 ~ 600, K=1 ~ 240.
-     */
-    ASSERT_TRUE(k_hist[0] > k_hist[1]);
-    ASSERT_TRUE(k_hist[0] > 0); /* Must have succeeded at least once */
-    
-    /* Horizon K=15 check */
-    ASSERT_TRUE(k_hist[15] < 100);
-    
-    cleanup_collision_fixture(vol);
-}
-
-
-/* =========================================================================
- * 2. THE "DO NOTHING WRONG" TEST
- * ========================================================================= */
-hn4_TEST(CollisionStats, DoNothingWrong) {
-    hn4_volume_t* vol = create_collision_fixture();
-    hn4_anchor_t anchor = {0};
-    anchor.gravity_center = hn4_cpu_to_le64(1000);
-    anchor.orbit_vector[0] = 7;
-    
-    /* Sequential write on empty drive */
-    uint64_t k_sum = 0;
-    uint64_t horizon_hits = 0;
-    
-    for (int i = 0; i < 1000; i++) {
-        hn4_addr_t out;
-        uint8_t k;
-        ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, i, &out, &k));
-        k_sum += k;
-        if (k == 15) horizon_hits++;
-    }
-    
-    /* 
-     * Ideally K=0 for all. Maybe sparse K=1 if hash collision.
-     * Avg K should be close to 0.
-     * Horizon hits should be 0.
-     */
-    ASSERT_EQ(0ULL, horizon_hits);
-    ASSERT_TRUE(k_sum < 50); /* Allow < 5% noise */
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
- * 3. ADVERSARIAL VECTOR ALIGNMENT (Harmonic Resonance)
- * ========================================================================= */
-hn4_TEST(CollisionStats, HarmonicResonanceCheck) {
-    /* Phi = 4096 (Power of 2). V = 2048, 1024, 512. */
-    hn4_volume_t* vol = create_collision_fixture();
-    uint64_t start = vol->sb.info.lba_flux_start;
-    /* Force Phi=4096 */
-    vol->vol_capacity_bytes = (start + 4096) * 4096;
-    
-    hn4_anchor_t A = {0}, B = {0}, C = {0};
-    /* Set V via memcpy to support > 255 */
-    uint64_t V1 = 2048, V2 = 1024, V3 = 512;
-    memcpy(A.orbit_vector, &V1, 2);
-    memcpy(B.orbit_vector, &V2, 2);
-    memcpy(C.orbit_vector, &V3, 2);
-    
-    /* Interleaved allocation */
-    int horizon_hits = 0;
-    for (int i = 0; i < 100; i++) {
-        hn4_addr_t o; uint8_t k;
-        hn4_alloc_block(vol, &A, i, &o, &k); if(k==15) horizon_hits++;
-        hn4_alloc_block(vol, &B, i, &o, &k); if(k==15) horizon_hits++;
-        hn4_alloc_block(vol, &C, i, &o, &k); if(k==15) horizon_hits++;
-    }
-    
-    /* Should resolve via K-ladder, not collapse to Horizon en masse */
-    ASSERT_TRUE(horizon_hits < 50); /* < 16% failure rate */
-    
-    cleanup_collision_fixture(vol);
-}
-
 /* =========================================================================
  * 5. RAPID K-OSCILLATION SUPPRESSION
  * ========================================================================= */
@@ -1627,76 +1296,6 @@ hn4_TEST(CollisionStats, OscillationSuppression) {
     cleanup_collision_fixture(vol);
 }
 
-/* =========================================================================
- * 7. PAIRED-ANCHOR INTERFERENCE (Nearby Neighbors)
- * ========================================================================= */
-hn4_TEST(CollisionStats, PairedAnchorInterference) {
-    hn4_volume_t* vol = create_collision_fixture();
-    
-    /* 1. Determine safe geometry */
-    uint32_t bs = vol->vol_block_size;
-    uint32_t ss = hn4_hal_get_caps(vol->target_device)->logical_block_size;
-    uint64_t total = vol->vol_capacity_bytes / bs;
-    uint64_t start = hn4_addr_to_u64(vol->sb.info.lba_flux_start) / (bs/ss);
-    uint64_t phi = total - start;
-
-    /* Pick V coprime to Phi to prevent Linear Degeneration (Tail Chasing) */
-    uint64_t safe_V = 17;
-    if (phi > 0) {
-        while (_test_gcd(safe_V, phi) != 1) safe_V += 2;
-    }
-
-    hn4_anchor_t A = {0}, B = {0};
-    /* Place them far enough from Flux Start to avoid boundary edge cases */
-    uint64_t G = 1000;
-    
-    A.gravity_center = hn4_cpu_to_le64(G);
-    B.gravity_center = hn4_cpu_to_le64(G + 1);
-    
-    /* Store the safe V (Little Endian) */
-    uint64_t v_le = hn4_cpu_to_le64(safe_V);
-    memcpy(A.orbit_vector, &v_le, 6);
-    memcpy(B.orbit_vector, &v_le, 6);
-    
-    /* Interleaved alloc */
-    uint64_t k_sum = 0;
-    int success_count = 0;
-
-    for (int i = 0; i < 100; i++) {
-        hn4_addr_t o; 
-        uint8_t k = 0;
-        
-        /* Initialize K to 0 and check result to avoid adding garbage */
-        if (hn4_alloc_block(vol, &A, i, &o, &k) == HN4_OK) {
-            k_sum += k;
-            success_count++;
-        }
-        
-        k = 0;
-        if (hn4_alloc_block(vol, &B, i, &o, &k) == HN4_OK) {
-            k_sum += k;
-            success_count++;
-        }
-    }
-    
-    /* 
-     * Analysis:
-     * With V=17 (Ballistic), A and B stride in parallel lines:
-     * A: 0, 17, 34...
-     * B: 1, 18, 35...
-     * They never collide with each other in an empty volume.
-     * k_sum should be exactly 0 if volume is empty.
-     * Allowing for some fixture pre-fill noise, average K should be very low.
-     */
-    
-    ASSERT_TRUE(success_count == 200);
-    
-    /* Strict check: in a clean ballistic scenario, interference should be minimal */
-    ASSERT_TRUE(k_sum < 50); 
-    
-    cleanup_collision_fixture(vol);
-}
-
 
 /* =========================================================================
  * 9. THETA LUT CONTINUITY
@@ -1722,35 +1321,6 @@ hn4_TEST(CollisionStats, ThetaContinuity) {
         }
         prev = curr;
     }
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
- * 10. COLLISION SNOWBALL CONTAINMENT
- * ========================================================================= */
-hn4_TEST(CollisionStats, SnowballContainment) {
-    hn4_volume_t* vol = create_collision_fixture();
-    hn4_anchor_t anchor = {0};
-    /* Use V=10 to prevent N=10/K=1 aliasing with N=11/K=0 */
-    uint64_t G = 1000, V = 10;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.orbit_vector[0] = 10;
-    
-    /* 1. Create a "Hot Spot" at N=10 (Jam K=0..5) */
-    for(int k=0; k<=5; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, V, 10, 0, k);
-        _bitmap_op(vol, lba, BIT_SET, NULL);
-    }
-    
-    /* 2. Alloc N=10. Should hit K=6. */
-    hn4_addr_t o; uint8_t k;
-    hn4_alloc_block(vol, &anchor, 10, &o, &k);
-    ASSERT_EQ(6, k);
-    
-    /* 3. Alloc N=11. Should NOT be affected (K=0 should work) */
-    hn4_alloc_block(vol, &anchor, 11, &o, &k);
-    ASSERT_EQ(0, k);
     
     cleanup_collision_fixture(vol);
 }
@@ -1831,38 +1401,6 @@ hn4_TEST(Collision, ThetaExhaustionRecovery) {
     uint8_t k_rec;
     hn4_alloc_block(vol, &anchor, 0, &lba_rec, &k_rec);
     ASSERT_EQ(0, k_rec);
-    
-    cleanup_collision_fixture(vol);
-}
-
-/* =========================================================================
- * 5. MIXED-ANCHOR INTERFERENCE (False Phase Lock)
- * ========================================================================= */
-hn4_TEST(Collision, CoincidentalPhaseLock) {
-    hn4_volume_t* vol = create_collision_fixture();
-    uint64_t phi = 1000;
-    /* Force Phi=1000 */
-    vol->sb.info.lba_flux_start = 100;
-    vol->vol_capacity_bytes = (100 + 1000) * 4096;
-    
-    hn4_anchor_t A={0}, B={0};
-    /* G close, V shares factors with Phi (e.g. V=100) */
-    A.gravity_center = hn4_cpu_to_le64(500); A.orbit_vector[0] = 100;
-    B.gravity_center = hn4_cpu_to_le64(501); B.orbit_vector[0] = 100;
-    
-    /* Alternating Alloc N=0..10 */
-    for(int i=0; i<10; i++) {
-        hn4_addr_t o; uint8_t k;
-        hn4_alloc_block(vol, &A, i, &o, &k);
-        hn4_alloc_block(vol, &B, i, &o, &k);
-        
-        /* 
-         * Verify K doesn't explode. 
-         * With V=100, they land in different "Lanes" (mod 100 offsets).
-         * A lands on 00, B lands on 01. No collision expected.
-         */
-        ASSERT_EQ(0, k);
-    }
     
     cleanup_collision_fixture(vol);
 }

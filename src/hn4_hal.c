@@ -116,7 +116,8 @@ hn4_result_t hn4_hal_init(void)
         atomic_store(&_zns_zone_ptrs[i], 0);
     }
 
-    atomic_store(&_prng_seed, 0xCAFEBABE12345678ULL);
+    uint64_t entropy = (uintptr_t)&entropy ^ hn4_hal_get_time_ns();
+    atomic_store(&_prng_seed, 0xCAFEBABE12345678ULL ^ entropy);
 
     return HN4_OK;
 }
@@ -200,9 +201,19 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
                 break;
 
             case HN4_IO_ZONE_RESET:
-                memset(dev->mmio_base + offset, 0, len_bytes);
-                hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
-                break;
+        
+            memset(dev->mmio_base + offset, 0, len_bytes);
+            hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
+    
+            /* Reset the Write Pointer for ZNS Simulation */
+            if (dev->caps.hw_flags & HN4_HW_ZNS_NATIVE) {
+                uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
+                uint64_t lba_raw = hn4_addr_to_u64(req->lba);
+                uint64_t zone_idx = lba_raw / zone_cap_blocks;
+                uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
+                atomic_store(&_zns_zone_ptrs[sim_idx], 0);
+            }
+            break;
 
             default:
                 if (cb) cb(req, HN4_ERR_INVALID_ARGUMENT);
@@ -675,4 +686,72 @@ void hn4_hal_prefetch(hn4_hal_device_t* dev, hn4_addr_t lba, uint32_t len) {
     (void)lba;
     (void)len;
 #endif
+}
+
+/* 1. Define internal context/callback HIDDEN from the rest of the engine */
+typedef struct {
+    volatile bool         done;
+    volatile hn4_result_t res;
+} _hal_internal_ctx_t;
+
+static void _hal_internal_cb(hn4_io_req_t* r, hn4_result_t res) {
+    _hal_internal_ctx_t* ctx = (_hal_internal_ctx_t*)r->user_ctx;
+    ctx->res = res;
+    atomic_thread_fence(memory_order_release);
+    ctx->done = true;
+}
+
+#define HN4_HAL_DEFAULT_TIMEOUT_NS (30ULL * 1000000000ULL) // 30 Seconds
+
+/* 2. Implement the clean Synchronous API */
+hn4_result_t hn4_hal_zns_append_sync(
+    hn4_hal_device_t* dev,
+    hn4_addr_t zone_start_lba,
+    void* buffer,
+    uint32_t len_blocks,
+    hn4_addr_t* result_lba
+) {
+    if (!dev) return HN4_ERR_INVALID_ARGUMENT;
+
+    _hal_internal_ctx_t ctx = { .done = false, .res = HN4_OK };
+    hn4_io_req_t req = {0};
+
+    req.op_code  = HN4_IO_ZONE_APPEND;
+    req.lba      = zone_start_lba; /* The Zone Handle */
+    req.buffer   = buffer;
+    req.length   = len_blocks;
+    req.user_ctx = &ctx;
+
+    /* Submit to hardware queue */
+    hn4_hal_submit_io(dev, &req, _hal_internal_cb);
+
+    /* 
+     * THE POLLING LOOP (Moved from hn4_write.c)
+     * Keeps upper layers clean.
+     */
+    hn4_time_t start_ts = hn4_hal_get_time_ns();
+
+    /* Use atomic load for thread sanitizer safety */
+    while (!atomic_load_explicit((_Atomic bool*)&ctx.done, memory_order_acquire)) {
+        
+        hn4_hal_poll(dev);
+
+        if ((hn4_hal_get_time_ns() - start_ts) > HN4_HAL_DEFAULT_TIMEOUT_NS) {
+            HN4_LOG_CRIT("HAL: ZNS Append Timeout. Device Stalled.");
+            /* 
+             * NOTE: In a real kernel driver, you must issue an Abort command here 
+             * or leak the stack frame. We return timeout. 
+             */
+            return HN4_ERR_ATOMICS_TIMEOUT;
+        }
+        
+        HN4_YIELD(); /* Reduce CPU burn */
+    }
+
+    /* Capture the resulting LBA provided by the drive */
+    if (ctx.res == HN4_OK && result_lba) {
+        *result_lba = req.result_lba;
+    }
+
+    return ctx.res;
 }

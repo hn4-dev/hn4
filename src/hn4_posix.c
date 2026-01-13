@@ -424,10 +424,46 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         if (hn4_write_anchor_atomic(vol, &new_anc) != HN4_OK) return -HN4_EIO;
 
         /* Write to RAM */
-        hn4_hal_spinlock_acquire(&vol->l2_lock);
-        ((hn4_anchor_t*)vol->nano_cortex)[slot] = new_anc;
-        _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[slot], sizeof(hn4_anchor_t));
+          hn4_hal_spinlock_acquire(&vol->l2_lock);
+
+        bool collision = false;
+        size_t cortex_cnt = vol->cortex_size / sizeof(hn4_anchor_t);
+        hn4_anchor_t* ram_base = (hn4_anchor_t*)vol->nano_cortex;
+        
+        for (size_t k = 0; k < cortex_cnt; k++) {
+            hn4_anchor_t* check = &ram_base[k];
+            /* Atomic load to ensure we see a consistent 64-bit value */
+            uint64_t dc = _imp_atomic_load_u64(&check->data_class);
+            dc = hn4_le64_to_cpu(dc);
+
+            if ((dc & HN4_FLAG_VALID) && !(dc & HN4_FLAG_TOMBSTONE)) {
+                /* Inline name check */
+                if (_imp_strcmp((char*)check->inline_buffer, lk.name) == 0) {
+                    collision = true;
+                    break;
+                }
+            }
+        }
+
+        if (!collision) {
+            /* No collision, commit to RAM */
+            ram_base[slot] = new_anc;
+            _imp_dcache_flush(&ram_base[slot], sizeof(hn4_anchor_t));
+        }
+        
         hn4_hal_spinlock_release(&vol->l2_lock);
+
+        if (collision) {
+            new_anc.data_class |= hn4_cpu_to_le64(HN4_FLAG_TOMBSTONE);
+            
+            /* Best effort rollback - ignore errors as we are already failing */
+            hn4_write_anchor_atomic(vol, &new_anc);
+            
+            return -HN4_EEXIST;
+        }
+
+        /* Update Context for Handle */
+        lk.anchor = new_anc;
 
         /* Update Context for Handle */
         lk.anchor = new_anc;
@@ -521,42 +557,79 @@ hn4_ssize_t hn4_posix_read(hn4_volume_t* vol, hn4_handle_t* handle, void* buf, s
     return (hn4_ssize_t)total;
 }
 
-hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void* buf, size_t count) {
+hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void* buf, size_t count) 
+{
     if (!vol || !handle || !buf) return -HN4_EINVAL;
+    
+    /* 1. Volume State Checks */
     if (vol->read_only) return -HN4_EROFS;
+    if (vol->sb.info.state_flags & HN4_VOL_PANIC) return -HN4_EIO;
 
     hn4_vfs_handle_t* fh = (hn4_vfs_handle_t*)handle;
+    
+    /* 2. Directory Safety */
     if (fh->is_directory) return -HN4_EISDIR;
 
-    /* Validate Write Mode */
+    /* 3. Handle Mode Validation */
     int acc = fh->open_flags & HN4_O_ACCMODE;
     if (acc != HN4_O_WRONLY && acc != HN4_O_RDWR) return -HN4_EBADF;
 
-    /* TOCTOU Check: Re-read perms */
+    /* 
+     * CRITICAL: SYNC FROM SOURCE OF TRUTH
+     * Reload the anchor from the Nano-Cortex (RAM Cache) to ensure we have
+     * the latest Write Generation and Mass before we attempt any IO.
+     * This mitigates "Split-Brain" where a local handle writes with a stale generation.
+     */
+    if (vol->nano_cortex) {
+        hn4_hal_spinlock_acquire(&vol->l2_lock);
+        _imp_memory_barrier();
+        
+        /* Range check the index to prevent OOB if cortex resized (unlikely but safe) */
+        size_t max_slots = vol->cortex_size / sizeof(hn4_anchor_t);
+        if (fh->anchor_idx < max_slots) {
+            fh->cached_anchor = ((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+        }
+        
+        hn4_hal_spinlock_release(&vol->l2_lock);
+    } else {
+        /* If Cortex is missing in RW mode, we are in a critical failure state */
+        return -HN4_EIO;
+    }
+
+    /* 4. Immutable/Permission Check (TOCTOU Defense) */
     uint32_t perms = hn4_le32_to_cpu(fh->cached_anchor.permissions);
     if (perms & HN4_PERM_IMMUTABLE) return -HN4_EPERM;
 
-    /* Handle Append */
+    /* 5. Append Logic */
     if (fh->open_flags & HN4_O_APPEND) {
         fh->current_offset = hn4_le64_to_cpu(fh->cached_anchor.mass);
     }
 
+    /* 6. Size Limit Check */
     if (count > 0 && (UINT64_MAX - fh->current_offset < count)) return -HN4_EFBIG;
 
+    /* 7. Geometry Setup */
     uint32_t bs = vol->vol_block_size;
     if (bs == 0) return -HN4_EIO;
     uint32_t payload = HN4_BLOCK_PayloadSize(bs);
     if (payload == 0) return -HN4_EIO;
 
     const uint8_t* ptr = (const uint8_t*)buf;
-    size_t total = 0;
+    size_t total_written = 0;
     size_t rem = count;
 
+    /* 8. Allocation */
     void* io = hn4_hal_mem_alloc(bs);
     if (!io) return -HN4_ENOMEM;
 
+    int ret_code = 0;
+
+    /* 9. WRITE LOOP */
     while (rem > 0) {
-        /* Re-check Append inside loop to reduce race window */
+        /* 
+         * Re-check Append inside loop. 
+         * If another thread updated Mass between our chunks, we must chase the tail.
+         */
         if (fh->open_flags & HN4_O_APPEND) {
              fh->current_offset = hn4_le64_to_cpu(fh->cached_anchor.mass);
         }
@@ -566,52 +639,97 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         uint32_t chunk = payload - b_off;
         if (chunk > rem) chunk = rem;
 
-        bool rmw = (b_off > 0) || (chunk < payload);
-        _imp_memset(io, 0, bs);
+        bool rmw_needed = (b_off > 0) || (chunk < payload);
+        
+        /* Always zero buffer to prevent data leaks in padding */
+        memset(io, 0, bs);
 
-        if (rmw) {
+        /* 
+         * A. READ-MODIFY-WRITE (RMW) PATH
+         * If we are writing a partial block, we must fetch the existing data.
+         */
+        if (rmw_needed) {
             hn4_result_t r = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs);
-            /* Treat not found as sparse (zeros) for RMW */
-            if (r != HN4_OK && r != HN4_INFO_SPARSE && r != HN4_ERR_NOT_FOUND) {
-                hn4_hal_mem_free(io);
-                return _map_err(r);
+            
+            /* 
+             * Sparse/Not Found is acceptable for RMW (treat as zeros).
+             * Any other error is fatal.
+             */
+            if (r != HN4_OK && r != HN4_INFO_SPARSE && r != HN4_ERR_NOT_FOUND && r != HN4_INFO_HEALED) {
+                ret_code = _map_err(r);
+                goto cleanup;
             }
         }
 
-        _imp_memcpy((uint8_t*)io + b_off, ptr, chunk);
+        /* B. OVERLAY NEW DATA */
+        /* Note: io buffer contains the BLOCK HEADER at start, but hn4_read_block_atomic
+           returns the PAYLOAD in the buffer. However, hn4_write_block_atomic expects
+           payload data to be passed in. We construct the payload in `io` then pass it. */
+           
+        /* 
+         * CORRECTION: `hn4_read_block_atomic` outputs payload.
+         * We update the payload part of the buffer.
+         */
+        memcpy((uint8_t*)io + b_off, ptr, chunk);
 
+        /* 
+         * C. ATOMIC WRITE (THE SHADOW HOP)
+         * This function persists the data to a new ballistic trajectory,
+         * issues a hardware barrier, and updates `fh->cached_anchor` locally.
+         */
         hn4_result_t w = hn4_write_block_atomic(vol, &fh->cached_anchor, b_idx, io, payload);
+        
         if (w != HN4_OK) {
-            hn4_hal_mem_free(io);
-            return _map_err(w);
+            ret_code = _map_err(w);
+            goto cleanup;
         }
 
+        /* 
+         * D. SYNC TO GLOBAL STATE (Critical for Atomicity)
+         * We must publish the updated Anchor (New Generation, New Mass)
+         * to the Nano-Cortex immediately, or other handles will see stale metadata.
+         */
+        hn4_hal_spinlock_acquire(&vol->l2_lock);
+        _imp_memory_barrier();
+        
+        /* 
+         * Optimistic update: We assume we own the sequence. 
+         * In a strictly POSIX compliant system, we would need a file-level mutex.
+         * Here, we broadcast the result of our atomic hop.
+         */
+        if (fh->anchor_idx < (vol->cortex_size / sizeof(hn4_anchor_t))) {
+            ((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx] = fh->cached_anchor;
+            
+            /* CPU Cache Flush hint if platform requires manual coherence for DMA */
+            // _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx], sizeof(hn4_anchor_t));
+        }
+        
+        hn4_hal_spinlock_release(&vol->l2_lock);
+
+        /* E. Advance Cursors */
         ptr += chunk;
         fh->current_offset += chunk;
         rem -= chunk;
-        total += chunk;
-        fh->dirty = true;
+        total_written += chunk;
+        fh->dirty = true; /* Mark handle dirty for close() logic */
 
-        /* Update Mass Atomically */
+        /* 
+         * Update Mass locally if we extended the file.
+         * (hn4_write_block_atomic handles this too, but we keep handle logic consistent)
+         */
         uint64_t mass = hn4_le64_to_cpu(fh->cached_anchor.mass);
         if (fh->current_offset > mass) {
             fh->cached_anchor.mass = hn4_cpu_to_le64(fh->current_offset);
         }
-        
-        uint64_t now = hn4_hal_get_time_ns();
-        fh->cached_anchor.mod_clock = hn4_cpu_to_le64(now);
-
-        /* Update RAM Cache */
-        hn4_hal_spinlock_acquire(&vol->l2_lock);
-        ((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx] = fh->cached_anchor;
-        _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx], sizeof(hn4_anchor_t));
-        hn4_hal_spinlock_release(&vol->l2_lock);
     }
 
+cleanup:
     hn4_hal_mem_free(io);
-    return (hn4_ssize_t)total;
+    
+    /* If we wrote anything, return that count (short write), otherwise return error */
+    if (total_written > 0) return (hn4_ssize_t)total_written;
+    return (hn4_ssize_t)ret_code;
 }
-
 
 
 hn4_off_t hn4_posix_lseek(hn4_volume_t* vol, hn4_handle_t* handle, hn4_off_t offset, int whence) {
@@ -646,72 +764,117 @@ hn4_off_t hn4_posix_lseek(hn4_volume_t* vol, hn4_handle_t* handle, hn4_off_t off
 int hn4_posix_readdir(hn4_volume_t* vol, const char* path, void* buf, 
                       int (*filler)(void*, const char*, const hn4_stat_t*, hn4_off_t)) 
 {
+    /* 1. Path Resolution */
     hn4_lookup_ctx_t lk;
     int err = _resolve_path(vol, path, &lk);
     if (err != 0) return err;
 
-    /* Directory Semantics Check */
+    /* 2. Directory Semantics Check */
     uint64_t root_dclass = hn4_le64_to_cpu(lk.anchor.data_class);
     bool is_dir = lk.is_root || (root_dclass & HN4_FLAG_IS_DIRECTORY);
 
     if (!is_dir) return -HN4_ENOTDIR;
 
-    /* Emit Standard Entries */
+    /* 3. Emit Standard Entries (.) and (..) */
     if (filler(buf, ".", NULL, 0)) return 0;
     if (filler(buf, "..", NULL, 0)) return 0;
 
-    /* Flat Namespace: Only Root contains files */
+    /* HN4 has a Flat Namespace: Only Root contains files */
     if (!lk.is_root) return 0;
 
     if (!vol->nano_cortex) return -HN4_EIO;
 
-    hn4_hal_spinlock_acquire(&vol->l2_lock);
-    _imp_memory_barrier();
-
-    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-    size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
-
-    for (size_t i = 0; i < count; i++) {
-        hn4_anchor_t* a = &anchors[i];
-        
-        uint64_t dclass = _imp_atomic_load_u64(&a->data_class);
-        dclass = hn4_le64_to_cpu(dclass);
-        
-        if (!(dclass & HN4_FLAG_VALID)) continue;
-        if (dclass & HN4_FLAG_TOMBSTONE) continue;
-
+    /* 
+     * 4. SNAPSHOT ITERATION
+     * Iterate the Cortex array in chunks. 
+     * We copy metadata under lock, release lock, then call the filler.
+     */
+    uint64_t total_count = vol->cortex_size / sizeof(hn4_anchor_t);
+    uint64_t cursor = 0;
+    
+    #define HN4_READDIR_BATCH 64
+    
+    typedef struct {
         char name[HN4_INLINE_NAME_MAX + 1];
-        _imp_memcpy(name, a->inline_buffer, HN4_INLINE_NAME_MAX);
-        name[HN4_INLINE_NAME_MAX] = '\0';
+        hn4_stat_t st;
+        bool valid;
+    } dir_snap_t;
+    
+    /* Approx 6KB on stack - safe for kernel threads */
+    dir_snap_t batch[HN4_READDIR_BATCH];
+
+    while (cursor < total_count) {
+        int items_in_batch = 0;
+
+        /* --- CRITICAL SECTION START --- */
+        hn4_hal_spinlock_acquire(&vol->l2_lock);
+        _imp_memory_barrier();
         
-        if (name[0] != '\0') {
-            hn4_stat_t st;
-            _imp_memset(&st, 0, sizeof(st));
+        hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+        
+        /* Fill batch */
+        for (; cursor < total_count && items_in_batch < HN4_READDIR_BATCH; cursor++) {
+            hn4_anchor_t* a = &anchors[cursor];
             
-            /* Inode 0 is reserved; offset by 1 */
-            st.st_ino = (hn4_ino_t)(i + 1);
-            
-            st.st_mode = _perms_to_mode(hn4_le32_to_cpu(a->permissions));
-            
-            if (dclass & HN4_FLAG_IS_DIRECTORY) st.st_mode |= HN4_S_IFDIR;
-            else st.st_mode |= HN4_S_IFREG;
-            
-            st.st_size = hn4_le64_to_cpu(a->mass);
-            
-            if (vol->vol_block_size > 0) {
-                st.st_blksize = vol->vol_block_size;
-                st.st_blocks = (st.st_size + vol->vol_block_size - 1) / vol->vol_block_size;
+            uint64_t dclass = _imp_atomic_load_u64(&a->data_class);
+            dclass = hn4_le64_to_cpu(dclass);
+
+            /* Skip Invalid or Deleted entries */
+            if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
+                continue; 
             }
 
-            st.st_mtime = hn4_le64_to_cpu(a->mod_clock) / 1000000000ULL;
-            st.st_ctime = st.st_mtime;
+            /* Valid Entry Found - Copy to Snapshot */
+            dir_snap_t* snap = &batch[items_in_batch];
+            
+            /* Extract Name */
+            _imp_memcpy(snap->name, a->inline_buffer, HN4_INLINE_NAME_MAX);
+            snap->name[HN4_INLINE_NAME_MAX] = '\0';
+            
+            /* Skip empty names (shouldn't happen for valid files, but safe guard) */
+            if (snap->name[0] == '\0') continue;
 
-            /* Now valid because filler returns int */
-            if (filler(buf, name, &st, 0)) break;
+            /* Populate Stat */
+            _imp_memset(&snap->st, 0, sizeof(hn4_stat_t));
+            
+            /* Inode 0 is reserved; offset by 1 */
+            snap->st.st_ino = (hn4_ino_t)(cursor + 1);
+            
+            snap->st.st_mode = _perms_to_mode(hn4_le32_to_cpu(a->permissions));
+            if (dclass & HN4_FLAG_IS_DIRECTORY) snap->st.st_mode |= HN4_S_IFDIR;
+            else snap->st.st_mode |= HN4_S_IFREG;
+            
+            snap->st.st_size = hn4_le64_to_cpu(a->mass);
+            
+            if (vol->vol_block_size > 0) {
+                snap->st.st_blksize = vol->vol_block_size;
+                snap->st.st_blocks = (snap->st.st_size + vol->vol_block_size - 1) / vol->vol_block_size;
+            }
+
+            snap->st.st_mtime = hn4_le64_to_cpu(a->mod_clock) / 1000000000ULL;
+            snap->st.st_ctime = snap->st.st_mtime;
+            
+            snap->valid = true;
+            items_in_batch++;
+        }
+        
+        hn4_hal_spinlock_release(&vol->l2_lock);
+        /* --- CRITICAL SECTION END --- */
+
+        /* 
+         * Safe Callback Phase
+         * Call the VFS filler without holding internal locks.
+         */
+        for (int i = 0; i < items_in_batch; i++) {
+            if (batch[i].valid) {
+                if (filler(buf, batch[i].name, &batch[i].st, 0)) {
+                    /* Buffer full - stop iteration */
+                    return 0; 
+                }
+            }
         }
     }
 
-    hn4_hal_spinlock_release(&vol->l2_lock);
     return 0;
 }
 

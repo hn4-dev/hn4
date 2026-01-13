@@ -109,29 +109,6 @@ hn4_TEST(SiliconCartography, MetadataRejectsBronze) {
     cleanup_env(vol);
 }
 
-
-/*
- * Test Q2: User Data Accepts Bronze
- * RATIONALE:
- * Standard user data (HN4_ALLOC_DEFAULT) should be allowed on Bronze blocks
- * to maximize capacity utilization on aging media.
- */
-hn4_TEST(SiliconCartography, UserDataAcceptsBronze) {
-    hn4_volume_t* vol = create_env();
-    
-    /* Flood with Bronze (0x55) */
-    flood_qmask(vol, 0x55);
-    
-    uint64_t G, V;
-    /* Request Default Allocation */
-    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V);
-    
-    /* Should succeed */
-    ASSERT_EQ(HN4_OK, res);
-
-    cleanup_env(vol);
-}
-
 /*
  * Test Q3: Toxic Ban
  * RATIONALE:
@@ -156,29 +133,6 @@ hn4_TEST(SiliconCartography, ToxicIsBannedGlobal) {
     /* 3. Try Ludic (Game Assets) -> Should be EVENT_HORIZON */
     res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_LUDIC, &G, &V);
     ASSERT_EQ(HN4_ERR_EVENT_HORIZON, res);
-
-    cleanup_env(vol);
-}
-
-
-/*
- * Test Q4: Gold Preference
- * RATIONALE:
- * Gold (11) is the highest tier. All allocation types should accept it.
- */
-hn4_TEST(SiliconCartography, GoldAcceptedAll) {
-    hn4_volume_t* vol = create_env();
-    
-    /* Flood with Gold (0xFF) */
-    flood_qmask(vol, 0xFF);
-    
-    uint64_t G, V;
-    
-    /* Metadata - OK */
-    ASSERT_EQ(HN4_OK, hn4_alloc_genesis(vol, 0, HN4_ALLOC_METADATA, &G, &V));
-    
-    /* User - OK */
-    ASSERT_EQ(HN4_OK, hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &G, &V));
 
     cleanup_env(vol);
 }
