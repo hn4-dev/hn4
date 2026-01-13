@@ -536,11 +536,12 @@ hn4_ssize_t hn4_posix_read(hn4_volume_t* vol, hn4_handle_t* handle, void* buf, s
         uint32_t chunk = payload - b_off;
         if (chunk > to_read) chunk = to_read;
 
-        hn4_result_t res = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs);
+         hn4_result_t res = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs);
 
         if (res == HN4_OK || res == HN4_INFO_HEALED) {
             _imp_memcpy(ptr, (uint8_t*)io + b_off, chunk);
-        } else if (res == HN4_INFO_SPARSE || res == HN4_ERR_NOT_FOUND) {
+        } else if (res == HN4_INFO_SPARSE) {
+            /* Valid Logic Hole */
             _imp_memset(ptr, 0, chunk);
         } else {
             hn4_hal_mem_free(io);
@@ -674,10 +675,18 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
 
         /* 
          * C. ATOMIC WRITE (THE SHADOW HOP)
-         * This function persists the data to a new ballistic trajectory,
-         * issues a hardware barrier, and updates `fh->cached_anchor` locally.
+         * FIX: Calculate actual valid length. If we are writing the tail, 
+         * we must not inflate the mass to the full payload capacity.
          */
-        hn4_result_t w = hn4_write_block_atomic(vol, &fh->cached_anchor, b_idx, io, payload);
+        uint32_t valid_len = payload;
+        
+        /* If this is the last block logical index, determine valid byte count */
+        /* Note: b_off + chunk is the valid end offset within this block buffer */
+        if (fh->current_offset + chunk > hn4_le64_to_cpu(fh->cached_anchor.mass)) {
+             valid_len = b_off + chunk;
+        }
+
+        hn4_result_t w = hn4_write_block_atomic(vol, &fh->cached_anchor, b_idx, io, valid_len);
         
         if (w != HN4_OK) {
             ret_code = _map_err(w);
@@ -800,13 +809,15 @@ int hn4_posix_readdir(hn4_volume_t* vol, const char* path, void* buf,
         bool valid;
     } dir_snap_t;
     
-    /* Approx 6KB on stack - safe for kernel threads */
-    dir_snap_t batch[HN4_READDIR_BATCH];
+    /* FIX: Allocate large batch buffers from Heap/Pool, never Stack */
+    dir_snap_t* batch = hn4_hal_mem_alloc(sizeof(dir_snap_t) * HN4_READDIR_BATCH);
+    if (!batch) return -HN4_ENOMEM;
 
+    /* Ensure we free this before returning! */
+    
     while (cursor < total_count) {
         int items_in_batch = 0;
 
-        /* --- CRITICAL SECTION START --- */
         hn4_hal_spinlock_acquire(&vol->l2_lock);
         _imp_memory_barrier();
         
@@ -949,7 +960,7 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
     return 0;
 }
 
-hn4_posix_close(hn4_volume_t* vol, hn4_handle_t* handle) {
+int hn4_posix_close(hn4_volume_t* vol, hn4_handle_t* handle) {
     if (!vol || !handle) return -HN4_EINVAL;
     hn4_vfs_handle_t* fh = (hn4_vfs_handle_t*)handle;
     

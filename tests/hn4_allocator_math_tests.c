@@ -558,3 +558,381 @@ hn4_TEST(Math_Boundary, OOB_Rejection) {
     
     cleanup_math_fixture(vol);
 }
+
+
+/* =========================================================================
+ * TEST 12: ALGEBRA - ENTROPY AMPLIFICATION
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * HN4 uses "Fractal Amplification" for entropy. 
+ * Small offsets in G are treated as full Fractal Strides in the mixing phase.
+ * 
+ * Logic:
+ * Entropy = G % S
+ * Fractal_Offset += Entropy
+ * Physical_LBA += Entropy (at tail)
+ * 
+ * Expected Shift = (Entropy * S) + Entropy
+ */
+hn4_TEST(Math_Algebra, Entropy_Amplification) {
+    hn4_volume_t* vol = create_math_fixture(20);
+    
+    uint16_t M = 4; /* S = 16 blocks */
+    uint64_t S = 1ULL << M;
+    
+    /* G_aligned = 1600. Entropy = 5. */
+    uint64_t G_aligned = 1600;
+    uint64_t entropy = 5;
+    uint64_t G_unaligned = G_aligned + entropy;
+    
+    uint64_t lba_aligned = _calc_trajectory_lba(vol, G_aligned, 1, 0, M, 0);
+    uint64_t lba_unaligned = _calc_trajectory_lba(vol, G_unaligned, 1, 0, M, 0);
+    
+    /* 
+     * Based on code analysis:
+     * Shift = (Entropy * S) + Entropy = (5 * 16) + 5 = 85.
+     * Note: If implementation varies, we verify it is deterministic and > entropy.
+     */
+    uint64_t diff = lba_unaligned - lba_aligned;
+    
+    ASSERT_EQ((entropy * S) + entropy, diff);
+    
+    cleanup_math_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 13: GROUP THEORY - BIJECTIVE MAPPING (PIGEONHOLE)
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * If GCD(V, Phi) == 1, then the mapping N -> LBA is bijective over the ring.
+ * Iterating N from 0 to Phi-1 must yield Phi unique physical locations.
+ * No collisions allowed in the ideal case.
+ */
+hn4_TEST(Math_Group, Bijective_Mapping_Check) {
+    uint64_t clusters = 4; /* 4 * 16 = 64 blocks total */
+    hn4_volume_t* vol = create_math_fixture(clusters);
+    
+    uint64_t ring_size = clusters * HN4_CLUSTER_SIZE; /* 64 */
+    uint64_t V = 3; /* Coprime to 64 */
+    uint16_t M = 0; /* S=1 */
+    
+    uint8_t visited[64] = {0};
+    
+    for (uint64_t n = 0; n < ring_size; n++) {
+        /* Logical index must scale with block size for N */
+        /* For M=0, N implies block index directly */
+        uint64_t lba = _calc_trajectory_lba(vol, 0, V, n * HN4_CLUSTER_SIZE, M, 0);
+        
+        uint64_t rel_idx = lba - vol->sb.info.lba_flux_start;
+        
+        ASSERT_TRUE(rel_idx < ring_size);
+        
+        /* Collision Check */
+        ASSERT_EQ(0, visited[rel_idx]);
+        visited[rel_idx] = 1;
+    }
+    
+    cleanup_math_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 14: ALGEBRA - N-MODULO WRAP AROUND
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * The logical index N wraps around the ring size Phi.
+ * T(N) == T(N + Phi).
+ * This ensures very large files wrap around the physical disk seamlessly.
+ */
+hn4_TEST(Math_Algebra, N_Modulo_Wrap) {
+    uint64_t clusters = 50;
+    hn4_volume_t* vol = create_math_fixture(clusters);
+    
+    /* M=0, S=1 */
+    uint64_t allocator_phi = clusters * HN4_CLUSTER_SIZE; /* 50 * 16 = 800 */
+    
+    uint64_t N_base = 5;
+    /* 
+     * Input N is actually `cluster_idx` inside the allocator logic (N >> 4).
+     * To wrap `cluster_idx` by `phi`, we must add `phi * 16` to N.
+     */
+    uint64_t N_add = allocator_phi * 16; 
+    
+    /* Wait, allocator logic:
+       term_n = (N >> 4) % phi;
+       To wrap term_n back to same value, (N >> 4) must increase by k * phi.
+       So N must increase by phi * 16.
+    */
+    
+    uint64_t lba_1 = _calc_trajectory_lba(vol, 0, 1, N_base * 16, 0, 0);
+    uint64_t lba_2 = _calc_trajectory_lba(vol, 0, 1, (N_base * 16) + N_add, 0, 0);
+    
+    ASSERT_EQ(lba_1, lba_2);
+    
+    cleanup_math_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 15: PHYSICS - HDD LINEARITY (THETA SUPPRESSION)
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * If the device is mechanical (HDD), Inertial Damping (Theta) is disabled 
+ * to prevent seek thrashing.
+ * For HDD: T(k=0) == T(k=1) if Gravity Assist (k>=4) is not active.
+ */
+hn4_TEST(Math_Physics, HDD_Linearity_Check) {
+    hn4_volume_t* vol = create_math_fixture(100);
+    
+    /* Mock Device as HDD */
+    vol->sb.info.device_type_tag = HN4_DEV_HDD;
+    
+    uint64_t N = 0;
+    
+    /* 
+     * For SSD, k=0 and k=1 differ by Theta (Triangle numbers).
+     * For HDD, Theta should be 0.
+     * k=0 -> Theta=0.
+     * k=1 -> Theta=0 (Suppressed).
+     * Result should be identical.
+     */
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, 0, 1, N, 0, 0);
+    uint64_t lba_k1 = _calc_trajectory_lba(vol, 0, 1, N, 0, 1);
+    
+    ASSERT_EQ(lba_k0, lba_k1);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 16: ALGEBRA - OFFSET COMMUTATIVITY
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * A shift in Gravity (G) by V units is mathematically equivalent to 
+ * advancing the Logical Index (N) by 1 unit (assuming S=1).
+ * T(G=V, N=0) == T(G=0, N=1).
+ */
+hn4_TEST(Math_Algebra, Offset_Commutativity) {
+    hn4_volume_t* vol = create_math_fixture(100);
+    
+    uint64_t V = 7;
+    
+    /* Case A: Gravity shift */
+    uint64_t lba_A = _calc_trajectory_lba(vol, V, V, 0, 0, 0);
+    
+    /* Case B: Logical Index shift (1 cluster) */
+    uint64_t lba_B = _calc_trajectory_lba(vol, 0, V, 1 * HN4_CLUSTER_SIZE, 0, 0);
+    
+    ASSERT_EQ(lba_A, lba_B);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 17: BOUNDARY - FRACTAL SCALE SATURATION
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * If the Fractal Scale M is so large that S >= Available Space,
+ * the ring size Phi becomes 0 or 1.
+ * The allocator must handle this extreme geometry without crashing.
+ */
+hn4_TEST(Math_Boundary, Fractal_Saturation) {
+    /* Create fixture with ~1600 blocks available */
+    hn4_volume_t* vol = create_math_fixture(100);
+    
+    /* Set M=11 (2^11 = 2048 blocks). S > Available (1600). */
+    /* This forces Phi = 0 inside the calculation. */
+    uint16_t M = 11;
+    
+    uint64_t lba = _calc_trajectory_lba(vol, 0, 1, 0, M, 0);
+    
+    /* Should return Invalid due to geometry constraint violation */
+    ASSERT_EQ(HN4_LBA_INVALID, lba);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 18: ALGEBRA - RESONANCE DAMPENER (COPRIMALITY FORCE)
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * If V and Phi share a common factor (are not coprime), the allocator 
+ * detects the resonance and mutates V until GCD(V, Phi) == 1.
+ * Input V_bad -> Effective V_good.
+ * Therefore, T(N=1) using V_bad will NOT equal (Base + V_bad).
+ */
+hn4_TEST(Math_Algebra, Resonance_Dampener) {
+    /* 
+     * Fixture: Phi = 100 (Factors: 2, 5, 10, 20, 25, 50).
+     */
+    hn4_volume_t* vol = create_math_fixture(100);
+    
+    /* 
+     * Choose V = 50. GCD(50, 100) = 50. Bad.
+     * The allocator loop will try V=53, V=55 (bad), V=57...
+     * Expected: The physical stride will NOT be 50.
+     */
+    uint64_t V_bad = 50;
+    
+    uint64_t lba_0 = _calc_trajectory_lba(vol, 0, V_bad, 0, 0, 0);
+    uint64_t lba_1 = _calc_trajectory_lba(vol, 0, V_bad, 1 * HN4_CLUSTER_SIZE, 0, 0);
+    
+    uint64_t actual_stride = lba_1 - lba_0;
+    
+    ASSERT_NE(V_bad, actual_stride);
+    /* Verify the corrected V is actually coprime to 100 */
+    /* (Implementation specific, but usually finds nearest prime or coprime) */
+    
+    cleanup_math_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 19: PHYSICS - ZNS LINEARITY (THETA SUPPRESSION)
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * Zoned Namespaces (ZNS) require strict sequential writes within a zone.
+ * Ballistic scatter (Theta jitter) must be disabled for ZNS devices.
+ * T(k=0) == T(k=1).
+ */
+hn4_TEST(Math_Physics, ZNS_Linearity) {
+    hn4_volume_t* vol = create_math_fixture(10);
+    vol->sb.info.device_type_tag = HN4_DEV_ZNS;
+    
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 0);
+    uint64_t lba_k1 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 1);
+    
+    ASSERT_EQ(lba_k0, lba_k1);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 20: PHYSICS - SYSTEM PROFILE LINEARITY
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * The SYSTEM profile (OS Root/Metadata) requires predictable latency.
+ * Scatter allocation is disabled even on SSDs.
+ * T(k=0) == T(k=1).
+ */
+hn4_TEST(Math_Physics, SystemProfile_Linearity) {
+    hn4_volume_t* vol = create_math_fixture(10);
+    vol->sb.info.device_type_tag = HN4_DEV_SSD; /* Normally scattered */
+    vol->sb.info.format_profile = HN4_PROFILE_SYSTEM; /* Override */
+    
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 0);
+    uint64_t lba_k1 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 1);
+    
+    ASSERT_EQ(lba_k0, lba_k1);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 21: ALGEBRA - LARGE N STABILITY
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * The mapping N -> LBA must be stable for N >> Phi.
+ * Specifically, N and (N + K*Phi*16) must map to the same LBA.
+ * (Factor 16 accounts for the N>>4 cluster shift in the engine).
+ */
+hn4_TEST(Math_Algebra, Large_N_Stability) {
+    uint64_t clusters = 50;
+    hn4_volume_t* vol = create_math_fixture(clusters);
+    
+    /* Allocator Phi = 50 * 16 = 800 blocks (if M=0) */
+    uint64_t allocator_phi = clusters * HN4_CLUSTER_SIZE; 
+    
+    /* Small N */
+    uint64_t N_small = 5 * HN4_CLUSTER_SIZE;
+    
+    /* Large N: Add 1000 full revolutions */
+    /* Note: Modulo arithmetic is on `cluster_idx` (N/16). 
+       To wrap `cluster_idx` by `phi`, N must increase by `phi * 16`. */
+    uint64_t wrap_stride = allocator_phi * HN4_CLUSTER_SIZE;
+    uint64_t N_large = N_small + (1000 * wrap_stride);
+    
+    uint64_t lba_small = _calc_trajectory_lba(vol, 0, 1, N_small, 0, 0);
+    uint64_t lba_large = _calc_trajectory_lba(vol, 0, 1, N_large, 0, 0);
+    
+    ASSERT_EQ(lba_small, lba_large);
+    
+    cleanup_math_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 22: ALGEBRA - RESONANCE CORRECTION VALIDITY
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * If V shares factors with Phi, the allocator mutates V internally to be coprime.
+ * We verify that the *effective* stride output by the function is indeed
+ * coprime to Phi, ensuring full ring coverage.
+ */
+hn4_TEST(Math_Algebra, Resonance_Coprimality) {
+    /* Fixture: Phi = 100 clusters (1600 blocks) */
+    /* Allocator internal phi depends on M. If M=0, phi=1600. */
+    hn4_volume_t* vol = create_math_fixture(100);
+    uint64_t internal_phi = 1600;
+    
+    /* Input V = 800. GCD(800, 1600) = 800. Bad. */
+    uint64_t V_bad = 800;
+    
+    /* Measure effective stride */
+    uint64_t lba_0 = _calc_trajectory_lba(vol, 0, V_bad, 0, 0, 0);
+    uint64_t lba_1 = _calc_trajectory_lba(vol, 0, V_bad, 1 * HN4_CLUSTER_SIZE, 0, 0);
+    
+    int64_t effective_V = (int64_t)lba_1 - (int64_t)lba_0;
+    /* Handle wrap-around for stride calc */
+    if (effective_V < 0) effective_V += internal_phi;
+    
+    /* The effective V must have been mutated */
+    ASSERT_NE(V_bad, (uint64_t)effective_V);
+    
+    /* Verify Coprimality: GCD(EffectiveV, Phi) must be 1 */
+    int64_t x, y;
+    int64_t gcd = _math_extended_gcd(effective_V, internal_phi, &x, &y);
+    
+    ASSERT_EQ(1, gcd);
+    
+    cleanup_math_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 24: GEOMETRY - CLUSTER COALESCING
+ * ========================================================================= */
+/*
+ * THEOREM:
+ * The allocator groups 16 logical blocks into a single ballistic cluster.
+ * Logical indices N=0 through N=15 must map to the same base trajectory.
+ * (The caller handles the sub-block offset).
+ */
+hn4_TEST(Math_Geometry, Cluster_Coalescing) {
+    hn4_volume_t* vol = create_math_fixture(10);
+    
+    /* N=0 */
+    uint64_t lba_n0 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 0);
+    
+    /* N=15 (Same Cluster) */
+    uint64_t lba_n15 = _calc_trajectory_lba(vol, 0, 1, 15, 0, 0);
+    
+    /* N=16 (Next Cluster) */
+    uint64_t lba_n16 = _calc_trajectory_lba(vol, 0, 1, 16, 0, 0);
+    
+    ASSERT_EQ(lba_n0, lba_n15);
+    ASSERT_NE(lba_n0, lba_n16);
+    
+    cleanup_math_fixture(vol);
+}

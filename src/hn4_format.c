@@ -444,11 +444,17 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     /*  Careful math order for Virtual Overlays */
     if (params && (params->mount_intent_flags & HN4_MNT_VIRTUAL)) {
 #ifdef HN4_USE_128BIT
+        if (params->override_capacity_bytes.hi > 0) {
+            /* If we are keeping virt_cap as u64 local var, we must error out or upgrade it */
+            /* Assuming we switch local logic to use hn4_u128_t, or error: */
+            HN4_LOG_CRIT("Virtual Capacity > 18EB not supported in this tool version");
+            return HN4_ERR_INVALID_ARGUMENT;
+        }
         virt_cap = params->override_capacity_bytes.lo;
 #else
         virt_cap = params->override_capacity_bytes;
 #endif
-    }
+        }
 
     /* Zone Alignment validation for ZNS */
     if (virt_cap > 0) {
@@ -613,7 +619,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     uint64_t chronicle_sz = HN4_ALIGN_UP(chron_target, bs);
 
     /* Explicit Lower Bound Check before subtraction */
-    uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); // Metadata + Log + Tail
+    uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); 
     
     if (capacity_bytes < min_required) {
         HN4_LOG_ERR("Drive too small for layout. Need %llu bytes.", min_required);
@@ -622,6 +628,8 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
 
     uint64_t chron_end_offset = HN4_ALIGN_DOWN(capacity_bytes - tail_rsv, bs);
     
+    if (chron_end_offset < chronicle_sz) return HN4_ERR_GEOMETRY;
+
     uint64_t chron_start_offset = chron_end_offset - chronicle_sz;
 
     /* Initialize Superblock Chronicle Pointers */

@@ -198,22 +198,23 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
                 break;
 
             case HN4_IO_DISCARD:
+                /* Optional: Check HN4_FLAG_SHRED if memset(0) is required */
                 break;
 
             case HN4_IO_ZONE_RESET:
+                /* Physical Clear */
+                memset(dev->mmio_base + offset, 0, len_bytes);
+                hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
         
-            memset(dev->mmio_base + offset, 0, len_bytes);
-            hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
-    
-            /* Reset the Write Pointer for ZNS Simulation */
-            if (dev->caps.hw_flags & HN4_HW_ZNS_NATIVE) {
-                uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
-                uint64_t lba_raw = hn4_addr_to_u64(req->lba);
-                uint64_t zone_idx = lba_raw / zone_cap_blocks;
-                uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
-                atomic_store(&_zns_zone_ptrs[sim_idx], 0);
-            }
-            break;
+                /* Logical Reset: Reset the Write Pointer for ZNS Simulation */
+                if (dev->caps.hw_flags & HN4_HW_ZNS_NATIVE) {
+                    uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
+                    uint64_t lba_raw_z = hn4_addr_to_u64(req->lba);
+                    uint64_t zone_idx = lba_raw_z / zone_cap_blocks;
+                    uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
+                    atomic_store(&_zns_zone_ptrs[sim_idx], 0);
+                }
+                break;
 
             default:
                 if (cb) cb(req, HN4_ERR_INVALID_ARGUMENT);
@@ -232,8 +233,6 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
 
     if (req->op_code == HN4_IO_ZONE_APPEND) {
         uint64_t lba_raw = hn4_addr_to_u64(req->lba);
-
-        /* Calculate Zone ID based on fixed simulation sizes */
         uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
         uint64_t zone_idx        = lba_raw / zone_cap_blocks;
         uint64_t zone_start_lba  = zone_idx * zone_cap_blocks;
@@ -259,11 +258,23 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
 
         uint64_t final_lba = zone_start_lba + old_offset;
         req->result_lba = hn4_addr_from_u64(final_lba);
-    } else {
+    }  else if (req->op_code == HN4_IO_ZONE_RESET && (dev->caps.hw_flags & HN4_HW_ZNS_NATIVE)) {
+        uint64_t lba_raw = hn4_addr_to_u64(req->lba);
+        uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
+        uint64_t zone_idx = lba_raw / zone_cap_blocks;
+        uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
+        
+        /* Reset the simulated Write Pointer */
+        atomic_store(&_zns_zone_ptrs[sim_idx], 0);
+        req->result_lba = req->lba;
+    }
+    else {
+        /* Standard Read/Write/Flush pass-through */
         req->result_lba = req->lba;
     }
 
     atomic_thread_fence(memory_order_release);
+
     if (cb) cb(req, HN4_OK);
 }
 

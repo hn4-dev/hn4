@@ -1297,7 +1297,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
      */
     root->checksum = 0;
     
-    uint32_t calc_crc = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+    uint32_t calc_crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
     
     root->checksum = hn4_cpu_to_le32(stored_crc); /* Restore */
     
@@ -1341,7 +1341,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     HN4_LOG_WARN("Healing Root Anchor (Genesis Repair)...");
 
-    memset(io_buf, 0, sizeof(alloc_sz));
+    memset(io_buf, 0, alloc_sz);
     root = (hn4_anchor_t*)io_buf;
 
     root->seed_id.lo = 0xFFFFFFFFFFFFFFFFULL;
@@ -1364,11 +1364,10 @@ static hn4_result_t _verify_and_heal_root_anchor(
     strncpy((char*)root->inline_buffer, "ROOT", sizeof(root->inline_buffer)-1);
 
     /* Recalculate CRC (Standard Mode: Header + Inline Buffer) */
-    root->checksum = 0;
-    uint32_t crc = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
-    crc = hn4_crc32(crc, root->inline_buffer, sizeof(root->inline_buffer));
-    
-    root->checksum = hn4_cpu_to_le32(crc);
+        root->checksum = 0;
+        uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
+        
+        root->checksum = hn4_cpu_to_le32(crc);
 
     /* Commit Repair */
     res = hn4_hal_sync_io(dev, HN4_IO_WRITE, cortex_lba, io_buf, sector_count);
@@ -1893,14 +1892,19 @@ hn4_result_t hn4_mount(
      * PHASE 6: L10 RECOVERY (ZERO-SCAN RECONSTRUCTION)
      * Rebuild allocation truth from the Cortex Anchors.
      */
-    res = _reconstruct_cortex_state(dev, vol);
-    if (res != HN4_OK) {
-        if (!force_ro) {
-            HN4_LOG_CRIT("Cortex Reconstruction Failed in RW mode. Aborting.");
-            goto cleanup;
-        } else {
+   if (vol->sb.info.state_flags & (HN4_VOL_DIRTY | HN4_VOL_PANIC | HN4_VOL_DEGRADED)) {
+        HN4_LOG_WARN("Volume Unclean. Initiating Zero-Scan Reconstruction...");
+        res = _reconstruct_cortex_state(dev, vol);
+        
+        if (res != HN4_OK) {
+            if (!force_ro) {
+                HN4_LOG_CRIT("Cortex Reconstruction Failed in RW mode. Aborting.");
+                goto cleanup;
+            }
             HN4_LOG_WARN("Cortex Reconstruction Failed in RO mode. Continuing raw.");
         }
+    } else {
+        HN4_LOG_VAL("Volume Clean. Skipping Zero-Scan.", vol->sb.info.current_epoch_id);
     }
 
     res = _verify_and_heal_root_anchor(dev, vol, force_ro);

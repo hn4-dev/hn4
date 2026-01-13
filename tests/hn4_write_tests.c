@@ -32,6 +32,7 @@
 #define HN4_LBA_INVALID         UINT64_MAX
 #define HN4_CRC_SEED_HEADER 0xFFFFFFFFU
 #define HN4_CRC_SEED_DATA   0x00000000U
+#define HN4_ORBIT_LIMIT         12
 
 /**
  * _get_safe_G
@@ -8296,39 +8297,51 @@ hn4_TEST(SpecCompliance, Verify_Zero_Metadata_IO) {
     hn4_hal_device_t* dev = write_fixture_setup();
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
+    
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
-    uint64_t G = 3000;
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x123;
+    /* 1. Setup Anchor with Explicit Zeroing */
+    hn4_anchor_t anchor;
+    memset(&anchor, 0, sizeof(hn4_anchor_t));
+    
+    hn4_u128_t cpu_id = { .lo = 0x123, .hi = 0x456 };
+    anchor.seed_id = hn4_cpu_to_le128(cpu_id); 
+    
+    /* FIX: Use a safe Gravity Center (100) instead of 1M to avoid OOB on small test disks */
+    uint64_t G = 100; 
     anchor.gravity_center = hn4_cpu_to_le64(G);
+    
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE | HN4_PERM_SOVEREIGN);
     anchor.write_gen = hn4_cpu_to_le32(10);
+    anchor.orbit_vector[0] = 1;
 
-    /* 1. INITIAL SETUP: Write Anchor to Disk */
-    /* Check return value to ensure it actually wrote */
+    /* 2. INITIAL SETUP: Write Anchor to Disk */
     ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    
+    /* Barrier to ensure persistence before scan */
+    hn4_hal_barrier(dev);
 
-    /* 2. VERIFY BASELINE: Read back to confirm it's there */
-    hn4_anchor_t disk_anchor_before = {0};
-    /* Must return OK */
-    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor_before, NULL));
+    /* 3. VERIFY BASELINE: Read back to confirm it's there */
+    hn4_anchor_t disk_anchor_before;
+    memset(&disk_anchor_before, 0, sizeof(disk_anchor_before));
+    
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, cpu_id, &disk_anchor_before, NULL));
     ASSERT_EQ(10, hn4_le32_to_cpu(disk_anchor_before.write_gen));
 
-    /* 3. Perform Write (Should update RAM anchor to Gen 11) */
-    uint8_t buf[16] = "RAM_ONLY";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 8));
+    /* 4. Perform Write (Should update RAM anchor to Gen 11) */
+    uint8_t buf[16] = "RAM_ONLY_TEST";
+    /* Note: This function updates 'anchor' in RAM but does NOT flush it to disk */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 13));
     
-    /* Verify RAM object is updated */
+    /* Verify RAM object was updated */
     ASSERT_EQ(11, hn4_le32_to_cpu(anchor.write_gen));
 
-    /* 4. Verify Disk Content is UNCHANGED (Gen 10) */
-    hn4_anchor_t disk_anchor_after = {0};
-    /* Re-read from disk */
-    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor_after, NULL));
+    /* 5. Verify Disk Content is UNCHANGED (Gen 10) */
+    hn4_anchor_t disk_anchor_after;
+    memset(&disk_anchor_after, 0, sizeof(disk_anchor_after));
     
-    /* SUCCESS CONDITION: Disk still says 10 */
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, cpu_id, &disk_anchor_after, NULL));
     ASSERT_EQ(10, hn4_le32_to_cpu(disk_anchor_after.write_gen));
 
     hn4_unmount(vol);
@@ -8348,51 +8361,66 @@ hn4_TEST(SpecCompliance, Horizon_Fallback_Ram_Only_Update) {
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
-    uint64_t G_initial = 4000;
+    /* FIX: Use safe G */
+    uint64_t G_initial = 100;
     
-    /* 1. Clog D1 */
+    uint64_t V = 1;
+    uint16_t M = 0;
+
+    /* 1. Clog D1 (Fill all 13 ballistic orbits 0..12) */
     bool c;
-    for(int k=0; k<=12; k++) {
-        _bitmap_op(vol, _calc_trajectory_lba(vol, G_initial, 0, 0, 0, k), BIT_SET, &c);
+    for(int k=0; k <= 12; k++) {
+        uint64_t target_lba = _calc_trajectory_lba(vol, G_initial, V, 0, M, k);
+        if (target_lba != HN4_LBA_INVALID) {
+            _bitmap_op(vol, target_lba, BIT_SET, &c);
+        }
     }
 
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x123;
+    hn4_anchor_t anchor;
+    memset(&anchor, 0, sizeof(hn4_anchor_t));
+    
+    hn4_u128_t cpu_id = { .lo = 0x999, .hi = 0x888 };
+    
+    anchor.seed_id = hn4_cpu_to_le128(cpu_id);
     anchor.gravity_center = hn4_cpu_to_le64(G_initial);
     anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_SOVEREIGN);
     anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.orbit_vector[0] = 1; 
+    anchor.fractal_scale = hn4_cpu_to_le16(0);
 
-    /* Write Initial Anchor to Disk & Verify */
+    /* Write Initial Anchor */
     ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    hn4_hal_barrier(dev);
     
     /* Verify Baseline */
     hn4_anchor_t temp;
-    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &temp, NULL));
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, cpu_id, &temp, NULL));
     ASSERT_EQ(G_initial, hn4_le64_to_cpu(temp.gravity_center));
 
-    /* 2. Perform Write (Triggers Horizon) */
-    uint8_t buf[16] = "FALLBACK";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 8));
+    /* 2. Perform Write (Forces Horizon Fallback due to clog) */
+    uint8_t buf[16] = "FALLBACK_TEST";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 13));
 
-    /* 3. Verify RAM State: G should have changed */
+    /* 3. Verify RAM State: G should have changed to Horizon LBA */
     uint64_t G_ram = hn4_le64_to_cpu(anchor.gravity_center);
     ASSERT_NE(G_initial, G_ram);
 
-    /* 4. Verify Disk State: G should be UNCHANGED (Old G) */
-    hn4_anchor_t disk_anchor = {0};
-    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor, NULL));
+    /* 4. Verify Disk State: G should be UNCHANGED */
+    hn4_anchor_t disk_anchor;
+    memset(&disk_anchor, 0, sizeof(disk_anchor));
+    
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, cpu_id, &disk_anchor, NULL));
     uint64_t G_disk = hn4_le64_to_cpu(disk_anchor.gravity_center);
     
     ASSERT_EQ(G_initial, G_disk);
 
-    /* 5. Verify Dirty Flag Set */
+    /* 5. Verify Dirty Flag */
     ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
 
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
-
 
 /* 
  * TEST 3: Write_Dirty_Flag_Propagation

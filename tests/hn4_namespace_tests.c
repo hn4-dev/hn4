@@ -106,12 +106,18 @@ static void ns_teardown(hn4_hal_device_t* dev) {
     hn4_hal_mem_free(dev);
 }
 
-/* Helper to write anchor to specific slot index using standard IO */
+/* 
+ * FIX: Updated local writer to include FULL STRUCTURE in CRC calculation.
+ * This ensures test data is compatible with the hardened production reader logic
+ * (which now includes 'orbit_hints' and matches the fixed hn4_anchor.c).
+ */
 static void _local_write_anchor(hn4_hal_device_t* dev, hn4_superblock_t* sb, uint64_t slot_idx, hn4_anchor_t* anchor) {
-    /* Calc CRC */
+    /* 1. Explicitly zero checksum field */
     anchor->checksum = 0;
-    uint32_t c = hn4_crc32(0, anchor, offsetof(hn4_anchor_t, checksum));
-    c = hn4_crc32(c, anchor->inline_buffer, sizeof(anchor->inline_buffer));
+    
+    /* 2. Hash the ENTIRE 128-byte structure (Fixing the gap) */
+    uint32_t c = hn4_crc32(0, anchor, sizeof(hn4_anchor_t));
+    
     anchor->checksum = hn4_cpu_to_le32(c);
 
     uint64_t start = hn4_addr_to_u64(sb->info.lba_cortex_start);
@@ -136,11 +142,13 @@ hn4_TEST(Namespace, Hash_Pipeline_End_To_End) {
     vol.target_device = dev;
     hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
 
+    /* Construct ID: lo=0xCAFEBABE, hi=0xDEADBEEF */
     hn4_u128_t id = { .lo = 0xCAFEBABE, .hi = 0xDEADBEEF };
     
-    /* 1. Calculate Expected Slot using Spec Logic */
+    /* 1. Calculate Expected Slot using Spec Logic (Same as driver) */
     uint64_t h = _local_hash_uuid(id);
     
+    /* Calculate Total Slots in Cortex (Start=256, End=512, SS=512) */
     uint64_t cortex_sectors = (512 - 256);
     uint64_t cortex_bytes = cortex_sectors * NS_SECTOR_SIZE;
     uint64_t total_slots = cortex_bytes / sizeof(hn4_anchor_t);
@@ -148,20 +156,23 @@ hn4_TEST(Namespace, Hash_Pipeline_End_To_End) {
     
     /* 2. Plant Anchor at Expected Slot */
     hn4_anchor_t anchor = {0};
-    anchor.seed_id = id;
+    /* Ensure the on-disk ID matches the CPU ID used for hashing */
+    anchor.seed_id = hn4_cpu_to_le128(id);
     anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
     
     _local_write_anchor(dev, &vol.sb, expected_slot, &anchor);
     
     /* 3. Ask Driver to Resolve ID */
+    /* id: <HI><LO> in hex */
     hn4_anchor_t out;
     const char* id_str = "id:00000000DEADBEEF00000000CAFEBABE";
     
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_str, &out));
-    ASSERT_EQ(0xCAFEBABE, out.seed_id.lo);
+    ASSERT_EQ(0xCAFEBABE, hn4_le64_to_cpu(out.seed_id.lo));
 
     ns_teardown(dev);
 }
+
 
 /* TEST 2: URI Grammar - Tag Grouping (Spec 7) */
 hn4_TEST(Namespace, URI_Tag_Grouping_And_Pure_Tag_Query) {
@@ -365,18 +376,17 @@ hn4_TEST(Namespace, Anchor_Identity_and_Name_Lookup) {
     vol.target_device = dev;
     hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
 
+    hn4_u128_t cpu_id = { .lo = 0xCAFEBABE, .hi = 0xDEADBEEF };
+
     hn4_anchor_t a = {0};
-    a.seed_id.lo = 0xCAFEBABE;
-    a.seed_id.hi = 0xDEADBEEF;
+    a.seed_id = hn4_cpu_to_le128(cpu_id);
     a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
     strncpy((char*)a.inline_buffer, "config.sys", 20);
     
-    /* FIX: Calculate correct slot based on ID hash so resolver finds it */
-    uint64_t h = _local_hash_uuid(a.seed_id);
-    /* 256 sectors cortex size -> 128KB -> 1024 slots */
-    /* Cortex Start 256, End 512. Bytes = 256*512 = 131072. Slots = 131072/128 = 1024. */
-    uint64_t total_slots = (256 * NS_SECTOR_SIZE) / sizeof(hn4_anchor_t);
-    uint64_t slot = h % total_slots;
+    /* FIX: Calculate correct slot for ID lookup */
+    uint64_t h = _local_hash_uuid(cpu_id);
+    uint64_t slots = (256 * NS_SECTOR_SIZE) / sizeof(hn4_anchor_t);
+    uint64_t slot = h % slots;
 
     _local_write_anchor(dev, &vol.sb, slot, &a);
 
@@ -384,7 +394,7 @@ hn4_TEST(Namespace, Anchor_Identity_and_Name_Lookup) {
 
     /* TEST A: Resolve by Name (Resonance Scan finds it anywhere) */
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, "config.sys", &out));
-    ASSERT_EQ(0xCAFEBABE, out.seed_id.lo);
+    ASSERT_EQ(0xCAFEBABE, hn4_le64_to_cpu(out.seed_id.lo));
 
     /* TEST B: Resolve by Identity ID (Requires correct slot placement) */
     const char* id_uri = "id:00000000DEADBEEF00000000CAFEBABE";
@@ -403,12 +413,6 @@ hn4_TEST(Namespace, Human_Semantic_Workflow) {
     hn4_volume_t vol = {0};
     vol.target_device = dev;
     hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
-
-    /* 
-     * Scenario: User organizes files by Project and Year.
-     * File 1: /Projects/Titan/specs.pdf (Tagged: "Titan", "2024")
-     * File 2: /Projects/Zeus/memo.txt   (Tagged: "Zeus", "2024")
-     */
 
     /* Setup File 1 */
     hn4_anchor_t a1 = {0};
@@ -459,25 +463,15 @@ hn4_TEST(Namespace, AI_Topology_Tunnel_Check) {
 
     /* Mock Topology: GPU 0 -> LBA Range [10000, 20000] */
     vol.topo_count = 1;
-    vol.topo_map = calloc(1, sizeof(void*) * 4); /* Mock struct size */
-    /* 
-     * Direct struct access requires definition visibility. 
-     * If struct is opaque, we rely on allocator behavior.
-     * Assuming internal testing context where struct _hn4_topo_entry_t is visible.
-     */
-    typedef struct { uint32_t id; uint32_t w; uint64_t s; uint64_t l; } mock_topo_t;
-    mock_topo_t* t = (mock_topo_t*)vol.topo_map;
-    t->id = 0; t->w = 0; t->s = 10000 * 8; t->l = 10000 * 8; /* Sector units */
+    vol.topo_map = calloc(1, 64); /* Mock struct size */
+    
+    /* Assume opaque structure */
+    uint64_t* t = (uint64_t*)vol.topo_map;
+    t[0] = 0; /* ID 0 */
+    t[1] = 20000; /* Start LBA */
+    t[2] = 10000; /* Length */
 
-    /* Simulate GPU Context */
-    /* Note: Requires HAL SIM support enabled in build */
-    // hn4_hal_sim_set_gpu_context(0); 
-
-    /* 
-     * Verify Namespace resolution for "model.bin" returns an anchor.
-     * In a full integration test, we would check if hn4_alloc placed data in the tunnel.
-     * Here, we verify the Namespace correctly resolves a pre-existing "Matrix" file.
-     */
+    /* Verify Namespace resolution for "model.bin" returns an anchor */
     hn4_anchor_t a = {0};
     a.seed_id.lo = 9000;
     a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC | HN4_HINT_HORIZON); /* Matrix Type */
@@ -491,7 +485,6 @@ hn4_TEST(Namespace, AI_Topology_Tunnel_Check) {
     uint64_t dc = hn4_le64_to_cpu(out.data_class);
     ASSERT_TRUE((dc & HN4_HINT_HORIZON) != 0);
 
-    /* Cleanup */
     free(vol.topo_map);
     ns_teardown(dev);
 }
@@ -500,7 +493,6 @@ hn4_TEST(Namespace, AI_Topology_Tunnel_Check) {
  * 4. PERMISSIONS (WORM & APPEND)
  * ========================================================================= */
 
-/* Note: Permissions are enforced by hn4_write, but verified via Anchor inspection here */
 hn4_TEST(Namespace, Permission_Flags_Check) {
     hn4_hal_device_t* dev = ns_setup();
     hn4_volume_t vol = {0};
@@ -522,10 +514,6 @@ hn4_TEST(Namespace, Permission_Flags_Check) {
     ASSERT_TRUE((p & HN4_PERM_IMMUTABLE) != 0);
     ASSERT_FALSE((p & HN4_PERM_WRITE) != 0);
 
-    /* Mock Write Check (Logic that would happen in hn4_write) */
-    hn4_result_t write_check = (p & HN4_PERM_IMMUTABLE) ? HN4_ERR_IMMUTABLE : HN4_OK;
-    ASSERT_EQ(HN4_ERR_IMMUTABLE, write_check);
-
     ns_teardown(dev);
 }
 
@@ -540,13 +528,10 @@ hn4_TEST(Namespace, Fallopian_Tube_Tensor_Mapping) {
 
     /* 2. Mock Topology */
     vol.topo_count = 1;
-    /* Use sufficiently large buffer for mock struct */
     vol.topo_map = calloc(1, 64); 
     
-    /* Access opaque pointer via cast to match implementation expectation */
-    /* Assuming driver uses struct { id, weight, start, len } */
     uint64_t* t = (uint64_t*)vol.topo_map;
-    t[0] = 0; /* ID 0, Weight 0 (packed) */
+    t[0] = 0; /* ID 0 */
     t[1] = 20000; /* Start LBA */
     t[2] = 10000; /* Length */
 
@@ -722,10 +707,14 @@ hn4_TEST(Namespace, Resonance_Generation_Arbitration) {
 
 hn4_TEST(Namespace, URI_Grammar_Suite) {
     hn4_hal_device_t* dev = ns_setup();
-    hn4_volume_t vol = {0}; vol.target_device = dev;
+    hn4_volume_t vol = {0};
+    vol.target_device = dev;
     hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
 
-    hn4_anchor_t a = {0}; a.seed_id.lo = 100;
+    hn4_u128_t cpu_id = { .lo = 100, .hi = 0 };
+
+    hn4_anchor_t a = {0}; 
+    a.seed_id = hn4_cpu_to_le128(cpu_id);
     a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
     strncpy((char*)a.inline_buffer, "file.txt", 20);
     
@@ -734,7 +723,7 @@ hn4_TEST(Namespace, URI_Grammar_Suite) {
     a.tag_filter = hn4_cpu_to_le64(tm);
     
     /* FIX: Write to Correct Hash Slot for ID Lookup */
-    uint64_t h = _local_hash_uuid(a.seed_id);
+    uint64_t h = _local_hash_uuid(cpu_id);
     uint64_t total_slots = (256 * NS_SECTOR_SIZE) / sizeof(hn4_anchor_t);
     _local_write_anchor(dev, &vol.sb, h % total_slots, &a);
 
@@ -744,12 +733,12 @@ hn4_TEST(Namespace, URI_Grammar_Suite) {
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, "/tag:Finance+2024/file.txt", &out));
 
     /* id:<hex> (Correct slot placement allows this to pass) */
+    /* 100 decimal = 0x64 hex */
     const char* id_uri = "id:00000000000000000000000000000064"; 
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_uri, &out));
 
     ns_teardown(dev);
 }
-
 
 
 /* =========================================================================
@@ -884,17 +873,23 @@ hn4_TEST(Namespace, Geometry_Law_Extension_Ptrs) {
 
 hn4_TEST(Namespace, Law_Identity_Primary) {
     hn4_hal_device_t* dev = ns_setup();
-    hn4_volume_t vol = {0}; vol.target_device = dev;
+    hn4_volume_t vol = {0};
+    vol.target_device = dev;
     hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
 
-    hn4_anchor_t a = {0}; a.seed_id.lo = 555; /* 0x22B */
+    hn4_u128_t cpu_id = { .lo = 555, .hi = 0 }; /* 555 = 0x22B */
+
+    hn4_anchor_t a = {0}; 
+    a.seed_id = hn4_cpu_to_le128(cpu_id);
     a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
     strncpy((char*)a.inline_buffer, "name_A", 20);
     
     /* FIX: Calculate correct slot for ID lookup */
-    uint64_t h = _local_hash_uuid(a.seed_id);
+    uint64_t h = _local_hash_uuid(cpu_id);
     uint64_t slots = (256 * NS_SECTOR_SIZE) / sizeof(hn4_anchor_t);
-    _local_write_anchor(dev, &vol.sb, h % slots, &a);
+    uint64_t slot = h % slots;
+
+    _local_write_anchor(dev, &vol.sb, slot, &a);
 
     hn4_anchor_t out;
     /* ID lookup works */
@@ -903,7 +898,7 @@ hn4_TEST(Namespace, Law_Identity_Primary) {
 
     /* Simulate Rename: Update Anchor in place */
     strncpy((char*)a.inline_buffer, "name_B", 20);
-    _local_write_anchor(dev, &vol.sb, h % slots, &a);
+    _local_write_anchor(dev, &vol.sb, slot, &a);
 
     /* ID lookup STILL works and sees new name */
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_uri, &out));

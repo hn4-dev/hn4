@@ -254,8 +254,8 @@ hn4_result_t _ns_scan_cortex_slot(
             uint32_t stored_crc = hn4_le32_to_cpu(temp.checksum);
             
             temp.checksum = 0;
-            uint32_t calc_crc = hn4_crc32(0, &temp, offsetof(hn4_anchor_t, checksum));
-            calc_crc = hn4_crc32(calc_crc, temp.inline_buffer, sizeof(temp.inline_buffer));
+
+            uint32_t calc_crc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
 
             if (stored_crc == calc_crc) {
                 uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
@@ -486,14 +486,13 @@ static hn4_result_t _ns_resonance_scan(
 
             if (name_match) {
                 /* Verify CRC */
-                hn4_anchor_t temp;
+                 hn4_anchor_t temp;
                 memcpy(&temp, cand, sizeof(hn4_anchor_t));
                 
                 uint32_t stored = hn4_le32_to_cpu(temp.checksum);
                 temp.checksum = 0;
                 
-                uint32_t calc = hn4_crc32(0, &temp, offsetof(hn4_anchor_t, checksum));
-                calc = hn4_crc32(calc, temp.inline_buffer, sizeof(temp.inline_buffer));
+                uint32_t calc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
                 
                 if (stored == calc) {
                     uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
@@ -668,7 +667,7 @@ hn4_result_t hn4_ns_gather_tensor_shards(
                 uint32_t stored = hn4_le32_to_cpu(temp.checksum);
                 temp.checksum = 0;
                 
-                uint32_t calc = hn4_crc32(0, &temp, offsetof(hn4_anchor_t, checksum));
+                 uint32_t calc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
                 calc = hn4_crc32(calc, temp.inline_buffer, sizeof(temp.inline_buffer));
                 
                 if (stored == calc) {

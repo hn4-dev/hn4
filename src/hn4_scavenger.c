@@ -413,7 +413,7 @@ static hn4_result_t _reap_tombstone(
             #ifdef HN4_USE_128BIT
                 hn4_u128_t f_blk = hn4_u128_from_u64(found_lba);
                 hn4_addr_t p_sec = hn4_u128_mul_u64(f_blk, sectors_per_blk);
-                _reaper_add(vol, batch, hn4_addr_to_u64(p_sec)); 
+                _reaper_add(vol, batch, p_sec); 
             #else
                 _reaper_add(vol, batch, found_lba * sectors_per_blk);
             #endif

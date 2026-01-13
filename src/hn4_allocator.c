@@ -420,16 +420,23 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
     
     uint64_t used = atomic_load_explicit(&vol->used_blocks, memory_order_acquire);
-    
-    uint64_t cap_bytes_val;
-#ifdef HN4_USE_128BIT
-    if (vol->vol_capacity_bytes.hi > 0) cap_bytes_val = UINT64_MAX; 
-    else cap_bytes_val = vol->vol_capacity_bytes.lo;
-#else
-    cap_bytes_val = vol->vol_capacity_bytes;
-#endif
+    uint64_t cap_blocks;
 
-    uint64_t cap_blocks = cap_bytes_val / vol->vol_block_size;
+#ifdef HN4_USE_128BIT
+    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
+    
+    /* We can safely divide by block_size (u32/u64) */
+    hn4_u128_t blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
+    
+    /* 
+     * Even 1000 Exabytes in 4KB blocks fits in uint64_t.
+     * (1e21 bytes / 4096 = 2.4e17 blocks. UINT64_MAX = 1.8e19).
+     * Safe to downcast result.
+     */
+    cap_blocks = blocks_128.lo; 
+#else
+    cap_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+#endif
     if (cap_blocks == 0) return true;
 
     /* Calculate Absolute Thresholds */
@@ -698,7 +705,8 @@ hn4_result_t _bitmap_op(
         
         if (HN4_UNLIKELY(ss > 4096)) return HN4_ERR_NOMEM;
 
-        uint8_t sector_buf[4096]; 
+         void* sector_buf = hn4_hal_mem_alloc(4096);
+        if (!sector_buf) return HN4_ERR_NOMEM;
         
         /* Coordinate Calculation */
         uint64_t word_idx      = block_idx / 64;
@@ -711,13 +719,17 @@ hn4_result_t _bitmap_op(
         hn4_result_t res = HN4_OK;
 
         /* 
-         * CRITICAL SECTION (PICO)
          * Serialize access via the L2 lock to prevent RMW races.
          */
         hn4_hal_spinlock_acquire(&vol->l2_lock);
 
-        /* 1. READ: Fetch the sector containing the target word */
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, sector_buf, 1) != HN4_OK) {
+        uint32_t sectors_to_io = 1;
+        if ((offset_in_sec + sizeof(hn4_armored_word_t)) > ss) {
+            sectors_to_io = 2;
+        }
+
+        /* 1. READ: Fetch the sector(s) containing the target word */
+        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, sector_buf, sectors_to_io) != HN4_OK) {
             res = HN4_ERR_HW_IO;
             goto pico_cleanup;
         }
@@ -784,6 +796,7 @@ hn4_result_t _bitmap_op(
         if (op != BIT_TEST && out_result) *out_result = report_change;
 
     pico_cleanup:
+        if (sector_buf) hn4_hal_mem_free(sector_buf);
         hn4_hal_spinlock_release(&vol->l2_lock);
         return res;
     }
@@ -810,8 +823,8 @@ hn4_result_t _bitmap_op(
     /* 2. Atomic Loop State */
     hn4_aligned_u128_t  expected, desired;
     bool success = false;
-    bool logic_change = false;       /* Did the logical bit state change? */
-    bool heal_event_pending = false; /* Did we fix an ECC error? */
+    bool logic_change = false;      
+    bool heal_event_pending = false;
 
     /* Initial Load (Atomic) */
     expected = _hn4_load128(target_addr);
@@ -940,23 +953,18 @@ hn4_result_t _bitmap_op(
         else *out_result = logic_change; /* Logic change is true for mutation */
     }
 
-    /* Side Effects (Counters, L2, Dirty Flags) 
-       Only update L2/Counters if LOGICAL state changed, not just ECC repair */
-    bool actual_mutation = (desired.lo != expected.lo) && /* Value changed */
-                           (op != BIT_TEST) &&            /* Not a read */
-                           !heal_event_pending;           /* Not just healing? No, healing + mutation is mutation. */
-                           
-    /* Simple check using the final known values from the successful CAS loop */
-    bool bit_was_set = ((expected.lo & bit_mask) != 0); // Using raw load? No, use safe_data logic?
-    /* expected.lo might be corrupt. We rely on 'op' logic path. */
+     bool commit_side_effects = (logic_change && op != BIT_TEST) || 
+                               (heal_event_pending && !vol->read_only);
 
-    if (logic_change && op != BIT_TEST) {
-        /* GHOST BIT PROTECTION */
+    if (commit_side_effects) {
+        /* GHOST BIT PROTECTION & HEALING PERSISTENCE */
         if (op != BIT_FORCE_CLEAR && !vol->in_eviction_path) {
             atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_seq_cst);
         }
 
-        _update_counters_and_l2(vol, block_idx, (op == BIT_SET));
+        if (op != BIT_TEST) { 
+            _update_counters_and_l2(vol, block_idx, (op == BIT_SET));
+        }
         
         atomic_thread_fence(memory_order_seq_cst);
     }
@@ -1028,6 +1036,8 @@ _alloc_cortex_run(
     } else {
         scan_size = 65536; /* 64KB Batch */
     }
+
+    if (scan_size < sector_size) scan_size = sector_size;
 
     void* io_buffer = hn4_hal_mem_alloc(scan_size);
     if (!io_buffer) return HN4_ERR_NOMEM;
@@ -1603,7 +1613,10 @@ _calc_trajectory_lba(
      * Enforce Coprimality: If Phi has changed (Resize), V might share factors.
      * This destroys injectivity. If not coprime, fallback to Linear (V=1).
      */
-   uint64_t term_n = N % phi;
+    uint64_t cluster_idx = N >> 4;
+    uint64_t sub_offset  = N & 0xF;
+
+    uint64_t term_n = cluster_idx % phi;
     uint64_t term_v = effective_V % phi;
     
     /* RESONANCE DAMPENER (Prevent Prime Collapse) */
@@ -2156,10 +2169,12 @@ hn4_alloc_genesis(
 
     /* Attempt allocation in the Linear Log (Horizon) */
     uint64_t hlba;
-    hn4_result_t h_res = hn4_alloc_horizon(vol, &hlba);
+    hn4_addr_t hlba_addr;
+    
+    hn4_result_t h_res = hn4_alloc_horizon(vol, &hlba_addr);
     
     if (h_res == HN4_OK) {
-        *out_G = hlba;
+        *out_G = hn4_addr_to_u64(hlba_addr);
         *out_V = 0; /* V=0 indicates Linear Mode */
         
         /* Signal caller to apply Sentinel Flag (k=15) */
@@ -2211,7 +2226,7 @@ hn4_alloc_genesis(
  */
 _Check_return_ hn4_result_t hn4_alloc_horizon(
     HN4_INOUT hn4_volume_t* vol,
-    HN4_OUT hn4_addr_t* out_phys_lba /* FIX: Use abstract type */
+    HN4_OUT hn4_addr_t* out_phys_lba
 )
 {
     /* 

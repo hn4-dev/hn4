@@ -390,7 +390,9 @@ typedef struct HN4_PACKED {
     /* 0x60 */
     uint32_t    checksum;           /* Root CRC32C */
     /* 0x64 */
-    uint8_t     inline_buffer[28];  /* Filename or Tiny Data (Section 8.5) */
+    uint32_t    orbit_hints;        /* 2-bit hints for first 16 clusters */
+    /* 0x64 */
+    uint8_t     inline_buffer[24];  /* Filename or Tiny Data (Section 8.5) */
 } hn4_anchor_t;
 
 /* 9.3 Tether Structure - Access Control */
@@ -586,7 +588,7 @@ typedef struct {
     void*               target_device;
 
     /* Cached Geometry */
-    uint64_t            vol_capacity_bytes;
+    hn4_size_t          vol_capacity_bytes;
     uint32_t            vol_block_size;
 
     /* Superblock State & Offsets */

@@ -165,11 +165,10 @@ hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superbloc
     root->checksum = 0;
     
     /* CRC Head (0x00 to 0x5F) */
-    uint32_t crc = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+    root->checksum = 0;
     
-    /* CRC Tail (0x64 to 0x7F - inline_buffer) */
-    /* Chain: pass previous result as seed */
-    crc = hn4_crc32(crc, root->inline_buffer, sizeof(root->inline_buffer));
+    /* Hash the ENTIRE 128 bytes (includes orbit_hints and inline_buffer) */
+    uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
     
     root->checksum = hn4_cpu_to_le32(crc);
 
@@ -213,10 +212,7 @@ hn4_result_t hn4_write_anchor_atomic(
     anchor->checksum = 0;
     
     /* CRC Head (0x00 to 0x5F) */
-    uint32_t crc = hn4_crc32(0, anchor, offsetof(hn4_anchor_t, checksum));
-    
-    /* CRC Tail (Inline Buffer) - Chained */
-    crc = hn4_crc32(crc, anchor->inline_buffer, sizeof(anchor->inline_buffer));
+    uint32_t crc = hn4_crc32(0, anchor, sizeof(hn4_anchor_t));
     
     anchor->checksum = hn4_cpu_to_le32(crc);
 

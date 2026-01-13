@@ -401,30 +401,51 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
      */
     if (old_lba != HN4_LBA_INVALID && len < payload_cap) {
         void* thaw_buf = hn4_hal_mem_alloc(bs);
-        if (thaw_buf) {
-            hn4_addr_t old_phys = hn4_lba_from_blocks(old_lba * sectors);
-            
-            /* 1. Read Old Block */
-            if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, old_phys, thaw_buf, sectors) == HN4_OK) {
-                hn4_block_header_t* old_hdr = (hn4_block_header_t*)thaw_buf;
-                hn4_block_header_t* new_hdr_view = (hn4_block_header_t*)io_buf;
-
-                if (hn4_le32_to_cpu(old_hdr->magic) == HN4_BLOCK_MAGIC) {
-                    uint32_t meta = hn4_le32_to_cpu(old_hdr->comp_meta);
-                    uint8_t algo  = meta & HN4_COMP_ALGO_MASK;
-                    uint32_t csz  = meta >> HN4_COMP_SIZE_SHIFT;
-                    
-                    /* 2. Decompress/Copy Old Data into New Buffer */
-                    if (algo == HN4_COMP_TCC) {
-                         uint32_t out_sz = 0;
-                         hn4_decompress_block(old_hdr->payload, csz, new_hdr_view->payload, payload_cap, &out_sz);
-                    } else {
-                         memcpy(new_hdr_view->payload, old_hdr->payload, payload_cap);
-                    }
-                }
-            }
-            hn4_hal_mem_free(thaw_buf);
+        
+        if (!thaw_buf) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: Thaw alloc failed. Aborting to prevent data loss.");
+            hn4_hal_mem_free(io_buf); /* Clean up the main buffer before return */
+            return HN4_ERR_NOMEM;
         }
+
+        hn4_addr_t old_phys = hn4_lba_from_blocks(old_lba * sectors);
+        
+        hn4_result_t r_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, old_phys, thaw_buf, sectors);
+        if (r_res != HN4_OK) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: Thaw read failed. Aborting.");
+            hn4_hal_mem_free(thaw_buf);
+            hn4_hal_mem_free(io_buf);
+            return r_res;
+        }
+
+        hn4_block_header_t* old_hdr = (hn4_block_header_t*)thaw_buf;
+        hn4_block_header_t* new_hdr_view = (hn4_block_header_t*)io_buf;
+
+        if (hn4_le32_to_cpu(old_hdr->magic) != HN4_BLOCK_MAGIC) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: Thaw source corrupt (Phantom Block). Aborting.");
+            hn4_hal_mem_free(thaw_buf);
+            hn4_hal_mem_free(io_buf);
+            return HN4_ERR_PHANTOM_BLOCK;
+        }
+
+        uint32_t meta = hn4_le32_to_cpu(old_hdr->comp_meta);
+        uint8_t algo  = meta & HN4_COMP_ALGO_MASK;
+        uint32_t csz  = meta >> HN4_COMP_SIZE_SHIFT;
+        
+        if (algo == HN4_COMP_TCC) {
+             uint32_t out_sz = 0;
+             hn4_result_t d_res = hn4_decompress_block(old_hdr->payload, csz, new_hdr_view->payload, payload_cap, &out_sz);
+             
+             if (d_res != HN4_OK) {
+                 hn4_hal_mem_free(thaw_buf);
+                 hn4_hal_mem_free(io_buf);
+                 return HN4_ERR_DECOMPRESS_FAIL;
+             }
+        } else {
+             memcpy(new_hdr_view->payload, old_hdr->payload, payload_cap);
+        }
+
+        hn4_hal_mem_free(thaw_buf);
     }
 
     /* 4. Prepare Payload (With Compression Logic) */
@@ -704,43 +725,13 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
 
     /* OPTIMIZATION: ZNS ZONE APPEND (Spec 13.2) */
     if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) {
-
         /* 1. Calculate Zone Start LBA */
         uint32_t zone_bytes   = caps->zone_size_bytes;
         uint64_t zone_sectors = zone_bytes / ss;
         uint64_t raw_lba      = hn4_addr_to_u64(phys_sector);
         uint64_t zone_start   = (raw_lba / zone_sectors) * zone_sectors;
 
-        /* 2. Manual Async Submission */
-        hn4_io_req_t req = {0};
-        req.op_code = HN4_IO_ZONE_APPEND;
-        req.lba     = hn4_addr_from_u64(zone_start); /* Send to Zone Handle */
-        req.buffer  = io_buf;
-        req.length  = sectors;
-
-        /* Initialize context */
-        _zns_write_ctx_t ctx = { .done = false, .res = HN4_OK };
-        req.user_ctx = &ctx;
-
-        /* Pass the static function pointer */
-        hn4_hal_submit_io(vol->target_device, &req, _zns_append_callback);
-
-        /*
-         * TIMEOUT WATCHDOG:
-         * Prevent infinite spin if HAL/Device wedges.
-         */
-       if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) {
-
-        /* 1. Calculate Zone Start LBA */
-        uint32_t zone_bytes   = caps->zone_size_bytes;
-        uint64_t zone_sectors = zone_bytes / ss;
-        uint64_t raw_lba      = hn4_addr_to_u64(phys_sector);
-        uint64_t zone_start   = (raw_lba / zone_sectors) * zone_sectors;
-
-        /* 
-         * 2. CLEAN HAL CALL
-         * Replaces manual struct definition, callback, and polling loop.
-         */
+        /* 2. CLEAN HAL CALL */
         io_res = hn4_hal_zns_append_sync(
             vol->target_device,
             hn4_addr_from_u64(zone_start),
@@ -763,7 +754,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
                 hn4_hal_mem_free(io_buf);
                 return HN4_ERR_GEOMETRY;
             }
-        }}
+        }
     } else {
 
         uint32_t retry_sleep = 1000; /* Default 1ms */
