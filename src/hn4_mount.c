@@ -1279,7 +1279,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     HN4_LOG_WARN("Healing Root Anchor (Genesis Repair)...");
 
-    memset(io_buf, 0, alloc_sz);
+    memset(io_buf, 0, sizeof(hn4_anchor_t));
     root = (hn4_anchor_t*)io_buf;
 
     root->seed_id.lo = 0xFFFFFFFFFFFFFFFFULL;
@@ -1301,9 +1301,11 @@ static hn4_result_t _verify_and_heal_root_anchor(
     
     strncpy((char*)root->inline_buffer, "ROOT", sizeof(root->inline_buffer)-1);
 
-    /* Recalculate CRC (Strict Mode: No Inline Buffer) */
+    /* Recalculate CRC (Standard Mode: Header + Inline Buffer) */
     root->checksum = 0;
     uint32_t crc = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+    crc = hn4_crc32(crc, root->inline_buffer, sizeof(root->inline_buffer));
+    
     root->checksum = hn4_cpu_to_le32(crc);
 
     /* Commit Repair */
@@ -1384,10 +1386,12 @@ static hn4_result_t _reconstruct_cortex_state(
     /* 3. Linear Read (The fastest op an SSD can perform) */
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, cortex_sectors);
     if (res != HN4_OK) {
+      if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
         hn4_hal_mem_free(vol->nano_cortex);
         vol->nano_cortex = NULL;
-        return res;
-    }
+    } 
+    return HN4_OK;
+  }
 
     /* 4. Sequence Verification & Trajectory Re-Projection */
     uint32_t anchor_count = cortex_bytes / sizeof(hn4_anchor_t);
@@ -1565,6 +1569,9 @@ hn4_result_t hn4_mount(
 
     /* Initialize System L2 Lock */
     hn4_hal_spinlock_init(&vol->l2_lock);
+
+     /* Initialize Medic Priority Queue Lock */
+    hn4_hal_spinlock_init(&vol->medic_queue.lock);
 
     if (params && (params->mount_flags & HN4_MNT_READ_ONLY)) force_ro = true;
 

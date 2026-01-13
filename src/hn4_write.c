@@ -828,20 +828,29 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     }
 
     /* 9. Metadata Update */
-
-    /*
-     * CPU Ordering Barrier.
-     * Ensure Data Write and Barrier are globally visible before publishing Generation.
-     */
     atomic_thread_fence(memory_order_release);
 
-    anchor->write_gen = hn4_cpu_to_le32((uint32_t)next_gen);
-    anchor->mod_clock = hn4_cpu_to_le64(hn4_hal_get_time_ns());
+    uint32_t old_gen_le = anchor->write_gen;
+    while (!atomic_compare_exchange_weak(
+        (_Atomic uint32_t*)&anchor->write_gen, 
+        &old_gen_le, 
+        hn4_cpu_to_le32((uint32_t)next_gen)));
 
-    uint64_t old_mass = hn4_le64_to_cpu(anchor->mass);
+    uint64_t now_le = hn4_cpu_to_le64(hn4_hal_get_time_ns());
+    atomic_store((_Atomic uint64_t*)&anchor->mod_clock, now_le);
+
     uint64_t end_byte = (block_idx * payload_cap) + len;
-    if (end_byte > old_mass) {
-        anchor->mass = hn4_cpu_to_le64(end_byte);
+    uint64_t curr_mass_le = atomic_load((_Atomic uint64_t*)&anchor->mass);
+    
+    while (1) {
+        uint64_t curr_mass_cpu = hn4_le64_to_cpu(curr_mass_le);
+        if (end_byte <= curr_mass_cpu) break;
+        
+        uint64_t new_mass_le = hn4_cpu_to_le64(end_byte);
+        if (atomic_compare_exchange_weak(
+            (_Atomic uint64_t*)&anchor->mass, 
+            &curr_mass_le, 
+            new_mass_le)) break;
     }
 
     /* 10. THE ECLIPSE (Atomic Discard of Old LBA) */

@@ -196,7 +196,7 @@ static hn4_result_t _ns_scan_cortex_slot(
     uint64_t hash       = _ns_hash_uuid(target_seed);
     uint64_t start_slot = hash % total_slots;
 
-    uint32_t io_sz = (ss > sizeof(hn4_anchor_t) * 2) ? ss : sizeof(hn4_anchor_t) * 2;
+    uint32_t io_sz = ss * 2;
     void*    buf   = hn4_hal_mem_alloc(io_sz);
     
     if (!buf) return HN4_ERR_NOMEM;
@@ -217,6 +217,11 @@ static hn4_result_t _ns_scan_cortex_slot(
         
         hn4_addr_t read_lba     = hn4_addr_add(vol->sb.info.lba_cortex_start, sector_off);
         uint32_t   read_sectors = (byte_in_sec + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
+
+         if (read_sectors * ss > io_sz) { 
+            hn4_hal_mem_free(buf);
+            return HN4_ERR_INTERNAL_FAULT;
+        }
 
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, read_lba, buf, read_sectors) != HN4_OK) {
             continue; 
@@ -578,6 +583,113 @@ static uint64_t _ns_parse_time_slice(const char* s)
 
     /* Convert Days to Nanoseconds */
     return days * 86400ULL * 1000000000ULL;
+}
+
+/* =========================================================================
+ * TENSOR RESONANCE (SHARD GATHERING)
+ * ========================================================================= */
+
+/**
+ * hn4_ns_gather_tensor_shards
+ * 
+ * Scans the Cortex for all Anchors resonating with the specified Model Tag.
+ * Used to mount distributed tensor shards in a single operation.
+ * 
+ * @param vol           Volume context.
+ * @param model_tag     String identifier (e.g., "model:gpt4-70b").
+ * @param out_shards    Array to populate with found Anchors.
+ * @param max_count     Capacity of out_shards array.
+ * @param out_found     Number of shards actually found.
+ */
+hn4_result_t hn4_ns_gather_tensor_shards(
+    HN4_IN  hn4_volume_t* vol,
+    HN4_IN  const char*   model_tag,
+    HN4_OUT hn4_anchor_t* out_shards,
+    HN4_IN  uint32_t      max_count,
+    HN4_OUT uint32_t*     out_found
+)
+{
+    if (!vol || !model_tag || !out_shards || !out_found) return HN4_ERR_INVALID_ARGUMENT;
+
+    /* 1. Generate Bloom Filter Mask for the Model ID */
+    /* Implements Spec 5.1: Maps string to 3 bit positions */
+    uint64_t required_mask = _ns_generate_tag_mask(model_tag, strlen(model_tag));
+
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+    
+    /* 2. Setup Linear Scan of Cortex */
+    uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
+    uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
+    uint64_t sectors_left = end_sect - start_sect;
+    
+    hn4_addr_t current_lba = vol->sb.info.lba_cortex_start;
+    
+    /* Batch IO setup (64KB chunks) */
+    uint32_t batch_bytes = 64 * 1024;
+    if (batch_bytes % ss != 0) batch_bytes = (batch_bytes / ss + 1) * ss;
+    
+    void* buf = hn4_hal_mem_alloc(batch_bytes);
+    if (!buf) return HN4_ERR_NOMEM;
+    uint32_t sectors_per_batch = batch_bytes / ss;
+
+    uint32_t found_count = 0;
+
+    /* 3. The Resonance Loop */
+    while (sectors_left > 0 && found_count < max_count) {
+        uint32_t io_sectors = (sectors_left > sectors_per_batch) ? sectors_per_batch : (uint32_t)sectors_left;
+        
+        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, current_lba, buf, io_sectors) != HN4_OK) {
+            /* If read fails, skip this batch and continue (Best Effort) */
+            goto advance; 
+        }
+
+        uint8_t* ptr = (uint8_t*)buf;
+        uint8_t* end = ptr + (io_sectors * ss);
+        
+        while (ptr + sizeof(hn4_anchor_t) <= end && found_count < max_count) {
+            hn4_anchor_t* cand = (hn4_anchor_t*)ptr;
+            ptr += sizeof(hn4_anchor_t);
+
+            /* A. Validity Check */
+            uint64_t dclass = hn4_le64_to_cpu(cand->data_class);
+            if (!(dclass & HN4_FLAG_VALID)) continue;
+            if (dclass & HN4_FLAG_TOMBSTONE) continue;
+
+            /* B. Resonance Check (Bloom Filter) */
+            /* Does this anchor belong to the requested Model ID? */
+            uint64_t anchor_tags = hn4_le64_to_cpu(cand->tag_filter);
+            
+            if ((anchor_tags & required_mask) == required_mask) {
+                
+                /* C. Integrity Check */
+                hn4_anchor_t temp;
+                memcpy(&temp, cand, sizeof(hn4_anchor_t));
+                uint32_t stored = hn4_le32_to_cpu(temp.checksum);
+                temp.checksum = 0;
+                
+                uint32_t calc = hn4_crc32(0, &temp, offsetof(hn4_anchor_t, checksum));
+                calc = hn4_crc32(calc, temp.inline_buffer, sizeof(temp.inline_buffer));
+                
+                if (stored == calc) {
+                    /* D. Collect Shard */
+                    memcpy(&out_shards[found_count], &temp, sizeof(hn4_anchor_t));
+                    found_count++;
+                }
+            }
+        }
+
+    advance:
+        sectors_left -= io_sectors;
+        current_lba = hn4_addr_add(current_lba, io_sectors);
+    }
+
+    hn4_hal_mem_free(buf);
+    
+    *out_found = found_count;
+    
+    /* Return OK if we found at least one shard, NOT_FOUND otherwise */
+    return (found_count > 0) ? HN4_OK : HN4_ERR_NOT_FOUND;
 }
 
 

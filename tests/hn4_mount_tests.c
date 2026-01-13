@@ -2096,7 +2096,8 @@ hn4_TEST(Recovery, RootAnchor_BadCRC_Heal) {
     /* Recalc expected */
     uint32_t stored_sum = hn4_le32_to_cpu(root->checksum);
     root->checksum = 0;
-    uint32_t calc_sum = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+     uint32_t calc_sum = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+    calc_sum = hn4_crc32(calc_sum, root->inline_buffer, sizeof(root->inline_buffer));
     
     ASSERT_EQ(calc_sum, stored_sum);
     
