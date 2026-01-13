@@ -6222,78 +6222,6 @@ hn4_TEST(FixVerification, Write_Confirm_Horizon_LBA_Unit_Math) {
 }
 
 /* 
- * TEST 5: Write_Confirm_Anchor_Persisted_In_Horizon
- * Objective: Verify Fix 2 (Horizon Persistence).
- *            The Horizon path MUST persist the Anchor change (Gravity Update)
- *            immediately, otherwise the data is unreachable after remount.
- */
-hn4_TEST(FixVerification, Write_Confirm_Anchor_Persisted_In_Horizon) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* 1. Force Horizon */
-    uint64_t G = 9000;
-    bool changed;
-    for(int k=0; k<=12; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, 0, 0, 0, k);
-        _bitmap_op(vol, lba, BIT_SET, &changed);
-    }
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x123;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    /* 2. Write Data */
-    uint8_t buf[16] = "PERSISTED";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 9));
-
-    /* Capture new G */
-    uint64_t new_G = hn4_le64_to_cpu(anchor.gravity_center);
-    ASSERT_NE(G, new_G);
-
-    /* 3. Verify Persistence: 
-       Normally, write_block does NOT persist anchor. 
-       BUT Horizon fallback MUST call hn4_write_anchor_atomic.
-       To verify this, we inspect the Disk (mock buffer) for the Anchor update. */
-    
-    uint64_t ctx_start = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
-    uint32_t spb = vol->vol_block_size / 512;
-    
-    /* We need to find where this anchor lives. 
-       Since we didn't use hn4_alloc_nano or standard creation, 
-       it's an in-memory struct.
-       However, hn4_write_anchor_atomic will hash the ID and write it to Cortex.
-       We check if *something* was written there. */
-    
-    /* Hash ID to find slot */
-    hn4_u128_t seed = hn4_le128_to_cpu(anchor.seed_id);
-    uint64_t hash = seed.lo ^ seed.hi;
-    uint64_t cortex_bytes = (hn4_addr_to_u64(vol->sb.info.lba_bitmap_start) - ctx_start) * 512;
-    uint64_t slots = cortex_bytes / sizeof(hn4_anchor_t);
-    uint64_t slot = hash % slots;
-    
-    uint64_t anchor_lba = ctx_start + ((slot * sizeof(hn4_anchor_t)) / 512);
-    
-    uint8_t raw_sect[512];
-    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_sectors(anchor_lba), raw_sect, 1);
-    
-    /* Check if the Anchor on disk has the NEW Gravity Center */
-    /* Note: We need to find the specific anchor in the sector (might be multiple) */
-    hn4_anchor_t* disk_anchors = (hn4_anchor_t*)raw_sect;
-    uint32_t idx_in_sect = (slot * sizeof(hn4_anchor_t)) % 512 / sizeof(hn4_anchor_t);
-    
-    ASSERT_EQ(new_G, hn4_le64_to_cpu(disk_anchors[idx_in_sect].gravity_center));
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
  * TEST: ZNS_Permission_Append_Only_Logic
  * Objective: Verify HN4_PERM_APPEND works correctly under ZNS constraints.
  *            1. Mock device as ZNS Native.
@@ -8768,6 +8696,266 @@ hn4_TEST(Thaw, Defer_Refreeze_Optimization) {
     ASSERT_EQ(HN4_COMP_NONE, meta2 & HN4_COMP_ALGO_MASK);
 
     free(data); free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+/* 
+ * TEST 1: Write_Horizon_Fallback_Logic
+ * Objective: Verify the fix in `hn4_write_block_atomic` where the Horizon path 
+ *            was using incorrect types.
+ *            We force a Horizon fallback by clogging D1 and ensure the write succeeds
+ *            and data is readable.
+ */
+hn4_TEST(FixVerification, Write_Horizon_Fallback_Logic) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Setup Anchor */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x1234;
+    anchor.gravity_center = hn4_cpu_to_le64(1000); /* G=1000 */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 2. Clog D1 (Flux) completely to force Horizon */
+    bool changed;
+    for (int k = 0; k <= 12; k++) {
+        uint64_t lba = _calc_trajectory_lba(vol, 1000, 0, 0, 0, k);
+        _bitmap_op(vol, lba, BIT_SET, &changed);
+    }
+
+    /* 3. Perform Write */
+    uint8_t buf[16] = "HORIZON_DATA";
+    /* This hits the fixed code path in hn4_write_block_atomic */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 13));
+
+    /* 4. Verify Horizon Flag Set */
+    uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
+    ASSERT_TRUE(dclass & HN4_HINT_HORIZON);
+
+    /* 5. Verify Read (Ensures address math was correct) */
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "HORIZON_DATA"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/* 
+ * TEST 4: Horizon_Physical_Address_Calc
+ * Objective: Verify that the physical address calculation for Horizon blocks
+ *            uses the correct block-based math (fixed logic) and not raw sectors.
+ *            This ensures the `h_val / sectors` logic in the fix is exercised.
+ */
+hn4_TEST(FixVerification, Horizon_Physical_Address_Calc) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Force Horizon Fallback */
+    uint64_t G = 4000;
+    bool c;
+    for(int k=0; k<=12; k++) {
+        _bitmap_op(vol, _calc_trajectory_lba(vol, G, 0, 0, 0, k), BIT_SET, &c);
+    }
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x1234;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+
+    uint8_t buf[16] = "MATH_VERIFY";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 12));
+
+    /* 
+     * 2. Calculate Expected Horizon Location.
+     * The fix relies on `horizon_phys_addr` being converted to `h_val` (u64).
+     * If this conversion or the subsequent division was wrong, the data would 
+     * end up in the wrong place or the bitmap would be wrong.
+     */
+    
+    /* Horizon Start (Block Index) */
+    uint64_t h_start_sec = hn4_addr_to_u64(vol->sb.info.lba_horizon_start);
+    uint32_t spb = vol->vol_block_size / 512;
+    uint64_t h_start_blk = h_start_sec / spb;
+
+    /* The write should have claimed a block starting near h_start_blk. */
+    /* Check bitmap at h_start_blk */
+    bool is_set;
+    _bitmap_op(vol, h_start_blk, BIT_TEST, &is_set);
+    
+    /* 
+     * Note: Depending on previous tests or init, h_start_blk might be 0-offset.
+     * But it should definitely be SET now.
+     */
+    ASSERT_TRUE(is_set);
+
+    /* Verify Data Integrity via Read */
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "MATH_VERIFY"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/* 
+ * TEST 1: Write_Verify_Zero_Metadata_IO
+ * Objective: Verify that a standard atomic write does NOT trigger an immediate
+ *            Anchor write to the Cortex region. The Anchor update must be RAM-only.
+ *            We infer this by checking that the Cortex region on "disk" remains unchanged
+ *            immediately after the write call returns.
+ */
+hn4_TEST(SpecCompliance, Verify_Zero_Metadata_IO) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 3000;
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(10);
+
+    /* 1. INITIAL SETUP: Write Anchor to Disk */
+    /* Check return value to ensure it actually wrote */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+
+    /* 2. VERIFY BASELINE: Read back to confirm it's there */
+    hn4_anchor_t disk_anchor_before = {0};
+    /* Must return OK */
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor_before, NULL));
+    ASSERT_EQ(10, hn4_le32_to_cpu(disk_anchor_before.write_gen));
+
+    /* 3. Perform Write (Should update RAM anchor to Gen 11) */
+    uint8_t buf[16] = "RAM_ONLY";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 8));
+    
+    /* Verify RAM object is updated */
+    ASSERT_EQ(11, hn4_le32_to_cpu(anchor.write_gen));
+
+    /* 4. Verify Disk Content is UNCHANGED (Gen 10) */
+    hn4_anchor_t disk_anchor_after = {0};
+    /* Re-read from disk */
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor_after, NULL));
+    
+    /* SUCCESS CONDITION: Disk still says 10 */
+    ASSERT_EQ(10, hn4_le32_to_cpu(disk_anchor_after.write_gen));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+/* 
+ * TEST 2: Write_Horizon_Fallback_Ram_Only_Update
+ * Objective: Verify that when D1 saturates and the system falls back to Horizon,
+ *            the Gravity Center (G) update happens in RAM only, and the
+ *            volume is marked DIRTY to ensure eventual flush.
+ */
+hn4_TEST(SpecCompliance, Horizon_Fallback_Ram_Only_Update) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G_initial = 4000;
+    
+    /* 1. Clog D1 */
+    bool c;
+    for(int k=0; k<=12; k++) {
+        _bitmap_op(vol, _calc_trajectory_lba(vol, G_initial, 0, 0, 0, k), BIT_SET, &c);
+    }
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G_initial);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* Write Initial Anchor to Disk & Verify */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    
+    /* Verify Baseline */
+    hn4_anchor_t temp;
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &temp, NULL));
+    ASSERT_EQ(G_initial, hn4_le64_to_cpu(temp.gravity_center));
+
+    /* 2. Perform Write (Triggers Horizon) */
+    uint8_t buf[16] = "FALLBACK";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 8));
+
+    /* 3. Verify RAM State: G should have changed */
+    uint64_t G_ram = hn4_le64_to_cpu(anchor.gravity_center);
+    ASSERT_NE(G_initial, G_ram);
+
+    /* 4. Verify Disk State: G should be UNCHANGED (Old G) */
+    hn4_anchor_t disk_anchor = {0};
+    ASSERT_EQ(HN4_OK, _ns_scan_cortex_slot(vol, anchor.seed_id, &disk_anchor, NULL));
+    uint64_t G_disk = hn4_le64_to_cpu(disk_anchor.gravity_center);
+    
+    ASSERT_EQ(G_initial, G_disk);
+
+    /* 5. Verify Dirty Flag Set */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+/* 
+ * TEST 3: Write_Dirty_Flag_Propagation
+ * Objective: Verify that ANY successful atomic write sets the HN4_VOL_DIRTY flag
+ *            in the in-memory Superblock. This is the signal for the Scavenger/Epoch
+ *            syncer to persist changes later.
+ */
+hn4_TEST(SpecCompliance, Write_Sets_Dirty_Flag) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Ensure Clean Start */
+    /* Manually clear dirty flag in RAM to be sure */
+    atomic_fetch_and(&vol->sb.info.state_flags, ~HN4_VOL_DIRTY);
+    ASSERT_FALSE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.gravity_center = hn4_cpu_to_le64(5000);
+
+    /* 2. Perform Write */
+    uint8_t buf[16] = "DIRTY_TEST";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10));
+
+    /* 3. Verify Flag Logic */
+    /* 
+     * The Eclipse logic (clearing old bitmap bit) calls _bitmap_op.
+     * _bitmap_op sets HN4_VOL_DIRTY on any mutation.
+     * Even if no Eclipse happens (first write), the allocation logic 
+     * or metadata update trigger should mark it dirty.
+     * 
+     * Note: hn4_write_block_atomic itself might not explicitly set DIRTY 
+     * unless it hits the Horizon path (checked in previous test).
+     * However, the allocation/bitmap ops it calls MUST set it.
+     */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
+
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }

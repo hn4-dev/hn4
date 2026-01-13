@@ -148,7 +148,6 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
     
-    /* STEALTH MODE: Yield if device is busy to avoid impacting foreground IO */
     if (caps->queue_count > 1) { 
         hn4_hal_micro_sleep(100); 
     }
@@ -157,13 +156,8 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
     uint32_t sectors_per_blk = batch->block_size / ss;
     void* zero_buf = NULL;
 
-    /* 
-     * Resource Prep for Secure Shredding 
-     * If shredding is required, we need a zero-filled buffer.
-     */
     if (batch->secure_shred) {
         zero_buf = hn4_hal_mem_alloc(batch->block_size);
-        /* If OOM, we fall back to DISCARD (Best effort security vs System Crash) */
         if (zero_buf) {
             _secure_zero(zero_buf, batch->block_size);
         } else {
@@ -173,10 +167,10 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
 
     /* --- PHASE 1: PHYSICAL SANITIZATION (The Hardware Commit) --- */
     for (uint32_t i = 0; i < batch->count; i++) {
-        hn4_addr_t phys = hn4_lba_from_sectors(batch->lbas[i]);
+        hn4_addr_t phys = batch->lbas[i];
         
         if (batch->secure_shred && zero_buf) {
-            /* Overwrite with Zeros (Cryptographic Erase equivalent step 1) */
+            /* Overwrite with Zeros */
             hn4_hal_sync_io(dev, HN4_IO_WRITE, phys, zero_buf, sectors_per_blk);
         } else {
             /* Standard Trim/Unmap */
@@ -192,13 +186,13 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
         hn4_free_block(vol, batch->lbas[i]);
     }
 
-    /* Cleanup */
     if (zero_buf) hn4_hal_mem_free(zero_buf);
     batch->count = 0;
 }
 
 
-static void _reaper_add(hn4_volume_t* vol, _reaper_batch_t* batch, uint64_t phys_sector_lba) {
+
+static void _reaper_add(hn4_volume_t* vol, _reaper_batch_t* batch, hn4_addr_t phys_sector_lba) {
     /*
      * PICO Profile Exception:
      * Embedded devices often lack RAM for batching or threading. 
@@ -278,8 +272,53 @@ static hn4_result_t _reap_tombstone(
     /* 
      * 5. ATOMIC DESTRUCTION (The Commit)
      */
-    _secure_zero(anchor, sizeof(hn4_anchor_t));
-    hn4_result_t res = hn4_write_anchor_atomic(vol, anchor);
+
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+
+    uintptr_t base_addr = (uintptr_t)vol->nano_cortex;
+    uintptr_t curr_addr = (uintptr_t)anchor;
+    
+    if (curr_addr < base_addr || curr_addr >= base_addr + vol->cortex_size) {
+        hn4_hal_mem_free(vbuf);
+        return HN4_ERR_INTERNAL_FAULT;
+    }
+
+    uint64_t offset_bytes = (uint64_t)(curr_addr - base_addr);
+    
+    /* Calculate physical LBA for the sector containing this anchor */
+    hn4_addr_t write_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, offset_bytes / ss);
+    uint32_t offset_in_sector = offset_bytes % ss;
+
+    /* 
+     * Read-Modify-Write the sector to zero out ONLY this anchor.
+     * We cannot use hn4_write_anchor_atomic because we are zeroing the ID,
+     * which would hash to the wrong slot if we used the standard API.
+     */
+    void* sector_buf = hn4_hal_mem_alloc(ss);
+    if (!sector_buf) {
+        hn4_hal_mem_free(vbuf);
+        return HN4_ERR_NOMEM;
+    }
+
+    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, sector_buf, 1) != HN4_OK) {
+        hn4_hal_mem_free(vbuf);
+        hn4_hal_mem_free(sector_buf);
+        return HN4_ERR_HW_IO;
+    }
+
+    /* Zero the anchor in the sector buffer */
+    memset((uint8_t*)sector_buf + offset_in_sector, 0, sizeof(hn4_anchor_t));
+
+    /* Commit to disk */
+    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, sector_buf, 1);
+    
+    /* Zero the anchor in RAM immediately to reflect disk state */
+    if (res == HN4_OK) {
+        _secure_zero(anchor, sizeof(hn4_anchor_t));
+    }
+
+    hn4_hal_mem_free(sector_buf);
 
     /* If writing the zero-anchor failed, we abort. The file remains "Deleted-but-visible". */
     if (res != HN4_OK) {
@@ -306,8 +345,6 @@ static hn4_result_t _reap_tombstone(
     } 
     
     /* Standard / Horizon Object Handling */
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size;
     uint32_t sectors_per_blk = bs / ss;
     uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
     
@@ -376,7 +413,7 @@ static hn4_result_t _reap_tombstone(
             #ifdef HN4_USE_128BIT
                 hn4_u128_t f_blk = hn4_u128_from_u64(found_lba);
                 hn4_addr_t p_sec = hn4_u128_mul_u64(f_blk, sectors_per_blk);
-                _reaper_add(vol, batch, p_sec); 
+                _reaper_add(vol, batch, hn4_addr_to_u64(p_sec)); 
             #else
                 _reaper_add(vol, batch, found_lba * sectors_per_blk);
             #endif
@@ -386,7 +423,6 @@ static hn4_result_t _reap_tombstone(
     hn4_hal_mem_free(vbuf);
     return HN4_OK;
 }
-
 
 
 /* =========================================================================
@@ -920,7 +956,6 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
     if (res == HN4_OK) {
         hn4_write_anchor_atomic(vol, &upgraded_anchor);
         
-        /* FIX: Free the old Horizon block */
         if (hn4_addr_to_u64(old_phys_lba) != 0) {
             hn4_free_block(vol, hn4_addr_to_u64(old_phys_lba));
         }

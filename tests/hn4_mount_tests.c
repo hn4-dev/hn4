@@ -6098,3 +6098,68 @@ hn4_TEST(Recovery, SB_Mirror_Healing) {
     destroy_fixture(dev);
 }
 
+
+/* 
+ * Test 200: Consensus - Verify Stack Buffer Overflow Fix (Probe Array)
+ * Scenario: Standard clean mount. 
+ * Logic: The bug in `_execute_cardinal_vote` overwrites the `probe_sizes` array terminator
+ *        if a valid North SB is found. This causes the loop to read stack garbage.
+ *        If fixed, the array has a double terminator {..., 0, 0}, ensuring the loop ends.
+ *        A crash or OOM error here indicates the fix is missing.
+ * Expected: HN4_OK.
+ */
+hn4_TEST(Consensus, Probe_Array_Terminator_Safety) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    /* 
+     * If the stack overflow bug is present, this call will likely crash,
+     * infinitely loop, or return HN4_ERR_NOMEM/HW_IO due to reading 
+     * garbage block sizes from the stack.
+     */
+    hn4_result_t res = hn4_mount(dev, &p, &vol);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 201: Consensus - Clean/Dirty Split-Brain (Fix Verification)
+ * Scenario: North SB is Clean (Gen 100). East SB is Dirty (Gen 100).
+ * Logic: This represents an interrupted unmount (Power loss after North update).
+ *        Bugged behavior: Returns HN4_ERR_TAMPERED (Bricks volume).
+ *        Fixed behavior: Downgrades to HN4_VOL_DIRTY and allows mount.
+ * Expected: HN4_OK, Volume State is DIRTY.
+ */
+hn4_TEST(Consensus, SplitBrain_CleanDirty_Merge) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    /* 1. Setup North: Clean, Gen 100 */
+    sb.info.copy_generation = 100;
+    sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
+    write_sb(dev, &sb, 0);
+
+    /* 2. Setup East: Dirty, Gen 100 */
+    sb.info.state_flags = HN4_VOL_DIRTY | HN4_VOL_METADATA_ZEROED;
+    write_mirror_sb(dev, &sb, 1);
+
+    /* 3. Attempt Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+
+    /* Verify Fix: Should verify OK, not TAMPERED */
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Verify Logic: State must be forced to DIRTY to trigger recovery */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
+    ASSERT_FALSE(vol->sb.info.state_flags & HN4_VOL_CLEAN);
+
+    if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}

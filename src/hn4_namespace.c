@@ -176,7 +176,7 @@ static bool _ns_verify_extension_ptr(hn4_volume_t* vol, uint64_t lba)
  * 1. Generation Awareness: Finds highest 'write_gen' if duplicates/tombstones exist.
  * 2. Load Factor Safety: Stops probing on 'Empty Slot' to prevent O(N) loops.
  */
-static hn4_result_t _ns_scan_cortex_slot(
+hn4_result_t _ns_scan_cortex_slot(
     HN4_IN  hn4_volume_t* vol,
     HN4_IN  hn4_u128_t target_seed,
     HN4_OUT hn4_anchor_t* out_anchor,

@@ -75,45 +75,50 @@ static inline hn4_result_t _epoch_phys_map(
     uint64_t block_idx,
     uint32_t block_size,
     uint32_t sector_size,
-    hn4_size_t vol_cap_bytes, /* CHANGED TYPE */
+    hn4_size_t vol_cap_bytes,
     hn4_addr_t* out_lba,
     uint32_t* out_sector_count
 ) {
     if (block_size == 0 || sector_size == 0) return HN4_ERR_GEOMETRY;
 
-    /* 
-     * 128-bit Capacity Check
-     * We need to verify if (block_idx * block_size) < vol_cap_bytes
-     * Since block_idx is u64 (internal logic limitation?), we check bounds.
-     */
+    uint64_t sectors_per_block = block_size / sector_size;
 
 #ifdef HN4_USE_128BIT
-    /* Check bounds: if block_idx > (cap / bs) */
-    /* Simplified check: construct 128-bit offset and compare */
-    hn4_u128_t offset;
-    /* We don't have 64x64=128 multiply helper shown yet, 
-       but we can do a rough check or add a helper.
-       Assuming block_idx fits in 64-bit (Ring Pointer), we verify: */
-       
-    // Approximation:
-    hn4_u128_t cap_blocks = vol_cap_bytes; 
-    (void)vol_cap_bytes; // Bypass strict check for this snippet or implement u128 div.
+    /* 
+     * 1. 128-bit Capacity Check
+     * Verify: (block_idx * block_size) < vol_cap_bytes
+     */
+    hn4_u128_t blk_128 = hn4_u128_from_u64(block_idx);
+    
+    /* Calculate byte offset of the block start */
+    hn4_u128_t byte_offset = hn4_u128_mul_u64(blk_128, block_size);
+    
+    /* Strict bound check */
+    if (hn4_u128_cmp(byte_offset, vol_cap_bytes) >= 0) {
+        return HN4_ERR_GEOMETRY;
+    }
+
+    *out_lba = hn4_u128_mul_u64(blk_128, sectors_per_block);
+
 #else
-    /* Use ceiling division to allow access to partial blocks at volume end */
-    uint64_t total_blocks = (vol_cap_bytes + block_size - 1) / block_size;
-    if (block_idx >= total_blocks) return HN4_ERR_GEOMETRY;
+    /* 
+     * Standard 64-bit Logic 
+     */
+    
+    /* Overflow check for byte calculation */
+    if (block_idx > (UINT64_MAX / block_size)) return HN4_ERR_GEOMETRY;
+    
+    uint64_t byte_offset = block_idx * block_size;
+    
+    /* Capacity check */
+    if (byte_offset >= vol_cap_bytes) return HN4_ERR_GEOMETRY;
+
+    /* Overflow check for sector calculation */
+    if (block_idx > (UINT64_MAX / sectors_per_block)) return HN4_ERR_GEOMETRY;
+
+    *out_lba = block_idx * sectors_per_block;
 #endif
 
-    /* LBA Calculation */
-    uint64_t sectors_per_block = block_size / sector_size;
-    
-    /* Use 128-bit construction for output LBA to prevent truncation */
-    uint64_t final_sector_lo = block_idx * sectors_per_block;
-    
-    /* Check for u64 overflow in multiplication if block_idx is huge? */
-    /* For now, assume block_idx fits. */
-
-    *out_lba = hn4_addr_from_u64(final_sector_lo);
     *out_sector_count = (uint32_t)sectors_per_block;
     
     return HN4_OK;

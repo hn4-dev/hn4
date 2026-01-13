@@ -246,10 +246,14 @@ hn4_result_t hn4_write_anchor_atomic(
 
     /* Hash the ID */
     hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
-    /* Simple XOR fold hash for reference implementation */
-    uint64_t hash = seed.lo ^ seed.hi; 
     
-    uint64_t slot_idx = hash % total_slots;
+    uint64_t h = seed.lo ^ seed.hi;
+    
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL; /* HN4_NS_HASH_CONST */
+    h ^= (h >> 33);
+    
+    uint64_t slot_idx = h % total_slots;
     
     /* Calculate Physical Sector LBA */
     uint64_t byte_offset = slot_idx * sizeof(hn4_anchor_t);

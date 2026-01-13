@@ -144,7 +144,13 @@ hn4_result_t hn4_chronicle_append(
      */
     hn4_addr_t start = vol->sb.info.journal_start;
     hn4_addr_t head  = vol->sb.info.journal_ptr;
-    hn4_addr_t end   = vol->sb.info.lba_horizon_start;
+    hn4_addr_t end;
+#ifdef HN4_USE_128BIT
+    /* Convert bytes to sectors */
+    end = hn4_u128_div_u64(vol->sb.info.total_capacity, ss);
+#else
+    end = vol->sb.info.total_capacity / ss;
+#endif
 
     /* 
      * 128-bit Safe Bounds Check 
@@ -334,7 +340,13 @@ hn4_result_t hn4_chronicle_verify_integrity(
 
     /* Use abstract types, do not downcast to u64 */
     hn4_addr_t start = vol->sb.info.journal_start;
-    hn4_addr_t end   = vol->sb.info.lba_horizon_start;
+    
+    hn4_addr_t end;
+#ifdef HN4_USE_128BIT
+    end = hn4_u128_div_u64(vol->sb.info.total_capacity, ss);
+#else
+    end = vol->sb.info.total_capacity / ss;
+#endif
 
     /* 
      * HEALING LOOP

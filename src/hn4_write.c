@@ -614,30 +614,31 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
         if (alloc_res == HN4_ERR_GRAVITY_COLLAPSE) {
             HN4_LOG_CRIT("WRITE_ATOMIC: D1 Full. Trying Horizon...");
 
-            uint64_t horizon_phys_sector = HN4_LBA_INVALID;
-            alloc_res = hn4_alloc_horizon(vol, &horizon_phys_sector);
+            hn4_addr_t horizon_phys_addr = hn4_addr_from_u64(HN4_LBA_INVALID);
+            
+            alloc_res = hn4_alloc_horizon(vol, &horizon_phys_addr);
 
             if (alloc_res == HN4_OK) {
+                uint64_t h_val = hn4_addr_to_u64(horizon_phys_addr);
+
                 /*
                  * Alignment Assertion.
                  * The Horizon Allocator must return a sector aligned to the Block boundary.
                  */
-                if (horizon_phys_sector % sectors != 0) {
+                if (h_val % sectors != 0) {
                     HN4_LOG_CRIT("WRITE_ATOMIC: Horizon Misalignment (Sect %llu %% %u != 0)",
-                                 (unsigned long long)horizon_phys_sector, sectors);
+                                 (unsigned long long)h_val, sectors);
 
                     /*
                      * Release reservation.
                      * CONTRACT: hn4_free_block expects Physical Sector LBA.
-                     * horizon_phys_sector is already in sectors.
                      */
-                    uint64_t lba_to_free = horizon_phys_sector;
-                    hn4_free_block(vol, lba_to_free);
+                    hn4_free_block(vol, h_val);
 
                     alloc_res = HN4_ERR_ALIGNMENT_FAIL;
                 } else {
                     /* Immediate Unit Conversion */
-                    target_lba = horizon_phys_sector / sectors; // Convert Sector -> Block Index
+                    target_lba = h_val / sectors; // Convert Sector -> Block Index
 
                     uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
                     dclass |= HN4_HINT_HORIZON;
@@ -650,19 +651,17 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
                     /* Use the normalized Block Index for math */
                     if (target_lba >= offset) {
                         uint64_t linear_start = target_lba - offset;
-                        anchor->gravity_center = hn4_cpu_to_le64(linear_start);
-
-                        /*
-                         * Check Result & Rollback.
-                         * If we fail to persist the new Gravity Center, we must release
-                         * the Horizon block we just claimed.
+                        
+                        /* 
+                         * SPEC COMPLIANCE (6.3): Zero Metadata Modification on Disk.
+                         * We update the Anchor Gravity Center in RAM immediately.
+                         * Persistence is handled asynchronously by Epoch Sync or Unmount.
                          */
-                        hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, anchor);
+                        anchor->gravity_center = hn4_cpu_to_le64(linear_start);
+                        
+                        /* Mark volume dirty to ensure eventual metadata flush */
+                        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
 
-                        if (anchor_res != HN4_OK) {
-                            hn4_free_block(vol, horizon_phys_sector);
-                            alloc_res = anchor_res;
-                        }
                     } else {
                         alloc_res = HN4_ERR_GEOMETRY;
                     }
@@ -730,30 +729,17 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
 
         if (io_res == HN4_OK) {
             /* 3. REVERSE ENGINEER GRAVITY */
-            /* The drive chose a location. We must update target_lba to match reality. */
             phys_sector = req.result_lba;
             uint64_t actual_lba_idx = hn4_addr_to_u64(phys_sector) / sectors;
 
             if (actual_lba_idx != target_lba) {
-                /*
-                 * We cannot update the global Gravity Center (G) based on a single block's
-                 * drift, as this would invalidate the trajectory for all other blocks
-                 * in the file.
-                 *
-                 * If the ZNS drive ignores our placement hint, we must reject the write
-                 * to preserve the mathematical integrity of the Ballistic Index.
-                 * The allocator should fallback to the Horizon (Linear) on retry.
-                 */
                 HN4_LOG_CRIT("ZNS Drift Detected: Expected %llu, Got %llu. Aborting to protect G.",
                              (unsigned long long)target_lba, (unsigned long long)actual_lba_idx);
 
                 /* Rollback the bitmap claim on the predicted block */
                 _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
 
-                /* We cannot free the actual_lba_idx because we don't own it in the bitmap yet,
-                   and the drive has already written to it. This creates a small leak
-                   (Space Amplification) to be cleaned by the Scavenger later. */
-
+                hn4_hal_mem_free(io_buf);
                 return HN4_ERR_GEOMETRY;
             }
         }

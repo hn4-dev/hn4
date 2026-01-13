@@ -11,6 +11,7 @@
  */
 
 #include "hn4_swizzle.h"
+#include "hn4_constants.h"
 
 //
 // -----------------------------------------------------------------------------
@@ -171,53 +172,118 @@ hn4_swizzle_tensor_offset(
     uint8_t format
     )
 {
-    (void)depth; // Unused in linear calculation for 3D slice offset
+    (void)depth; // Unused in linear calculation, implicit in Z coordinate
 
-    //
-    // Cast dimensions to 64-bit BEFORE multiplication.
-    // This prevents 32-bit integer overflow on large tensors.
-    //
+    /* 1. Basic Coordinate Bounds Check */
+    if (x >= width || y >= height) return HN4_OFFSET_INVALID;
+
+    /*
+     * Cast dimensions to 64-bit BEFORE multiplication.
+     */
     uint64_t w64 = (uint64_t)width;
     uint64_t h64 = (uint64_t)height;
     uint64_t z64 = (uint64_t)z;
     uint64_t y64 = (uint64_t)y;
     uint64_t x64 = (uint64_t)x;
 
+    /*
+     * 2. Overflow Protection: Plane Size
+     * Check if a single 2D plane (W * H) fits in u64.
+     */
+    if (w64 > 0 && h64 > (UINT64_MAX / w64)) return HN4_OFFSET_INVALID;
+    uint64_t plane_sz = w64 * h64;
+
+    /*
+     * 3. Overflow Protection: Volume Base
+     * Check if Z * PlaneSize fits.
+     */
+    if (plane_sz > 0 && z64 > (UINT64_MAX / plane_sz)) return HN4_OFFSET_INVALID;
+    uint64_t base_offset = z64 * plane_sz;
+
     switch (format) {
         case HN4_TENSOR_ROW_MAJOR:
-            // Standard C layout: Z-plane, then Y-row, then X-column.
-            return (z64 * h64 * w64) + (y64 * w64) + x64;
+            {
+                /* Offset = Base + (Y * W) + X */
+                
+                /* Y < H, so Y*W cannot exceed PlaneSize, which we validated. */
+                uint64_t row_offset = y64 * w64;
+                
+                /* Check Summation Overflow */
+                if ((UINT64_MAX - base_offset) < row_offset) return HN4_OFFSET_INVALID;
+                uint64_t temp = base_offset + row_offset;
+                
+                if ((UINT64_MAX - temp) < x64) return HN4_OFFSET_INVALID;
+                return temp + x64;
+            }
 
         case HN4_TENSOR_COL_MAJOR:
-            // Fortran/BLAS layout: X-column fastest, then Y, then Z.
-            return (z64 * h64 * w64) + (x64 * h64) + y64;
+            {
+                /* Offset = Base + (X * H) + Y */
+                /* Assumes Z-planes are stacked linearly even in Col-Major */
+                
+                uint64_t col_offset = x64 * h64;
+                
+                if ((UINT64_MAX - base_offset) < col_offset) return HN4_OFFSET_INVALID;
+                uint64_t temp = base_offset + col_offset;
+                
+                if ((UINT64_MAX - temp) < y64) return HN4_OFFSET_INVALID;
+                return temp + y64;
+            }
 
         case HN4_TENSOR_TILED:
             {
-                //
-                // 4x4 Tiling Logic.
-                // Breaks the surface into 4x4 blocks for cache locality.
-                //
+                /*
+                 * 4x4 Tiling Logic.
+                 * Breaks the surface into 4x4 blocks for cache locality.
+                 */
                 uint64_t block_x = x64 >> 2;
                 uint64_t block_y = y64 >> 2;
                 uint64_t in_x    = x64 & 3;
                 uint64_t in_y    = y64 & 3;
                 
-                // Round up dimensions to next 4-block boundary
+                /* Round up dimensions to next 4-block boundary: (W + 3) / 4 */
                 uint64_t width_in_blocks = (w64 + 3) >> 2;
                 uint64_t height_in_blocks = (h64 + 3) >> 2;
                 
-                uint64_t block_idx = (z64 * height_in_blocks * width_in_blocks) + 
-                                     (block_y * width_in_blocks) + 
-                                     block_x;
+                /* Check for overflow in block dimensions */
+                if (width_in_blocks > 0 && height_in_blocks > (UINT64_MAX / width_in_blocks)) 
+                    return HN4_OFFSET_INVALID;
                 
-                // Each block contains 16 elements (4x4).
-                // Offset = (BlockIndex * 16) + (InBlockY * 4) + InBlockX
+                uint64_t blocks_per_plane = width_in_blocks * height_in_blocks;
+                
+                /* Check Z block offset */
+                if (blocks_per_plane > 0 && z64 > (UINT64_MAX / blocks_per_plane)) 
+                    return HN4_OFFSET_INVALID;
+                
+                uint64_t z_block_base = z64 * blocks_per_plane;
+                
+                /* Calculate Block Index: Base + (BlockY * WidthInBlocks) + BlockX */
+                uint64_t y_block_offset = block_y * width_in_blocks;
+                
+                if ((UINT64_MAX - z_block_base) < y_block_offset) return HN4_OFFSET_INVALID;
+                uint64_t temp_idx = z_block_base + y_block_offset;
+                
+                if ((UINT64_MAX - temp_idx) < block_x) return HN4_OFFSET_INVALID;
+                uint64_t block_idx = temp_idx + block_x;
+                
+                /*
+                 * Each block contains 16 elements (4x4).
+                 * Offset = (BlockIndex * 16) + (InBlockY * 4) + InBlockX
+                 * Check if BlockIndex > (UINT64_MAX / 16)
+                 */
+                if (block_idx > (UINT64_MAX >> 4)) return HN4_OFFSET_INVALID;
+                
                 return (block_idx << 4) + (in_y << 2) + in_x;
             }
 
         default:
-            // Fallback to Row Major
-            return (z64 * h64 * w64) + (y64 * w64) + x64;
+            /* Fallback to Row Major (Safe Default) */
+            {
+                uint64_t row_offset = y64 * w64;
+                if ((UINT64_MAX - base_offset) < row_offset) return HN4_OFFSET_INVALID;
+                uint64_t temp = base_offset + row_offset;
+                if ((UINT64_MAX - temp) < x64) return HN4_OFFSET_INVALID;
+                return temp + x64;
+            }
     }
 }

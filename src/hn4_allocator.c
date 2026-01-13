@@ -1193,11 +1193,24 @@ _alloc_cortex_run(
                     }
                     
                     hn4_nano_header_t* claim_hdr = (hn4_nano_header_t*)((uint8_t*)io_buffer + head_buf_offset);
-                    
-                    /* Double-Check: Ensure we didn't race between the batch read and this claim */
-                    if (claim_hdr->magic != 0 && claim_hdr->magic != hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
-                        free_run_length = 0; /* Lost race, restart search */
-                        continue;
+    
+                    if (claim_hdr->magic != 0) {
+    
+                        bool collision = true;
+
+                        if (claim_hdr->magic == hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
+                            uint64_t claim_ts = hn4_le64_to_cpu(claim_hdr->version);
+                            uint64_t now = hn4_hal_get_time_ns();
+                            // Re-verify expiration (30s window)
+                            if (now > claim_ts && (now - claim_ts) > 30000000000ULL) {
+                                collision = false; // Safe to reclaim
+                           }
+                        }
+
+                        if (collision) {
+                            free_run_length = 0; /* Lost race, restart search */
+                            continue;
+                        }
                     }
                     
                     /* Populate Pending Marker */
@@ -2198,7 +2211,7 @@ hn4_alloc_genesis(
  */
 _Check_return_ hn4_result_t hn4_alloc_horizon(
     HN4_INOUT hn4_volume_t* vol,
-    HN4_OUT hn4_addr_t* out_phys_lba /* Updated Signature */
+    HN4_OUT hn4_addr_t* out_phys_lba /* FIX: Use abstract type */
 )
 {
     /* 
@@ -2272,17 +2285,11 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
          */
 #ifdef HN4_USE_128BIT
         /* diff = offset * spb */
-        /* Assuming block_offset * spb fits in u64 (it should if capacity is reasonable) */
-        /* Wait, if block_offset is large, this mul could overflow u64. Use primitive. */
         hn4_u128_t offset_128 = hn4_u128_from_u64(block_offset);
         hn4_u128_t byte_off_128 = hn4_u128_mul_u64(offset_128, spb);
         
-        /* Add to start address (u128 + u128) - Need u128 add helper */
-        /* Since hn4_addr_add takes u64 inc, we must implement u128 add or verify limits. */
-        /* Let's assume hn4_u128_add exists or inline it. */
-        
+        /* Add to start address (u128 + u128) - Inline logic since hn4_addr_add takes u64 */
         hn4_addr_t abs_lba = start_addr;
-        /* Inline u128 add: result = a + b */
         uint64_t old_lo = abs_lba.lo;
         abs_lba.lo += byte_off_128.lo;
         abs_lba.hi += byte_off_128.hi + ((abs_lba.lo < old_lo) ? 1 : 0);
@@ -2322,7 +2329,7 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
 }
 
 
-void hn4_free_block(HN4_INOUT hn4_volume_t* vol, uint64_t phys_lba) {
+void hn4_free_block(HN4_INOUT hn4_volume_t* vol, hn4_addr_t phys_lba) {
     if (!vol->target_device) return;
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
@@ -2330,7 +2337,22 @@ void hn4_free_block(HN4_INOUT hn4_volume_t* vol, uint64_t phys_lba) {
     uint32_t bs = vol->vol_block_size;
     uint32_t spb = (bs / ss) ? (bs / ss) : 1;
 
-    uint64_t block_idx = phys_lba / spb;
+    uint64_t block_idx;
+
+#ifdef HN4_USE_128BIT
+
+    hn4_u128_t idx_128 = hn4_u128_div_u64(phys_lba, spb);
+
+    if (idx_128.hi > 0) {
+        HN4_LOG_CRIT("Free OOB: Block Index exceeds 64-bits");
+        return;
+    }
+    block_idx = idx_128.lo;
+#else
+    /* Standard 64-bit math */
+    block_idx = phys_lba / spb;
+#endif
+
     uint64_t max_blk = vol->vol_capacity_bytes / bs;
 
     if (block_idx >= max_blk) {

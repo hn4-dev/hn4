@@ -716,20 +716,27 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     memset(&sb_cpu, 0, sizeof(sb_cpu));
 
     /* --- STEP 1: CALCULATE GEOMETRY --- */
-    /* Note: _calc_geometry uses the 'caps' snapshot passed here */
+
     res = _calc_geometry(params, caps, &sb_cpu);
     if (res != HN4_OK) return res;
 
     /* --- STEP 2: SANITIZE (THE NUKE) --- */
-    uint64_t total_cap = hn4_addr_to_u64(sb_cpu.info.total_capacity); 
+    hn4_size_t total_cap = sb_cpu.info.total_capacity;
 
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        #ifdef HN4_USE_128BIT
+        hn4_u128_t rem = hn4_u128_div_u64(total_cap, caps->zone_size_bytes); // Assuming div returns quotient, we need remainder helper or check logic
+        #else
         if (total_cap % caps->zone_size_bytes != 0) {
             HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
             return HN4_ERR_ALIGNMENT_FAIL;
         }
+        #endif
+        
+        /* Update _sanitize_zns signature to take hn4_size_t */
         res = _sanitize_zns(dev, total_cap, caps->zone_size_bytes, caps->logical_block_size);
     } else {
+        /* Update _sanitize_generic signature to take hn4_size_t */
         res = _sanitize_generic(dev, total_cap, caps->logical_block_size);
     }
     

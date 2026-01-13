@@ -267,7 +267,7 @@ static hn4_result_t _execute_cardinal_vote(
     uint64_t max_ts = 0;
     hn4_result_t final_res = HN4_ERR_BAD_SUPERBLOCK;
     
-    uint32_t probe_sizes[] = { sector_sz, 4096, 16384, 65536, 0 };
+    uint32_t probe_sizes[] = { sector_sz, 4096, 16384, 65536, 0, 0 };
     hn4_superblock_t cand;
 
 #ifdef HN4_USE_128BIT
@@ -402,10 +402,10 @@ static hn4_result_t _execute_cardinal_vote(
                         bool best_clean = (best_sb.info.state_flags & HN4_VOL_CLEAN);
                         bool cand_clean = (cand.info.state_flags & HN4_VOL_CLEAN);
                         if (best_clean != cand_clean) {
-                            HN4_LOG_CRIT("Split-Brain: Same Gen, Different State (Clean vs Dirty)");
-                            final_res = HN4_ERR_TAMPERED;
-                            found_valid = false;
-                            goto cleanup;
+                            HN4_LOG_WARN("Split-Brain: Interrupted Unmount detected. Forcing DIRTY state.");
+                            // Clear CLEAN, set DIRTY on the "best" candidate to ensure recovery runs
+                            best_sb.info.state_flags &= ~HN4_VOL_CLEAN;
+                            best_sb.info.state_flags |= HN4_VOL_DIRTY;
                         }
                     }
                 }
@@ -748,12 +748,28 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     if (!caps) return HN4_ERR_INTERNAL_FAULT;
     uint32_t sect_sz = caps->logical_block_size;
     uint32_t bs = vol->vol_block_size;
-    uint64_t cap = vol->vol_capacity_bytes;
+    hn4_size_t cap = vol->vol_capacity_bytes;
 
     if (bs == 0 || sect_sz == 0 || bs % sect_sz != 0) return HN4_ERR_ALIGNMENT_FAIL;
 
-    uint64_t cap_blocks = cap / bs;
-    size_t armor_words = (cap_blocks + 63) / 64;
+#ifdef HN4_USE_128BIT
+    if (cap.hi > 0) {
+        HN4_LOG_CRIT("Mount Fail: Volume too large for RAM Bitmap. Use Sparse/Cache mode.");
+        return HN4_ERR_NOMEM;
+    }
+    uint64_t cap_64 = cap.lo;
+#else
+    uint64_t cap_64 = cap;
+#endif
+
+    uint64_t cap_blocks = cap_64 / bs;
+    
+    /* Check for overflow in size_t calc (e.g. 32-bit systems) */
+    if (cap_blocks > (SIZE_MAX / sizeof(hn4_armored_word_t)) * 64) {
+        return HN4_ERR_NOMEM;
+    }
+
+    size_t armor_words = (size_t)((cap_blocks + 63) / 64);
     
     vol->void_bitmap = hn4_hal_mem_alloc(armor_words * sizeof(hn4_armored_word_t));
     if (!vol->void_bitmap) return HN4_ERR_NOMEM;
@@ -1432,10 +1448,12 @@ static hn4_result_t _reconstruct_cortex_state(
     /* 3. Linear Read (The fastest op an SSD can perform) */
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, cortex_sectors);
     if (res != HN4_OK) {
-      if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
-        hn4_hal_mem_free(vol->nano_cortex);
-        vol->nano_cortex = NULL;
-    } 
+      HN4_LOG_WARN("Cortex Linear Read failed. Disabling Zero-Scan Cache.");
+        
+        if (vol->nano_cortex) {
+            hn4_hal_mem_free(vol->nano_cortex);
+            vol->nano_cortex = NULL;
+        }
     return HN4_OK;
   }
 
