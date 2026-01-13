@@ -260,6 +260,12 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             depth_limit = 3;
             retry_sleep = 5000;
             break;
+        case HN4_PROFILE_GAMING:
+            if (hn4_le64_to_cpu(anchor.mass) < 65536) {
+                depth_limit = 1; /* RAM Disk Mode */
+            }
+            retry_sleep = 10; /* Aggressive polling for Audio */
+            break;
         default:
             /* Device-specific overrides */
             if (dev_type == HN4_DEV_HDD || (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL)) {
@@ -475,6 +481,15 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             if (HN4_IS_OK(decomp_res)) {
                 winner_idx = i;
                 deep_error = decomp_res;
+
+                if (HN4_UNLIKELY(profile == HN4_PROFILE_GAMING)) {
+                    uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, 0);
+                    if (next_lba != HN4_LBA_INVALID && next_lba < max_blocks) {
+                         hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
+                         hn4_hal_prefetch(vol->target_device, pf_phys, sectors);
+                    }
+                }
+
                 break;
             } else {
                 failed_mask |= (1ULL << i);

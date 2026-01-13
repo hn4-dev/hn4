@@ -2425,24 +2425,25 @@ hn4_TEST(FixVerify, Chronicle_Reservation_Underflow) {
     hn4_hal_device_t* dev = create_device_fixture(cap, 512);
     mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
     mdev->caps.hw_flags |= HN4_HW_NVM;
-    /* Allocate MMIO for successful format */
+    /* Allocate MMIO for format attempt */
     mdev->mmio_base = hn4_hal_mem_alloc(cap);
     
     hn4_format_params_t params = {0};
     params.target_profile = HN4_PROFILE_PICO;
     
     /* 
-     * FIX: Updated assertion to HN4_OK.
-     * The new hn4_format logic correctly downsizes the Chronicle to 64KB 
-     * for PICO profiles, allowing it to fit within the 1MB limit.
-     * The "Underflow" condition is now successfully mitigated by the driver.
+     * FIX: Updated assertion to HN4_ERR_ENOSPC.
+     * Per Spec Section 2.3, the Epoch Ring is strictly fixed at 1MB.
+     * A 1MB device cannot hold the Ring + Superblock + Bitmap + Cortex.
+     * The format MUST fail gracefully rather than creating a non-compliant volume.
      */
     hn4_result_t res = hn4_format(dev, &params);
-    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
     hn4_hal_mem_free(mdev->mmio_base);
     destroy_device_fixture(dev);
 }
+
 /*
  * TEST: PICO Strict 512B Enforcement
  * Scenario: PICO Profile requested on 4Kn (4096B) hardware.

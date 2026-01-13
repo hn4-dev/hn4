@@ -128,6 +128,16 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev,
                              void* buf, 
                              uint32_t len_blocks);
 
+/**
+ * hn4_hal_prefetch
+ * OPTIONAL: Hints the hardware to pull data into cache. 
+ * Implementation may be a no-op on unsupported platforms.
+ * @param dev: Device context
+ * @param lba: Physical LBA to prefetch
+ * @param len: Length in device sectors
+ */
+void hn4_hal_prefetch(hn4_hal_device_t* dev, hn4_addr_t lba, uint32_t len);                             
+
 void hn4_hal_poll(hn4_hal_device_t* dev);
 
 /* =========================================================================

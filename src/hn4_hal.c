@@ -652,3 +652,27 @@ hn4_result_t hn4_hal_get_topology_data(hn4_hal_device_t* dev, void* buffer, size
      */
     return HN4_OK;
 }
+
+void hn4_hal_prefetch(hn4_hal_device_t* dev, hn4_addr_t lba, uint32_t len) {
+    if (!dev) return;
+
+    /* 
+     * IMPLEMENTATION NOTE: 
+     * This is a "Best Effort" hint. Failure is ignored.
+     */
+#if defined(__linux__) && defined(POSIX_FADV_WILLNEED)
+    /* User-space optimization: Hint the OS page cache */
+    uint64_t offset = hn4_addr_to_u64(lba) * 512; /* Assuming 512B sector base */
+    uint64_t bytes  = len * 512;
+    posix_fadvise(dev->fd, (off_t)offset, (off_t)bytes, POSIX_FADV_WILLNEED);
+
+#elif defined(_WIN32)
+    /* Windows Prefetch logic (File mapping hint or empty) */
+    /* No-op for standard file handles */
+
+#else
+    /* Embedded/Bare-metal: No-op unless specific controller registers exist */
+    (void)lba;
+    (void)len;
+#endif
+}

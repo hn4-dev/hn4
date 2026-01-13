@@ -2532,12 +2532,13 @@ hn4_TEST(Profile, Gaming_Read_Enables_Healing) {
     /* Reset Heal Stats */
     atomic_store(&vol->stats.heal_count, 0);
 
-    hn4_anchor_t anchor = {0};
+   hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x123;
     anchor.gravity_center = hn4_cpu_to_le64(300);
     anchor.write_gen = hn4_cpu_to_le32(10);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
     anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.mass = hn4_cpu_to_le64(1024 * 1024); /* 1MB Asset */
 
     /* Inject Corruption at k=0 */
     uint64_t lba_k0 = _calc_trajectory_lba(vol, 300, 0, 0, 0, 0);

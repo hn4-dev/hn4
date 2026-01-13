@@ -982,11 +982,8 @@ hn4_TEST(Recovery, SouthDisabledSmallVol) {
     /* 2. Format */
     hn4_format_params_t fp = {0};
     fp.target_profile = HN4_PROFILE_PICO; /* Best for small vols */
-    
     hn4_result_t res = hn4_format(dev, &fp);
-    
-    /* FIX: Expect SUCCESS. 1MB is valid for PICO now. */
-    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
     /* Cleanup */
     hn4_hal_mem_free(dev);

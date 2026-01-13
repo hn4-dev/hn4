@@ -715,8 +715,28 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
             }
         }
     } else {
-        /* Standard SSD/HDD Write */
-        io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, phys_sector, io_buf, sectors);
+
+        uint32_t retry_sleep = 1000; /* Default 1ms */
+        int max_retries = 2;
+
+        if (profile == HN4_PROFILE_GAMING) {
+            retry_sleep = 10; /* 10us Aggressive Poll */
+            max_retries = 5;  /* Try harder before rescue to prevent stutter */
+        } else if (profile == HN4_PROFILE_USB) {
+            retry_sleep = 5000;
+            max_retries = 3;
+        }
+
+        int tries = 0;
+        do {
+            io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, phys_sector, io_buf, sectors);
+            
+            if (io_res != HN4_OK) {
+                if (++tries < max_retries) {
+                    hn4_hal_micro_sleep(retry_sleep);
+                }
+            }
+        } while (io_res != HN4_OK && tries < max_retries);
     }
 
     if (io_res != HN4_OK) {
