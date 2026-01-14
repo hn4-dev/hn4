@@ -2,7 +2,7 @@
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
  * MODULE:      Tensor Stream Layer (Virtualization)
  * SOURCE:      hn4_tensor.c
- * STATUS:      HARDENED / PRODUCTION (v20.1)
+ * STATUS:      HARDENED / PRODUCTION (v20.2)
  * AUTHOR:      Core Systems Engineering
  * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
@@ -13,16 +13,16 @@
  *    This layer implements a "Fail-Stop" philosophy. It does not attempt to 
  *    retry I/O, skip bad blocks, or recover from checksum errors. 
  *    Any error reported by the HAL is treated as a fatal stream corruption.
- *    rationale: Upper layers (Application/Model Loader) must decide on recovery.
  *
- * 2. MEMORY SAFETY:
- *    - Sentinel values are set to UINT32_MAX to force immediate faults if 
- *      unchecked, rather than allowing OOB heap reads.
- *    - Geometry is validated for strict monotonicity to prevent logical aliasing.
+ * 2. VIRTUALIZATION:
+ *    Tensor streams present a contiguous byte-addressable view (0..N) composed
+ *    of disjoint physical shards (Anchors). The engine handles the O(1) mapping
+ *    using a prefix-sum acceleration structure.
  *
- * 3. ABI & CONCURRENCY:
- *    - Contexts are Immutable and Non-Thread-Safe.
- *    - Atomic Reader MUST strip internal headers. Payload MUST be at offset 0.
+ * 3. CONCURRENCY:
+ *    Contexts are read-only after creation. Multiple threads may read from the
+ *    same context concurrently IF they provide their own locking for the 
+ *    output buffers (the context itself is stateless during read).
  * -----------------------------------------------------------------------------
  */
 
@@ -50,12 +50,15 @@
 /**
  * _shard_cmp
  * Sorts shards by 128-bit Seed ID to establish logical monotonicity.
+ * This ensures that if shards are scattered on disk, they assemble in
+ * a deterministic order based on their creation identity.
  */
 static int _shard_cmp(const void* a, const void* b) 
 {
     const hn4_anchor_t* sa = (const hn4_anchor_t*)a;
     const hn4_anchor_t* sb = (const hn4_anchor_t*)b;
     
+    /* Comparison must be done on Host Endian values */
     hn4_u128_t id_a = hn4_le128_to_cpu(sa->seed_id);
     hn4_u128_t id_b = hn4_le128_to_cpu(sb->seed_id);
 
@@ -70,13 +73,17 @@ static int _shard_cmp(const void* a, const void* b)
  * _find_shard_idx
  * Resolves global logical offset to shard index using Binary Search.
  *
+ * The `shard_offsets` array contains (shard_count + 1) entries.
+ * entry[i] is the start of shard i.
+ * entry[i+1] is the end of shard i (and start of shard i+1).
+ *
  * Returns:
  * - [0 .. shard_count-1] on success.
- * - HN4_SHARD_INVALID    on failure (Explicit Sentinel).
+ * - HN4_SHARD_INVALID    on failure (OOB).
  */
 static uint32_t _find_shard_idx(const hn4_tensor_ctx_t* ctx, uint64_t global_pos) 
 {
-    /* Invariant: Global position must be within total mass */
+    /* Invariant: Global position must be strictly less than total mass */
     if (HN4_UNLIKELY(global_pos >= ctx->total_size_bytes)) {
         return HN4_SHARD_INVALID;
     }
@@ -95,13 +102,8 @@ static uint32_t _find_shard_idx(const hn4_tensor_ctx_t* ctx, uint64_t global_pos
         }
         
         if (global_pos < start) {
-            /* 
-             * Geometry Corruption Check:
-             * If global_pos < start[mid] and mid==0, then global_pos is negative
-             * relative to the universe, or offsets[0] != 0.
-             */
             if (HN4_UNLIKELY(mid == 0)) {
-                HN4_LOG_CRIT("Tensor BS: Topology underflow. Integrity violation.");
+                /* Should be caught by global_pos >= total check, but defensive */
                 return HN4_SHARD_INVALID;
             }
             high = mid - 1;
@@ -138,7 +140,7 @@ hn4_result_t hn4_tensor_open(
     memset(ctx, 0, sizeof(hn4_tensor_ctx_t));
 
     /* ---------------------------------------------------------------------
-     * PHASE 1: Gather
+     * PHASE 1: Gather (Resonance Scan)
      * --------------------------------------------------------------------- */
     ctx->shards = hn4_hal_mem_alloc(sizeof(hn4_anchor_t) * HN4_MAX_TENSOR_SHARDS);
     if (!ctx->shards) {
@@ -146,10 +148,12 @@ hn4_result_t hn4_tensor_open(
         goto failure;
     }
 
+    /* Scan the Cortex for anchors matching the tag */
     result = hn4_ns_gather_tensor_shards(
         vol, model_tag, ctx->shards, HN4_MAX_TENSOR_SHARDS, &found_count);
 
     if (result != HN4_OK) goto failure;
+    
     if (found_count == 0) {
         result = HN4_ERR_NOT_FOUND;
         goto failure;
@@ -168,11 +172,11 @@ hn4_result_t hn4_tensor_open(
     }
 
     /* ---------------------------------------------------------------------
-     * PHASE 2: Sort & Geometry
+     * PHASE 2: Sort & Geometry Map Building
      * --------------------------------------------------------------------- */
     qsort(ctx->shards, found_count, sizeof(hn4_anchor_t), _shard_cmp);
 
-    /* Allocate one extra slot for the EOF sentinel */
+    /* Allocate (N + 1) slots for the offset map to hold the EOF sentinel */
     ctx->shard_offsets = hn4_hal_mem_alloc(sizeof(uint64_t) * (found_count + 1));
     if (!ctx->shard_offsets) {
         result = HN4_ERR_NOMEM;
@@ -194,7 +198,7 @@ hn4_result_t hn4_tensor_open(
 
         /* Check 2: 64-bit Address Space Overflow */
         if (HN4_UNLIKELY((UINT64_MAX - accumulator) < mass)) {
-            HN4_LOG_CRIT("Tensor Open: Mass overflow.");
+            HN4_LOG_CRIT("Tensor Open: Mass overflow (Exceeds 18 EB).");
             result = HN4_ERR_GEOMETRY;
             goto failure;
         }
@@ -202,13 +206,10 @@ hn4_result_t hn4_tensor_open(
         accumulator += mass;
     }
     
-    /* Store End Sentinel (EOF) */
+    /* Store End Sentinel (EOF) at index N */
     ctx->shard_offsets[found_count] = accumulator;
 
-    /* 
-     * INTEGRITY CHECK: Memory Corruption / Logic Errors
-     * Ensure the universe starts at 0.
-     */
+    /* Integrity Check: The universe must start at 0 */
     if (HN4_UNLIKELY(ctx->shard_offsets[0] != 0)) {
         HN4_LOG_CRIT("Tensor Open: Offset map corrupted in RAM.");
         result = HN4_ERR_INTERNAL;
@@ -220,15 +221,13 @@ hn4_result_t hn4_tensor_open(
      * --------------------------------------------------------------------- */
     ctx->vol              = vol;
     ctx->shard_count      = found_count;
-    atomic_fetch_add(&vol->ref_count, 1);
     ctx->total_size_bytes = accumulator;
     ctx->block_size       = vol->vol_block_size;
     
     /* 
-     * PAYLOAD VALIDATION:
-     * Check 1: p_cap must exist (>0)
-     * Check 2: p_cap must leave room for headers ( < block_size)
-     * Note: We cannot validate (block - p_cap >= header_min) without HAL internals.
+     * CACHE PAYLOAD CAPACITY:
+     * This avoids repeated calculations during the read loop.
+     * Logic: BlockSize - HeaderSize
      */
     uint32_t p_cap = HN4_BLOCK_PayloadSize(ctx->block_size);
     
@@ -239,6 +238,9 @@ hn4_result_t hn4_tensor_open(
         goto failure;
     }
     ctx->payload_cap = p_cap;
+
+    /* Acquire reference to volume to prevent unmount while tensor is open */
+    atomic_fetch_add(&vol->health.ref_count, 1);
 
     *out_ctx = ctx;
     return HN4_OK;
@@ -264,15 +266,21 @@ hn4_result_t hn4_tensor_read(
         return HN4_ERR_INVALID_ARGUMENT;
     }
     
-    /* Clamp Read Length to EOF (Short Read allowed) */
+    /* Clamp Read Length to EOF (Allow Short Read) */
     uint64_t read_len = len;
     if ((global_offset + len) > ctx->total_size_bytes) {
         read_len = ctx->total_size_bytes - global_offset;
     }
 
     /* 
-     * ALLOCATION: 
-     * Allocate full physical block size to absorb internal headers safely.
+     * BOUNCE BUFFER ALLOCATION:
+     * We MUST allocate a bounce buffer. HN4 blocks contain headers, so the data
+     * on disk is not contiguous. We cannot read directly into the user buffer.
+     *
+     * OPTIMIZATION NOTE: 
+     * We allocate per-read here to keep the Context stateless/thread-safe.
+     * In extremely high-throughput scenarios, this malloc/free pair is observable overhead.
+     * However, it guarantees memory safety.
      */
     void* bounce_buf = hn4_hal_mem_alloc(ctx->block_size);
     if (HN4_UNLIKELY(!bounce_buf)) return HN4_ERR_NOMEM;
@@ -282,7 +290,7 @@ hn4_result_t hn4_tensor_read(
     uint64_t current_pos = global_offset;
     hn4_result_t res     = HN4_OK;
 
-    /* Initial Lookup with robust sentinel check */
+    /* 1. Initial Shard Lookup */
     uint32_t shard_idx = _find_shard_idx(ctx, current_pos);
     
     if (HN4_UNLIKELY(shard_idx == HN4_SHARD_INVALID)) {
@@ -292,6 +300,7 @@ hn4_result_t hn4_tensor_read(
 
     /* ---------------------------------------------------------------------
      * STREAM LOOP
+     * Iterates through shards until the request is satisfied.
      * --------------------------------------------------------------------- */
     while (remaining > 0 && shard_idx < ctx->shard_count) {
         
@@ -300,10 +309,12 @@ hn4_result_t hn4_tensor_read(
         uint64_t shard_end   = ctx->shard_offsets[shard_idx + 1];
         uint64_t shard_mass  = shard_end - shard_start;
 
+        /* Calculate offset relative to THIS shard */
         uint64_t local_offset = current_pos - shard_start;
 
         /* Monotonicity Guard */
         if (HN4_UNLIKELY(local_offset >= shard_mass)) {
+            /* Should be impossible if _find_shard_idx works, but defense-in-depth */
             res = HN4_ERR_GEOMETRY;
             goto cleanup;
         }
@@ -311,49 +322,32 @@ hn4_result_t hn4_tensor_read(
         /* Inner Loop: Blocks within Shard */
         while (remaining > 0 && local_offset < shard_mass) {
             
+            /* Logic to Physical Mapping inside the Shard */
             uint64_t block_idx = local_offset / ctx->payload_cap;
             uint32_t offset_in_blk = (uint32_t)(local_offset % ctx->payload_cap);
             
             /* 
-             * MATH SAFETY:
-             * Verify block calculation doesn't point to the start of the *next* 
-             * shard due to alignment issues.
-             */
-#if defined(__SIZEOF_INT128__)
-            uint64_t logical_base = (uint64_t)((unsigned __int128)block_idx * ctx->payload_cap);
-#else
-            if (block_idx > (UINT64_MAX / ctx->payload_cap)) {
-                res = HN4_ERR_GEOMETRY;
-                goto cleanup;
-            }
-            uint64_t logical_base = block_idx * ctx->payload_cap;
-#endif
-
-            /* 
-             * Calc Chunk: Perform all math in 64-bit to avoid overflow before clamp.
+             * Calculate how much valid data is in THIS block.
              */
             uint64_t bytes_available_in_blk = ctx->payload_cap - offset_in_blk;
-            uint64_t shard_rem = shard_mass - local_offset;
-            uint64_t fetch_len = bytes_available_in_blk;
+            uint64_t bytes_left_in_shard    = shard_mass - local_offset;
+            uint64_t fetch_len              = bytes_available_in_blk;
             
-            if (fetch_len > shard_rem) fetch_len = shard_rem;
+            /* Clamp to shard boundary */
+            if (fetch_len > bytes_left_in_shard) fetch_len = bytes_left_in_shard;
+            /* Clamp to user request */
             if (fetch_len > remaining) fetch_len = remaining;
 
             /* 
              * SAFE DOWNCAST:
-             * payload_cap is derived from block_size (uint32_t).
-             * fetch_len <= payload_cap, therefore fetch_len fits in uint32_t.
+             * payload_cap fits in uint32_t. fetch_len <= payload_cap.
              */
             uint32_t chunk = (uint32_t)fetch_len;
 
-            /* Logical Span Check */
-            if (HN4_UNLIKELY((logical_base + offset_in_blk + chunk) > shard_mass)) {
-                res = HN4_ERR_GEOMETRY;
-                goto cleanup;
-            }
-
             /* 
-             * ATOMIC READ: Fail-Stop on any error.
+             * ATOMIC READ: 
+             * Uses the standard ballistic read pipeline. 
+             * This handles headers, CRCs, decompression, and phantom blocks.
              */
             res = hn4_read_block_atomic(
                 ctx->vol, 
@@ -364,18 +358,21 @@ hn4_result_t hn4_tensor_read(
             );
 
             if (HN4_UNLIKELY(res != HN4_OK)) {
-                /* Logged by HAL, we propagate up */
+                /* Error propagated from read pipeline (e.g. DATA_ROT) */
                 goto cleanup;
             }
 
+            /* Copy payload to user buffer */
             memcpy(cursor, (uint8_t*)bounce_buf + offset_in_blk, chunk);
 
+            /* Advance Cursors */
             cursor       += chunk;
             current_pos  += chunk;
             local_offset += chunk;
             remaining    -= chunk;
         }
 
+        /* Move to next shard if we still need data */
         shard_idx++;
     }
 
@@ -387,17 +384,17 @@ cleanup:
 void hn4_tensor_close(hn4_tensor_ctx_t* ctx) 
 {
     if (ctx) {
-        /* Release Reference */
+        /* Release Reference to Volume */
         if (ctx->vol) {
-            atomic_fetch_sub(&ctx->vol->ref_count, 1);
+            atomic_fetch_sub(&ctx->vol->health.ref_count, 1);
         }
 
         if (ctx->shards)        hn4_hal_mem_free(ctx->shards);
         if (ctx->shard_offsets) hn4_hal_mem_free(ctx->shard_offsets);
         
-#ifdef HN4_DEBUG
+        /* Wipe context to prevent UAF or leaks if pointer is reused */
         memset(ctx, 0xDD, sizeof(hn4_tensor_ctx_t));
-#endif
+        
         hn4_hal_mem_free(ctx);
     }
 }

@@ -113,13 +113,15 @@ static bool _verify_block_at_lba(
 {
     if (phys_blk_idx == HN4_LBA_INVALID) return false;
 
-    /* 1. Bitmap Filter (Fast Check) */
-    /* If the bit is 0, it's physically impossible for valid data to be here */
+    uint64_t max_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+    if (phys_blk_idx >= max_blocks) return false;
+
+    /* 1. Bitmap Filter */
     bool allocated;
     if (_bitmap_op(vol, phys_blk_idx, BIT_TEST, &allocated) != HN4_OK || !allocated) {
         return false;
     }
-
+    
     /* 2. Calculate Physical Geometry */
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t bs      = vol->vol_block_size;
@@ -178,7 +180,7 @@ static bool _verify_block_at_lba(
 uint64_t _resolve_residency_verified(
     HN4_IN hn4_volume_t* vol,
     HN4_IN hn4_anchor_t* anchor,
-    HN4_IN uint64_t      block_idx
+    HN4_OUT uint64_t  block_idx
 )
 {
     /* 1. Unpack Anchor Physics */
@@ -231,9 +233,24 @@ uint64_t _resolve_residency_verified(
             if ((UINT64_MAX - G) >= offset) {
                 
                 uint64_t linear_lba = G + offset;
-                uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
                 
-                if (linear_lba < max_vol_blocks) {
+                bool in_bounds = false;
+#ifdef HN4_USE_128BIT
+                /* 
+                 * We can safely assume linear_lba (u64) fits in capacity 
+                 * if capacity.hi > 0 or capacity.lo is large enough.
+                 * To be precise: max_blocks = capacity / block_size.
+                 * Since we don't have a u128_div available here easily, 
+                 * check if linear_lba * bs < capacity.
+                 */
+                hn4_u128_t limit_chk = hn4_u128_mul_u64(hn4_u128_from_u64(linear_lba), vol->vol_block_size);
+                if (hn4_u128_cmp(limit_chk, vol->vol_capacity_bytes) < 0) in_bounds = true;
+#else
+                uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+                if (linear_lba < max_vol_blocks) in_bounds = true;
+#endif
+
+                if (in_bounds) {
                     if (_verify_block_at_lba(vol, linear_lba, check_buf, my_well_id, block_idx, current_gen)) {
                         found_lba = linear_lba;
                         goto Cleanup;
@@ -294,7 +311,11 @@ retry_transaction:;
         return HN4_ERR_VOLUME_LOCKED;
     }
 
-    uint64_t dclass_check = hn4_le64_to_cpu(anchor->data_class);
+    hn4_anchor_t txn_anchor;
+    memcpy(&txn_anchor, anchor, sizeof(hn4_anchor_t));
+
+    /* Use txn_anchor for logic checks */
+    uint64_t dclass_check = hn4_le64_to_cpu(txn_anchor.data_class);
 
     /*
      * Tombstone Check:
@@ -405,6 +426,15 @@ retry_transaction:;
             hn4_hal_mem_free(io_buf);
             return HN4_ERR_PHANTOM_BLOCK;
         }
+        uint32_t old_hcrc = hn4_le32_to_cpu(old_hdr->header_crc);
+        uint32_t cal_hcrc = hn4_crc32(HN4_CRC_SEED_HEADER, old_hdr, offsetof(hn4_block_header_t, header_crc));
+        
+        if (old_hcrc != cal_hcrc) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: Thaw source has Header Rot. Aborting.");
+            hn4_hal_mem_free(thaw_buf);
+            hn4_hal_mem_free(io_buf);
+            return HN4_ERR_HEADER_ROT;
+        }
 
         uint32_t meta = hn4_le32_to_cpu(old_hdr->comp_meta);
         uint8_t algo  = meta & HN4_COMP_ALGO_MASK;
@@ -496,9 +526,13 @@ retry_transaction:;
      * 5. The Shadow Hop (Allocation)
      */
     uint64_t G = hn4_le64_to_cpu(anchor->gravity_center);
-    uint64_t V = 0;
-    memcpy(&V, anchor->orbit_vector, 6);
-    V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
+    const uint8_t* raw_v = anchor->orbit_vector;
+    uint64_t V = (uint64_t)raw_v[0] |
+                 ((uint64_t)raw_v[1] << 8)  |
+                 ((uint64_t)raw_v[2] << 16) |
+                 ((uint64_t)raw_v[3] << 24) |
+                 ((uint64_t)raw_v[4] << 32) |
+                 ((uint64_t)raw_v[5] << 40);
     uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
 
     /*
@@ -539,7 +573,13 @@ retry_transaction:;
      * Mask with 0x3 (device) and 0x7 (profile) to prevent OOB access.
      * Combine policies using bitwise OR.
      */
-    uint8_t policy_mask = _dev_policy_lut[dev_type & 0x3] | _prof_policy_lut[profile & 0x7];
+    if (dev_type >= 4 || profile >= 8) {
+        HN4_LOG_CRIT("WRITE_ATOMIC: Invalid Profile/Device Type (%u/%u) in SB.", profile, dev_type);
+        hn4_hal_mem_free(io_buf);
+        return HN4_ERR_BAD_SUPERBLOCK;
+    }
+    
+    uint8_t policy_mask = _dev_policy_lut[dev_type] | _prof_policy_lut[profile];
 
     /* Allocation Loop */
     uint8_t k_limit = (policy_mask & HN4_POL_SEQ) ? 0 : HN4_ORBIT_LIMIT;
@@ -606,7 +646,8 @@ retry_transaction:;
 
                 /* Update Orbit Hint in RAM Anchor */
                 uint64_t c_idx = block_idx >> 4;
-                if (c_idx < 16) {
+                /* Only store hint if it fits in 2 bits (k <= 3). */
+                if (c_idx < 16 && k <= 3) {
                     /* Repurpose reserved padding */
                     uint32_t hints = hn4_le32_to_cpu(anchor->orbit_hints);
                     
@@ -628,7 +669,7 @@ retry_transaction:;
         if (alloc_res == HN4_ERR_GRAVITY_COLLAPSE) {
             HN4_LOG_CRIT("WRITE_ATOMIC: D1 Full. Trying Horizon...");
 
-            hn4_addr_t horizon_phys_addr = hn4_addr_from_u64(HN4_LBA_INVALID);
+            hn4_addr_t horizon_phys_addr = hn4_addr_from_u64(0);
             
             alloc_res = hn4_alloc_horizon(vol, &horizon_phys_addr);
 
@@ -723,14 +764,57 @@ retry_transaction:;
             uint64_t actual_lba_idx = hn4_addr_to_u64(phys_sector) / sectors;
 
             if (actual_lba_idx != target_lba) {
-                HN4_LOG_CRIT("ZNS Drift Detected: Expected %llu, Got %llu. Aborting to protect G.",
-                             (unsigned long long)target_lba, (unsigned long long)actual_lba_idx);
+                
+                bool fixed = false;
 
-                /* Rollback the bitmap claim on the predicted block */
-                _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+                /* 
+                 * Case A: Genesis Drift (Block 0)
+                 * If this is the start of the file, we can shift the Gravity Center (G)
+                 * to match the drive's Write Pointer without breaking previous blocks.
+                 */
+                if (block_idx == 0) {
+                    /* 
+                     * Calculate new G.
+                     * For ZNS, V=1 and Fractal Scale applies.
+                     * Formula: LBA = G + (Index * Stride). 
+                     * Since Index=0, New_G = Actual_LBA.
+                     */
+                    uint64_t new_G = actual_lba_idx;
+                    
+                    txn_anchor.gravity_center = hn4_cpu_to_le64(new_G);
+                    
+                    /* Update Bitmap: Release 'target', Claim 'actual' */
+                    _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+                    _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
+                    
+                    /* Sync internal state variables */
+                    target_lba = actual_lba_idx;
+                    
+                    HN4_LOG_WARN("ZNS Drift Fixed: G shifted to %llu to match Zone WP.", 
+                                 (unsigned long long)new_G);
+                    fixed = true;
+                }
 
-                hn4_hal_mem_free(io_buf);
-                return HN4_ERR_GEOMETRY;
+                if (!fixed) {
+                    /* 
+                     * Case B: Mid-Stream Drift (Block > 0)
+                     * We cannot shift G without breaking Blocks 0..N-1.
+                     * This indicates a Zone Hole or unauthorized write. Fatal.
+                     */
+                    HN4_LOG_CRIT("ZNS Drift Fatal: Mid-file deviation (Blk %llu). Exp %llu Got %llu.",
+                                 (unsigned long long)block_idx, 
+                                 (unsigned long long)target_lba, 
+                                 (unsigned long long)actual_lba_idx);
+
+                    /* Rollback the bitmap claim on the predicted block */
+                    _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+                    
+                    /* Mark the ACTUAL block as dirty/used to prevent future collisions */
+                    _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
+
+                    hn4_hal_mem_free(io_buf);
+                    return HN4_ERR_GEOMETRY;
+                }
             }
         }
     } else {
@@ -780,10 +864,10 @@ retry_transaction:;
                                                          phys_sector,
                                                          rescue_buf,
                                                          sectors);
-
-                    if (r_res == HN4_OK) {
-                        /* Check if the data on disk matches what we intended to write */
-                        if (memcmp(io_buf, rescue_buf, bs) == 0) {
+                        if (r_res == HN4_OK) {
+                        size_t p_off = offsetof(hn4_block_header_t, payload);
+                        
+                        if (memcmp((uint8_t*)io_buf + p_off, (uint8_t*)rescue_buf + p_off, payload_cap) == 0) {
                             HN4_LOG_WARN("WRITE_ATOMIC: Rescue Successful! Latent write confirmed.");
                             rescued = true;
                             io_res = HN4_OK; /* Clear Error */
@@ -804,8 +888,11 @@ retry_transaction:;
              * On ZNS, any write attempt (even failed) might advance the WP. 
              * We MUST leak the block (keep it marked 'used') to preserve sequentiality.
              */
-            if (!is_zns && io_res != HN4_ERR_ATOMICS_TIMEOUT) {
-                _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+             if (!is_zns && io_res != HN4_ERR_ATOMICS_TIMEOUT) {
+                if (_bitmap_op(vol, target_lba, BIT_CLEAR, NULL) != HN4_OK) {
+                    HN4_LOG_CRIT("WRITE_ATOMIC: Bitmap corruption during rollback. PANIC.");
+                    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+                }
             } else {
                 /* For ZNS or Timeouts, we leak the block and mark dirty for Scavenger */
                 HN4_LOG_CRIT("Leaking Block %llu (ZNS/Timeout) to preserve alignment.", 
@@ -816,8 +903,7 @@ retry_transaction:;
                 /* 2. Downgrade Silicon Quality (Firmware distress signal) */
                 if (vol->quality_mask) {
                     uint64_t w_idx = target_lba / 32;
-                    /* Bounds Check */
-                    if (((w_idx + 1) * 8) <= vol->qmask_size) {
+                    if (((w_idx + 1) * sizeof(uint64_t)) <= vol->qmask_size) {
                         uint32_t shift = (target_lba % 32) * 2;
                         _Atomic uint64_t* q_ptr = (_Atomic uint64_t*)&vol->quality_mask[w_idx];
                         uint64_t old_val = atomic_load_explicit(q_ptr, memory_order_relaxed);
@@ -862,17 +948,37 @@ retry_transaction:;
     }
 
     if (io_res != HN4_OK) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Barrier Error %d. Rolling back.", io_res);
-        _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+        HN4_LOG_CRIT("WRITE_ATOMIC: Barrier Error %d. Leaking block to prevent corruption.", io_res);
+        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+        
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_HW_IO;
     }
 
     /* 9. Metadata Update */
+
     atomic_thread_fence(memory_order_release);
 
-    /* We expect the generation to be exactly what we read at the start (current_gen). */
-    /* Note: current_gen was captured in Step 5 logic above. */
+    uint64_t end_byte = (block_idx * payload_cap) + len;
+    uint64_t curr_mass_le = atomic_load((_Atomic uint64_t*)&anchor->mass);
+    
+    while (1) {
+        uint64_t curr_mass_cpu = hn4_le64_to_cpu(curr_mass_le);
+        /* If existing size is larger, we don't need to extend */
+        if (end_byte <= curr_mass_cpu) break;
+        
+        uint64_t new_mass_le = hn4_cpu_to_le64(end_byte);
+        /* Optimistically extend the file size */
+        if (atomic_compare_exchange_weak(
+            (_Atomic uint64_t*)&anchor->mass, 
+            &curr_mass_le, 
+            new_mass_le)) break;
+    }
+
+    /* Barrier: Ensure Mass update is visible before we seal the transaction */
+    atomic_thread_fence(memory_order_release);
+
+    /* NOW commit the generation to make the transaction valid */
     uint32_t expected_gen_le = hn4_cpu_to_le32(current_gen);
     uint32_t new_gen_le      = hn4_cpu_to_le32((uint32_t)next_gen);
 
@@ -884,9 +990,10 @@ retry_transaction:;
         HN4_LOG_WARN("WRITE_ATOMIC: Race detected. Expected Gen %u, Found %u. Retrying.", 
                      current_gen, hn4_le32_to_cpu(expected_gen_le));
 
-        /* ROLLBACK: Free the NEW block we just wrote (target_lba) */
-        /* We do NOT free old_lba because we failed to claim the transaction. */
-        _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+         if (_bitmap_op(vol, target_lba, BIT_CLEAR, NULL) != HN4_OK) {
+             /* If we can't free the orphan, we must panic to prevent leak accumulation */
+             atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+        }
 
         /* Cleanup memory before jumping back */
         hn4_hal_mem_free(io_buf);
@@ -898,21 +1005,6 @@ retry_transaction:;
 
     uint64_t now_le = hn4_cpu_to_le64(hn4_hal_get_time_ns());
     atomic_store((_Atomic uint64_t*)&anchor->mod_clock, now_le);
-
-
-    uint64_t end_byte = (block_idx * payload_cap) + len;
-    uint64_t curr_mass_le = atomic_load((_Atomic uint64_t*)&anchor->mass);
-    
-    while (1) {
-        uint64_t curr_mass_cpu = hn4_le64_to_cpu(curr_mass_le);
-        if (end_byte <= curr_mass_cpu) break;
-        
-        uint64_t new_mass_le = hn4_cpu_to_le64(end_byte);
-        if (atomic_compare_exchange_weak(
-            (_Atomic uint64_t*)&anchor->mass, 
-            &curr_mass_le, 
-            new_mass_le)) break;
-    }
 
     /* 10. THE ECLIPSE (Atomic Discard of Old LBA) */
     if (old_lba != HN4_LBA_INVALID && old_lba != target_lba) {

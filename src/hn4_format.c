@@ -146,7 +146,7 @@ static const hn4_profile_spec_t PROFILE_SPECS[] = {
  * Resets critical Zone 0 first, guarantees SB location clear.
  */
 static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev, 
-                                  uint64_t capacity_bytes, 
+                                  hn4_size_t capacity_bytes, 
                                   uint32_t zone_size_bytes,
                                   uint32_t logical_block_size) 
 {
@@ -158,35 +158,64 @@ static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev,
     if (zone_size_bytes == 0 || logical_block_size == 0) return HN4_ERR_GEOMETRY;
 
     uint32_t zone_sectors = zone_size_bytes / logical_block_size;
+
+    /* Initialize Offset Iterator */
+#ifdef HN4_USE_128BIT
+    hn4_u128_t offset = {0, 0};
+#else
     uint64_t aligned_cap = HN4_ALIGN_DOWN(capacity_bytes, zone_size_bytes);
     uint64_t offset = 0;
-
-    HN4_LOG_VAL("ZNS Sanitize Start. Capacity", capacity_bytes);
+#endif
 
     /* Critical - Reset SB Zone First (Zone 0) */
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, hn4_addr_from_u64(0), NULL, zone_sectors);
     if (res != HN4_OK) return res;
 
-    hn4_hal_barrier(dev); /* Fence: Ensure Zone 0 is empty before touching others */
+    hn4_hal_barrier(dev); 
 
-    /* Reset remainder */
+    /* Advance Offset past Zone 0 */
+#ifdef HN4_USE_128BIT
+    offset.lo += zone_size_bytes;
+    if (offset.lo < zone_size_bytes) offset.hi++; /* Carry */
+#else
     offset += zone_size_bytes;
-    while (offset < aligned_cap) {
-        hn4_addr_t lba = hn4_lba_from_sectors(offset / logical_block_size);
+#endif
+
+    /* Loop until End of Capacity */
+    while (
+#ifdef HN4_USE_128BIT
+        hn4_u128_cmp(offset, capacity_bytes) < 0
+#else
+        offset < aligned_cap
+#endif
+    ) {
+        hn4_addr_t lba;
+
+#ifdef HN4_USE_128BIT
+        /* Calculate LBA: offset / logical_block_size */
+        hn4_u128_t tmp = hn4_u128_div_u64(offset, logical_block_size);
+        lba = tmp;
+#else
+        lba = hn4_lba_from_sectors(offset / logical_block_size);
+#endif
         
         res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, zone_sectors);
         if (res != HN4_OK) return res;
 
+        /* Advance Offset */
+#ifdef HN4_USE_128BIT
+        uint64_t old_lo = offset.lo;
+        offset.lo += zone_size_bytes;
+        if (offset.lo < old_lo) offset.hi++;
+#else
         offset += zone_size_bytes;
-        /* Throttle logs */
-        if ((offset % (16 * HN4_SZ_GB)) == 0) {
-             HN4_LOG_VAL("ZNS Progress (Bytes)", offset);
-        }
+#endif
     }
     
     hn4_hal_barrier(dev);
     return HN4_OK;
 }
+
 
 static hn4_result_t _sanitize_generic(hn4_hal_device_t* dev, hn4_size_t capacity_bytes, uint32_t bs) {
     HN4_LOG_VAL("Generic TRIM/Discard. Bytes", capacity_bytes);
@@ -337,23 +366,29 @@ static hn4_result_t _survey_silicon_cartography(
  */
 static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev, 
                                           hn4_addr_t start_lba, 
-                                          uint64_t byte_len, 
+                                          hn4_size_t byte_len, 
                                           uint32_t block_size) 
 {
     /* Guard against empty regions */
+#ifdef HN4_USE_128BIT
+    if (byte_len.lo == 0 && byte_len.hi == 0) return HN4_OK;
+    
+    /* Alignment Check for 128-bit: Mask check low bits */
+    if ((byte_len.lo & (block_size - 1)) != 0) return HN4_ERR_ALIGNMENT_FAIL;
+#else
     if (byte_len == 0) return HN4_OK;
+    if (!HN4_IS_ALIGNED(byte_len, block_size)) return HN4_ERR_ALIGNMENT_FAIL;
+#endif
+
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
     uint32_t ss = caps ? caps->logical_block_size : 512;
     
-    /* Ensure request is aligned to Block Size, AND Block Size is aligned to Sector Size */
-    if (!HN4_IS_ALIGNED(byte_len, block_size) || !HN4_IS_ALIGNED(block_size, ss)) {
-        return HN4_ERR_ALIGNMENT_FAIL;
-    }
+    if (!HN4_IS_ALIGNED(block_size, ss)) return HN4_ERR_ALIGNMENT_FAIL;
 
     void* buffer = NULL;
     uint32_t buf_sz = 0;
 
-    /* Waterfall Allocator: Try big, fallback to small */
+    /* Waterfall Allocator */
     for (int i = 0; i < 3; i++) {
         buffer = hn4_hal_mem_alloc(PREF_IO_SIZES[i]);
         if (buffer) {
@@ -363,16 +398,14 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     }
     
     if (!buffer) return HN4_ERR_NOMEM;
-    
     memset(buffer, 0, buf_sz);
     
-    HN4_LOG_VAL("Zeroing Region LBA", hn4_addr_to_u64(start_lba));
-
     hn4_result_t res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, start_lba, buffer, byte_len, block_size);
     
     hn4_hal_mem_free(buffer);
     return res;
 }
+
 
 /**
  * _check_profile_compatibility
@@ -649,8 +682,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     
     /* Clamp overlap */
     if (horizon_start <= offset) {
-        horizon_start = offset + 1024 * bs; 
-        /* [MANUAL FIX] Ensure we don't hit the Chronicle */
+        horizon_start = offset + (1024ULL * bs); 
         if (horizon_start + min_horizon > chron_start_offset) return HN4_ERR_ENOSPC;
     }
 

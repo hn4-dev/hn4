@@ -909,13 +909,8 @@ hn4_TEST(Time, Read_Reject_Future_Block) {
 
     uint8_t buf[4096];
     hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-
-    /* 
-     * FIX: Strict Equality Enforcement
-     * The reader MUST return HN4_ERR_GENERATION_SKEW because Gen 11 > Gen 10.
-     * This represents a torn transaction where the anchor update failed.
-     */
-    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "FUTURE_DATA", 11));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1160,12 +1155,6 @@ hn4_TEST(Safety, Generation_High_Bit_Attack) {
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
     anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
 
-    /* 
-     * Simulated Wrap-Around Aliasing:
-     * Disk has generation 4294967297 (0x1_0000_0001).
-     * Anchor has generation 1.
-     * In a 32-bit rolling window, these are the same transaction slot.
-     */
     uint64_t attack_gen = 0x100000001ULL; 
     uint64_t lba = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
     
@@ -1173,14 +1162,7 @@ hn4_TEST(Safety, Generation_High_Bit_Attack) {
 
     uint8_t buf[4096];
     hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-
-    /* 
-     * FIX: Expect HN4_OK. 
-     * The reader now casts 64-bit disk generation to 32-bit before comparison 
-     * to support architectural wrap-around.
-     */
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(0, memcmp(buf, "ATTACK", 6));
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1215,9 +1197,9 @@ hn4_TEST(Logic, Read_Generation_Strictness) {
     anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
 
     /* 
-     * Case 1: High Bits Set (Simulated Wrap)
+     * Case 1: High Bits Set (Simulated Wrap / Invalid)
      * Disk has 0x00000001_00000005. Anchor has 5.
-     * Fix: Expect SUCCESS (Upper bits masked).
+     * Fix: Expect SKEW because high bits are non-zero.
      */
     uint64_t dirty_gen = 0x0000000100000005ULL;
     uint64_t lba0 = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
@@ -1226,9 +1208,7 @@ hn4_TEST(Logic, Read_Generation_Strictness) {
     uint8_t buf[4096] = {0};
     hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
     
-    /* Was SKEW, now OK due to 32-bit cast fix */
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(0, memcmp(buf, "DIRTY_GEN", 9));
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
     /* 
      * Case 2: Exact Match
@@ -1245,17 +1225,18 @@ hn4_TEST(Logic, Read_Generation_Strictness) {
     ASSERT_EQ(0, memcmp(buf, "GOOD_GEN", 8));
 
     /* 
-     * Case 3: Lower Bits Mismatch (Skew)
+     * Case 3: Newer Generation (Recovery)
      * Disk has 6. Anchor has 5.
-     * Expect: HN4_ERR_GENERATION_SKEW.
+     * Expect: OK (Durability First Policy).
      */
     anchor.seed_id.lo = 0xA03; 
     uint64_t lba2 = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
-    _inject_test_block(vol, lba2, anchor.seed_id, 6, "BAD_GEN", 7, INJECT_CLEAN); 
+    _inject_test_block(vol, lba2, anchor.seed_id, 6, "NEW_GEN", 7, INJECT_CLEAN); 
 
     memset(buf, 0, 4096);
     res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "NEW_GEN", 7));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -2741,19 +2722,17 @@ hn4_TEST(SystemProfile, Epoch_Mismatch) {
 
     uint64_t lba = _calc_trajectory_lba(vol, 6000, 0, 0, 0, 0);
     
-    /* Inject Disk Generation 11 (Future/Skewed) */
+    /* Inject Disk Generation 11 (Future/Recovered) */
     _inject_test_block(vol, lba, anchor.seed_id, 11, "FUTURE_SYS", 10, INJECT_CLEAN);
 
     uint8_t buf[4096];
     hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-
-    /* Must reject as SKEW */
-    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "FUTURE_SYS", 10));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
 }
-
 
 /* =========================================================================
  * FIXTURE HELPER: PICO SETUP (512-byte Blocks)
@@ -4118,6 +4097,157 @@ hn4_TEST(Compression, Gradient_Range_Rejection) {
     ASSERT_EQ(HN4_ERR_DATA_ROT, res);
 
     free(raw);
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+/*
+ * TEST: Math.Orbit_Vector_Byte_Assembly
+ * OBJECTIVE: Verify that the 6-byte orbit vector is correctly assembled into a 
+ *            64-bit integer without endian corruption or stack garbage leaks.
+ *            (Validates Fix 1 in hn4_read.c).
+ */
+hn4_TEST(Math, Orbit_Vector_Byte_Assembly) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xA1;
+    anchor.gravity_center = hn4_cpu_to_le64(100);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    /* 
+     * Set V to a pattern using all 48 bits (6 bytes): 0x112233445566.
+     * If the reader uses a naive cast/memcpy on LE, it works. 
+     * If it uses unsafe logic, the top 2 bytes might be garbage.
+     * We verify by injecting at the calculated location of this specific V.
+     */
+    uint8_t raw_v[6] = {0x66, 0x55, 0x44, 0x33, 0x22, 0x11};
+    memcpy(anchor.orbit_vector, raw_v, 6);
+
+    uint64_t V_assembled = 0x112233445566ULL;
+    
+    /* Calculate expected location for this V */
+    uint64_t lba = _calc_trajectory_lba(vol, 100, V_assembled, 0, 0, 0);
+    
+    _inject_test_block(vol, lba, anchor.seed_id, 1, "VECTOR_TEST", 11, INJECT_CLEAN);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "VECTOR_TEST", 11));
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Epoch.Ancient_Generation_Rejection
+ * OBJECTIVE: Verify that while "Future" blocks (recovery) are accepted, 
+ *            "Ancient" blocks (negative skew) are strictly rejected.
+ *            Validates the signed math fix in generation comparison.
+ */
+hn4_TEST(Epoch, Ancient_Generation_Rejection) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xC3;
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.write_gen = hn4_cpu_to_le32(100);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    uint64_t lba = _calc_trajectory_lba(vol, 1000, 0, 0, 0, 0);
+    
+    /* Inject Ancient Block (Gen 99). 99 < 100. */
+    _inject_test_block(vol, lba, anchor.seed_id, 99, "STALE", 5, INJECT_CLEAN);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    /* Must reject. 99 - 100 is negative. */
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Security.Immutable_Allow_Read
+ * OBJECTIVE: Verify HN4_PERM_IMMUTABLE does NOT prevent reading.
+ */
+hn4_TEST(Security, Immutable_Allow_Read) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xF6;
+    anchor.gravity_center = hn4_cpu_to_le64(400);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    /* Set Immutable + Read */
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_IMMUTABLE);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    uint64_t lba = _calc_trajectory_lba(vol, 400, 0, 0, 0, 0);
+    _inject_test_block(vol, lba, anchor.seed_id, 1, "READ_ME", 7, INJECT_CLEAN);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    /* Expect Success */
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "READ_ME", 7));
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Logic.Orbit_Limit_Boundary
+ * OBJECTIVE: Verify scanner stops exactly at HN4_ORBIT_LIMIT (12).
+ *            Inject valid data at k=12 (Index 12 is the 13th orbit).
+ *            Reader should NOT find it.
+ */
+hn4_TEST(Logic, Orbit_Limit_Boundary) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = _mount_with_profile(dev, HN4_PROFILE_GENERIC); /* Limit 12 */
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x77;
+    anchor.gravity_center = hn4_cpu_to_le64(700);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    /* Calculate k=12 (13th position) */
+    uint64_t lba12 = _calc_trajectory_lba(vol, 700, 0, 0, 0, 12);
+    
+    /* Inject Valid Data there */
+    _inject_test_block(vol, lba12, anchor.seed_id, 1, "TOO_FAR", 7, INJECT_CLEAN);
+
+    /* Ensure k=0..11 are empty */
+    for(int k=0; k<12; k++) {
+        uint64_t lba = _calc_trajectory_lba(vol, 700, 0, 0, 0, k);
+        bool c; _bitmap_op(vol, lba, BIT_CLEAR, &c);
+    }
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    /* Expect NOT_FOUND or SPARSE because k=12 is out of bounds for the scanner loop (0..11) */
+    ASSERT_NE(HN4_OK, res);
+
     hn4_unmount(vol);
     read_fixture_teardown(dev);
 }

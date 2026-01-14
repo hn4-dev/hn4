@@ -123,12 +123,14 @@ static hn4_result_t _validate_block(
 
     if (magic_val == 0xCCCCCCCC) {
         /* Poison Heuristic: Scan first cache line to confirm strict poisoning */
-        const uint64_t* scan = (const uint64_t*)buffer;
         bool is_poison = true;
+        uint64_t val;
 
         /* Check 64 bytes (8 x 64-bit words) */
         for (int i = 0; i < 8; i++) {
-            if (scan[i] != 0xCCCCCCCCCCCCCCCCULL) {
+            memcpy(&val, (const uint8_t*)buffer + (i * 8), sizeof(uint64_t));
+
+            if (val != 0xCCCCCCCCCCCCCCCCULL) {
                 is_poison = false;
                 break;
             }
@@ -160,11 +162,17 @@ static hn4_result_t _validate_block(
     /*
      * 4. Freshness Check (STRICT ATOMICITY)
      */
-    uint64_t blk_gen_64 = hn4_le64_to_cpu(hdr->generation);
+     uint64_t blk_gen_64 = hn4_le64_to_cpu(hdr->generation);
+    
+    if ((blk_gen_64 >> 32) != 0) {
+        return HN4_ERR_GENERATION_SKEW;
+    }
+
     uint32_t blk_gen_32 = (uint32_t)blk_gen_64;
     uint32_t exp_gen_32 = (uint32_t)expected_gen;
-
-    if (blk_gen_32 != exp_gen_32) {
+    int32_t gen_diff = (int32_t)(blk_gen_32 - exp_gen_32);
+    
+    if (gen_diff < 0) {
         return HN4_ERR_GENERATION_SKEW;
     }
 
@@ -215,9 +223,11 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 {
     if (HN4_UNLIKELY(!vol || !anchor_ptr || !out_buffer)) return HN4_ERR_INVALID_ARGUMENT;
 
-    /* Snapshot Anchor to Stack to prevent TOCTOU races */
     hn4_anchor_t anchor;
+    
+    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
     memcpy(&anchor, anchor_ptr, sizeof(hn4_anchor_t));
+    hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
     /* Caller Contract Enforcement */
     uint32_t payload_cap = HN4_BLOCK_PayloadSize(vol->vol_block_size);
@@ -234,11 +244,16 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     if ((perms & HN4_PERM_ENCRYPTED) || (dclass & HN4_HINT_ENCRYPTED)) return HN4_ERR_ACCESS_DENIED;
 
     /* 2. Physics & Geometry Extraction */
-    uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
+     uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
 
-    uint64_t V = 0;
-    memcpy(&V, anchor.orbit_vector, 6);
-    V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
+    const uint8_t* raw_v = anchor.orbit_vector;
+
+    uint64_t V = (uint64_t)raw_v[0] |
+                 ((uint64_t)raw_v[1] << 8)  |
+                 ((uint64_t)raw_v[2] << 16) |
+                 ((uint64_t)raw_v[3] << 24) |
+                 ((uint64_t)raw_v[4] << 32) |
+                 ((uint64_t)raw_v[5] << 40);
 
     uint16_t   M          = hn4_le16_to_cpu(anchor.fractal_scale);
     hn4_u128_t well_id    = hn4_le128_to_cpu(anchor.seed_id);
@@ -358,7 +373,9 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 }
 
                 if (is_allocated) {
-                    candidates[valid_candidates++] = lba;
+                    if (valid_candidates < HN4_SHOTGUN_DEPTH) {
+                        candidates[valid_candidates++] = lba;
+                    }
                 }
             }
         }
@@ -424,33 +441,17 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen, dclass);
 
                 if (val_res == HN4_OK) {
-                    /* Bitmap Race Window Check */
-                    bool still_alloc;
-                    if (_bitmap_op(vol, target_lba, BIT_TEST, &still_alloc) == HN4_OK && !still_alloc) {
-                        io_res = HN4_ERR_PHANTOM_BLOCK;
-                    } else {
-                        /*
-                         * Pre-emptive Healing Trigger.
-                         * If the HAL reported a Soft Error (INFO_HEALED) during the read,
-                         * mark this candidate as needing repair (failed_mask) despite success.
-                         * This forces Auto-Medic to rewrite the degrading block.
-                         */
-                        if (io_res == HN4_INFO_HEALED) {
-                            failed_mask |= (1ULL << i);
-                            /* Set error code to ROT to signal repair logic */
-                            candidate_errors[i] = HN4_ERR_DATA_ROT;
-                        }
-
-                        io_res = HN4_OK;
+                    if (io_res == HN4_INFO_HEALED) {
+                        /* Mark candidate for repair if HAL reported soft error */
+                        failed_mask |= (1U << i);
+                        candidate_errors[i] = HN4_ERR_DATA_ROT;
                     }
-                    break;
-                }
-
-                if (val_res != HN4_ERR_DATA_ROT && val_res != HN4_ERR_PAYLOAD_ROT) {
+                    io_res = HN4_OK;
+                } else if (val_res != HN4_ERR_DATA_ROT && val_res != HN4_ERR_PAYLOAD_ROT) {
                     io_res = val_res;
-                    break;
+                } else {
+                    io_res = val_res;
                 }
-                io_res = val_res;
             }
 
             if (++tries < max_retries && io_res != HN4_OK) {
@@ -510,7 +511,14 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 deep_error = decomp_res;
 
                 if (HN4_UNLIKELY(profile == HN4_PROFILE_GAMING)) {
-                    uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, 0);
+                    uint8_t next_k = 0;
+                    uint64_t next_cluster = (block_idx + 1) >> 4;
+                    if (next_cluster < 16) {
+                        uint32_t h = hn4_le32_to_cpu(anchor.orbit_hints);
+                        next_k = (h >> (next_cluster * 2)) & 0x3;
+                    }
+                    
+                    uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, next_k);
                     if (next_lba != HN4_LBA_INVALID && next_lba < max_blocks) {
                          hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
                          hn4_hal_prefetch(vol->target_device, pf_phys, sectors);
@@ -562,6 +570,8 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                         /* Polish: Save original CRC to restore state after write attempt */
                         uint32_t saved_crc = w_hdr->header_crc;
 
+                        uint32_t d_len = HN4_BLOCK_PayloadSize(vol->vol_block_size);
+                        w_hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, w_hdr->payload, d_len));
                         w_hdr->header_crc = 0;
                         w_hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, w_hdr, h_bound));
                         /* Data CRC assumed valid from previous read pass */

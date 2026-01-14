@@ -184,10 +184,13 @@ _Check_return_ hn4_result_t hn4_repair_block(
              * This indicates a severe system instability. Mark volume Degraded.
              */
             if (!success) {
-                HN4_LOG_CRIT("Auto-Medic CAS Starvation on LBA %llu. Marking DEGRADED.", (unsigned long long)lba_val);
+                HN4_LOG_CRIT("Auto-Medic CAS Starvation. Marking DEGRADED.");
                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DEGRADED);
-                /* Default fail safe */
-                res = HN4_ERR_ATOMICS_TIMEOUT;
+                
+                /* If data was repaired, return OK despite metadata timeout */
+                if (res != HN4_OK) {
+                    res = HN4_ERR_ATOMICS_TIMEOUT;
+                }
             }
         }
     }

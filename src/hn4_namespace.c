@@ -208,42 +208,47 @@ hn4_result_t _ns_scan_cortex_slot(
         hn4_anchor_t best_cand;
         uint64_t best_slot = 0;
 
+        /* Lookahead: 4 slots (512 bytes) covers ~8 cache lines */
         #define LOOKAHEAD 4
 
         for (uint32_t i = 0; i < HN4_NS_MAX_PROBES; i++) {
             uint64_t curr_slot = (start_slot + i) % total_slots;
             
-            /* PIPELINE: Prefetch future data */
+            /* PIPELINE: Prefetch future data into L1 */
             uint64_t next_slot = (start_slot + i + LOOKAHEAD) % total_slots;
-            HN4_PREFETCH(&ram_base[next_slot]);
-            HN4_PREFETCH((const uint8_t*)&ram_base[next_slot] + 64);
+            const hn4_anchor_t* next_ptr = &ram_base[next_slot];
+            HN4_PREFETCH(next_ptr);              /* Cache Line 1: IDs */
+            HN4_PREFETCH((const uint8_t*)next_ptr + 64); /* Cache Line 2: Gen/CRC */
 
             const hn4_anchor_t* raw = &ram_base[curr_slot];
             
-            /* 
-             * FIX: REMOVED "WALL" CHECK (break on zero).
-             * We now continue scanning even if we hit a zero slot, 
-             * to find items that might be stranded after a gap (Robustness).
-             */
+            /* Check Data Class (Validity) */
+            uint64_t dclass_le = raw->data_class;
             
-            /* Decode Class */
-            uint64_t dclass = hn4_le64_to_cpu(raw->data_class);
-            
-            /* Skip Invalid AND Skip Non-Tombstones (Empty slots fall here) */
+            /* The "Wall": Empty slot stops linear probe */
+            if (raw->seed_id.lo == 0 && raw->seed_id.hi == 0 && dclass_le == 0) {
+                break; 
+            }
+
+            uint64_t dclass = hn4_le64_to_cpu(dclass_le);
             if (!(dclass & HN4_FLAG_VALID) && !(dclass & HN4_FLAG_TOMBSTONE)) continue;
 
-            /* Check Identity */
+            /* Check Identity (Use fast 64-bit int compare) */
             if (raw->seed_id.lo != hn4_cpu_to_le64(target_seed.lo)) continue;
             if (raw->seed_id.hi != hn4_cpu_to_le64(target_seed.hi)) continue;
 
-            /* Verify Integrity */
+            /* Candidate Found: Verify Integrity */
             hn4_anchor_t temp;
             memcpy(&temp, raw, sizeof(hn4_anchor_t));
+            
             uint32_t stored_crc = hn4_le32_to_cpu(temp.checksum);
             temp.checksum = 0;
-            
-            if (stored_crc == hn4_crc32(0, &temp, sizeof(hn4_anchor_t))) {
+            uint32_t calc_crc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
+
+            if (stored_crc == calc_crc) {
                 uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
+                
+                /* Resolve Duplicate/Update Conflicts */
                 if (!found || curr_gen > max_gen) {
                     memcpy(&best_cand, &temp, sizeof(hn4_anchor_t));
                     best_slot = curr_slot;
@@ -582,9 +587,10 @@ static uint64_t _ns_parse_time_slice(const char* s)
     uint64_t y = 0, m = 0, d = 1; /* Default to 1st of month */
     
     /* Parse Year */
-     while (*s >= '0' && *s <= '9') {
+    while (*s >= '0' && *s <= '9') {
         y = (y * 10) + (*s++ - '0');
-        if (y > 3000) return 0; /* Cap at Year 3000 to prevent overflow/nonsense */
+        /* 64-bit nanosecond overflow occurs ~2262 AD */
+        if (y > 2260) return 0; 
     }
     if (*s == '-') s++;
     

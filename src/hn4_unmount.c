@@ -109,14 +109,12 @@ static hn4_result_t _broadcast_superblock(
 
     _secure_zero(io_buf, buf_sz);
 
-    /* 
-     * Allocating 8KB on the stack is unsafe in kernel contexts.
-     */
     hn4_superblock_t* cpu_sb = hn4_hal_mem_alloc(sizeof(hn4_superblock_t));
     if (!cpu_sb) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_NOMEM;
     }
+
 
     memcpy(cpu_sb, &vol->sb, sizeof(hn4_superblock_t));
 

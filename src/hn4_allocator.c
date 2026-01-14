@@ -145,31 +145,24 @@ _hn4_cas128(volatile void *dst,
 
 #elif defined(__aarch64__)
 
-    /*
-     * CASPAL does:
-     *   atomically compare pair <Xdest_lo,Xdest_hi>
-     *           with pair <Xexp_lo,Xexp_hi>
-     *   on match store pair <Xnew_lo,Xnew_hi> to [dst]
-     *   ALWAYS return memory value in Xexp_lo/Xexp_hi
-     */
-
-    uint64_t exp_lo = expected->lo;
-    uint64_t exp_hi = expected->hi;
-    uint64_t new_lo = desired.lo;
-    uint64_t new_hi = desired.hi;
+    /* FIX: Enforce even-odd register pairs (x0,x1 and x2,x3) for CASPAL */
+    register uint64_t x0_lo asm("x0") = expected->lo;
+    register uint64_t x1_hi asm("x1") = expected->hi;
+    register uint64_t x2_lo asm("x2") = desired.lo;
+    register uint64_t x3_hi asm("x3") = desired.hi;
 
     __asm__ __volatile__ (
-        "caspal %0, %1, %2, %3, [%4]"
-        : "+r"(exp_lo), "+r"(exp_hi)
-        : "r"(new_lo), "r"(new_hi), "r"(dst)
+        "caspal x0, x1, x2, x3, [%4]"
+        : "+r"(x0_lo), "+r"(x1_hi)
+        : "r"(x2_lo), "r"(x3_hi), "r"(dst)
         : "memory"
     );
 
-    bool success = (exp_lo == expected->lo) &&
-                   (exp_hi == expected->hi);
+    bool success = (x0_lo == expected->lo) &&
+                   (x1_hi == expected->hi);
 
-    expected->lo = exp_lo;
-    expected->hi = exp_hi;
+    expected->lo = x0_lo;
+    expected->hi = x1_hi;
 
     return success;
 

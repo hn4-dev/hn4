@@ -768,17 +768,23 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
 
     uint64_t cap_blocks = cap_64 / bs;
     
-    /* FIX: Strict Overflow Checking for Allocation Size */
-    size_t armor_words = (size_t)((cap_blocks + 63) / 64);
+    /* Calculate words required (u64 calculation) */
+    uint64_t armor_words_u64 = (cap_blocks + 63) / 64;
     size_t struct_size = sizeof(hn4_armored_word_t); // 16 bytes
-    
-    /* check: armor_words * struct_size > SIZE_MAX */
-    if (armor_words > (SIZE_MAX / struct_size)) {
-        HN4_LOG_CRIT("Mount Fail: Bitmap allocation size overflows system addressable memory.");
+
+    if (armor_words_u64 > (SIZE_MAX / struct_size)) {
+        HN4_LOG_CRIT("Mount Fail: Bitmap size exceeds addressable RAM.");
         return HN4_ERR_NOMEM;
     }
-    
+
+    size_t armor_words = (size_t)armor_words_u64;
     size_t alloc_bytes = armor_words * struct_size;
+
+    /* Double check against heuristic limits */
+    if (alloc_bytes > (SIZE_MAX / 4)) {
+        HN4_LOG_CRIT("Mount Fail: Bitmap requires >25%% kernel RAM.");
+        return HN4_ERR_NOMEM;
+    }
 
     /* If the bitmap takes > 25% of theoretical address space (e.g. 1GB on 32-bit), reject */
     if (alloc_bytes > (SIZE_MAX / 4)) {
@@ -1504,6 +1510,12 @@ static hn4_result_t _reconstruct_cortex_state(
         /* Calculate Block Count needed for this Mass */
         uint32_t payload_sz = bs - sizeof(hn4_block_header_t); 
         uint64_t blocks_needed = (mass + payload_sz - 1) / payload_sz;
+
+        uint64_t phys_total_blocks = vol->vol_capacity_bytes / bs;
+        if (blocks_needed > phys_total_blocks) {
+            HN4_LOG_WARN("Corrupt Mass in Anchor %u. Skipping reconstruction.", i);
+            continue;
+        }
 
        /* C. Re-Project Trajectory (Deep-Scan Recovery) */
         
