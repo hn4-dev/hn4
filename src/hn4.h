@@ -556,13 +556,15 @@ typedef struct HN4_PACKED HN4_ALIGNED(16) {
 #endif
 
 
-#define HN4_MEDIC_QUEUE_SIZE 64
-
-
 typedef struct {
     atomic_flag flag;
     uint32_t    pad; 
 } hn4_spinlock_t;
+
+#define HN4_MEDIC_QUEUE_SIZE 64
+
+#define HN4_CORTEX_SHARD_BITS   6
+#define HN4_CORTEX_SHARDS       (1 << HN4_CORTEX_SHARD_BITS) /* 64 */
 
 
 typedef struct {
@@ -588,6 +590,35 @@ typedef struct {
     void*           npu_tunnel_ctx; /* GPU Direct Context */
 } hn4_handle_t;
 
+/* 
+ * THE ECHO CHAMBER (Transient Metadata Log)
+ * Aligned to 32 bytes for cache efficiency and obfuscation padding.
+ */
+#define HN4_MAGIC_ECHO 0xECA0
+
+typedef struct HN4_PACKED {
+    uint32_t slot_idx;      /* Index in the Cortex array */
+    uint32_t write_gen;     /* New generation ID */
+    uint64_t mass;          /* New file size */
+    uint64_t mod_clock;     /* Timestamp */
+    uint32_t partial_crc;   /* Checksum of this entry */
+    uint16_t magic;         /* HN4_MAGIC_ECHO (Obfuscated) */
+    uint16_t flags;         /* Commit / Tombstone markers */
+} hn4_echo_entry_t;
+
+_Static_assert(sizeof(hn4_echo_entry_t) == 32, "Echo Entry must be 32 bytes");
+
+
+typedef struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+    hn4_spinlock_t lock;
+    /* 
+     * Padding ensures that acquiring lock[i] does not invalidate 
+     * the cache line for lock[i+1] on other cores.
+     */
+    uint8_t        pad[HN4_CACHE_LINE_SIZE - sizeof(hn4_spinlock_t)];
+} hn4_shard_lock_t;
+
+
 /* Runtime Volume Handle */
 typedef struct {
     /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
@@ -598,16 +629,14 @@ typedef struct {
     uint64_t            sb_offsets_bytes[4]; 
 
     /* MATH OPTIMIZATION: Shift/Masks replace CPU Division */
-    /* Use: offset >> vol->block_shift instead of offset / block_size */
     uint32_t            block_shift;      
-    /* Use: lba & vol->cap_mask instead of lba % capacity (if Power-of-2) */
     hn4_size_t          cap_mask;         
     
     hn4_size_t          vol_capacity_bytes;
     uint32_t            vol_block_size;
 
     /* Memory Structures */
-    hn4_armored_word_t* void_bitmap;
+    hn4_armored_word_t* void_bitmap;    /* Physical Allocator Bitmap (L1) */
     size_t              bitmap_size;
     uint64_t*           quality_mask;   
     size_t              qmask_size;
@@ -634,13 +663,7 @@ typedef struct {
         uint64_t            scavenger_cursor; 
     } alloc;
 
-
     /* --- HOT ZONE B: HEALTH & RECOVERY (Scavenger/Monitor Path) --- */
-    /* 
-     * ALIGNMENT CRITICAL:
-     * Keeps high-frequency counters away from allocator locks.
-     * Replaces previous 'stats' nested struct.
-     */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
         _Atomic uint32_t    taint_counter; 
         _Atomic uint64_t    toxic_blocks;  
@@ -653,9 +676,7 @@ typedef struct {
         _Atomic uint32_t    trajectory_collapse_counter;
     } health;
 
-    /* --- COLD ZONE (Locking & Topology) --- */
-    
-    /* AI Topology Map */
+    /* --- COLD ZONE (Topology) --- */
     struct {
         uint32_t gpu_id;
         uint32_t affinity_weight;
@@ -668,10 +689,21 @@ typedef struct {
     hn4_medic_queue_t   medic_queue;
     int64_t             last_log_ts;
 
-    /* L2 Locking (Isolated) */
+    /* --- HIGH-THROUGHPUT LOCKING ZONE --- */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
-        hn4_spinlock_t      l2_lock;       
+        
+        /* OPTIMIZATION 1: Sharded Swarm Locks */
+        /* Replaces single l2_lock with 64 isolated locks (~4KB footprint) */
+        hn4_shard_lock_t    shards[HN4_CORTEX_SHARDS];
+ hn4_spinlock_t      l2_lock;     
+        /* Existing L2 Summary (for Block Allocation) */
         uint64_t*           l2_summary_bitmap; 
+
+        /* OPTIMIZATION 3: Cortex Occupancy Bitmap */
+        /* Dense bitmask tracking used Anchor slots. 1 bit per 128-byte slot. */
+        /* Allows finding free inodes via bit-scan instead of linear probe. */
+        uint64_t*           cortex_occupancy_bitmap;
+
         bool                in_eviction_path; 
     } locking;
 

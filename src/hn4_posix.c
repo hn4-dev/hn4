@@ -307,22 +307,40 @@ static int _find_free_slot(hn4_volume_t* vol, uint64_t* slot_idx) {
 
     while (checked < count) {
         if (i >= count) i = 0;
-        
-        uint64_t dclass = _imp_atomic_load_u64(&anchors[i].data_class);
-        dclass = hn4_le64_to_cpu(dclass);
 
-        if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
-            *slot_idx = i;
-            vol->alloc.cortex_search_head = i + 1;
-            hn4_hal_spinlock_release(&vol->locking.l2_lock);
-            return 0;
+        /* Fallback for end of buffer */
+        if (i + 4 >= count) {
+            uint64_t dc = hn4_le64_to_cpu(_imp_atomic_load_u64(&anchors[i].data_class));
+            if (!(dc & HN4_FLAG_VALID) || (dc & HN4_FLAG_TOMBSTONE)) goto found;
+            i++; checked++;
+            continue;
         }
-        i++;
-        checked++;
+
+        /* 4-Way Unroll with TOMBSTONE REUSE */
+        uint64_t d0 = hn4_le64_to_cpu(_imp_atomic_load_u64(&anchors[i+0].data_class));
+        if (!(d0 & HN4_FLAG_VALID) || (d0 & HN4_FLAG_TOMBSTONE)) goto found;
+
+        uint64_t d1 = hn4_le64_to_cpu(_imp_atomic_load_u64(&anchors[i+1].data_class));
+        if (!(d1 & HN4_FLAG_VALID) || (d1 & HN4_FLAG_TOMBSTONE)) { i+=1; goto found; }
+
+        uint64_t d2 = hn4_le64_to_cpu(_imp_atomic_load_u64(&anchors[i+2].data_class));
+        if (!(d2 & HN4_FLAG_VALID) || (d2 & HN4_FLAG_TOMBSTONE)) { i+=2; goto found; }
+
+        uint64_t d3 = hn4_le64_to_cpu(_imp_atomic_load_u64(&anchors[i+3].data_class));
+        if (!(d3 & HN4_FLAG_VALID) || (d3 & HN4_FLAG_TOMBSTONE)) { i+=3; goto found; }
+
+        i += 4; 
+        checked += 4;
     }
 
     hn4_hal_spinlock_release(&vol->locking.l2_lock);
     return -HN4_ENOSPC;
+
+found:
+    *slot_idx = i;
+    vol->alloc.cortex_search_head = i + 1;
+    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    return 0;
 }
 
 /* =========================================================================
@@ -396,7 +414,6 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         if (vol->read_only) return -HN4_EROFS;
 
         /* 
-         * FIX: PROBABILISTIC SLOT ALLOCATION 
          * Instead of a linear scan, we must find a UUID that hashes to a free slot.
          * This aligns the Disk Location (Hash Based) with the RAM Location.
          */

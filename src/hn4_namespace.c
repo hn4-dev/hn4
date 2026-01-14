@@ -186,6 +186,7 @@ hn4_result_t _ns_scan_cortex_slot(
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t ss = caps->logical_block_size;
     
+    /* 1. Geometry Calculation */
     uint64_t start_sect  = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
     uint64_t end_sect    = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
     uint64_t total_bytes = (end_sect - start_sect) * ss;
@@ -196,18 +197,85 @@ hn4_result_t _ns_scan_cortex_slot(
     uint64_t hash       = _ns_hash_uuid(target_seed);
     uint64_t start_slot = hash % total_slots;
 
+    /* =========================================================
+     * FAST PATH: RAM RESIDENT (NANO-CORTEX)
+     * ========================================================= */
+    if (vol->nano_cortex) {
+        hn4_anchor_t* ram_base = (hn4_anchor_t*)vol->nano_cortex;
+        
+        bool found = false;
+        uint32_t max_gen = 0;
+        hn4_anchor_t best_cand;
+        uint64_t best_slot = 0;
+
+        #define LOOKAHEAD 4
+
+        for (uint32_t i = 0; i < HN4_NS_MAX_PROBES; i++) {
+            uint64_t curr_slot = (start_slot + i) % total_slots;
+            
+            /* PIPELINE: Prefetch future data */
+            uint64_t next_slot = (start_slot + i + LOOKAHEAD) % total_slots;
+            HN4_PREFETCH(&ram_base[next_slot]);
+            HN4_PREFETCH((const uint8_t*)&ram_base[next_slot] + 64);
+
+            const hn4_anchor_t* raw = &ram_base[curr_slot];
+            
+            /* 
+             * FIX: REMOVED "WALL" CHECK (break on zero).
+             * We now continue scanning even if we hit a zero slot, 
+             * to find items that might be stranded after a gap (Robustness).
+             */
+            
+            /* Decode Class */
+            uint64_t dclass = hn4_le64_to_cpu(raw->data_class);
+            
+            /* Skip Invalid AND Skip Non-Tombstones (Empty slots fall here) */
+            if (!(dclass & HN4_FLAG_VALID) && !(dclass & HN4_FLAG_TOMBSTONE)) continue;
+
+            /* Check Identity */
+            if (raw->seed_id.lo != hn4_cpu_to_le64(target_seed.lo)) continue;
+            if (raw->seed_id.hi != hn4_cpu_to_le64(target_seed.hi)) continue;
+
+            /* Verify Integrity */
+            hn4_anchor_t temp;
+            memcpy(&temp, raw, sizeof(hn4_anchor_t));
+            uint32_t stored_crc = hn4_le32_to_cpu(temp.checksum);
+            temp.checksum = 0;
+            
+            if (stored_crc == hn4_crc32(0, &temp, sizeof(hn4_anchor_t))) {
+                uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
+                if (!found || curr_gen > max_gen) {
+                    memcpy(&best_cand, &temp, sizeof(hn4_anchor_t));
+                    best_slot = curr_slot;
+                    max_gen = curr_gen;
+                    found = true;
+                }
+            }
+        }
+
+        if (found) {
+            uint64_t best_dc = hn4_le64_to_cpu(best_cand.data_class);
+            if (best_dc & HN4_FLAG_TOMBSTONE) return HN4_ERR_TOMBSTONE;
+            
+            if (out_anchor) memcpy(out_anchor, &best_cand, sizeof(hn4_anchor_t));
+            if (out_slot_idx) *out_slot_idx = best_slot;
+            return HN4_OK;
+        }
+        return HN4_ERR_NOT_FOUND;
+    }
+
+    /* =========================================================
+     * SLOW PATH: DIRECT IO (FALLBACK)
+     * ========================================================= */
     uint32_t io_sz = ss * 2;
     void*    buf   = hn4_hal_mem_alloc(io_sz);
-    
     if (!buf) return HN4_ERR_NOMEM;
 
-    /* Generation Tracking State */
     bool         found = false;
     uint32_t     max_gen = 0;
     uint64_t     best_slot = 0;
     hn4_anchor_t best_cand;
 
-    /* Linear Probe Loop (Bounded by HN4_NS_MAX_PROBES) */
     for (uint32_t i = 0; i < HN4_NS_MAX_PROBES; i++) {
         uint64_t curr_slot = (start_slot + i) % total_slots;
         
@@ -215,62 +283,33 @@ hn4_result_t _ns_scan_cortex_slot(
         uint64_t sector_off  = byte_offset / ss;
         uint64_t byte_in_sec = byte_offset % ss;
         
-        hn4_addr_t read_lba     = hn4_addr_add(vol->sb.info.lba_cortex_start, sector_off);
-        uint32_t   read_sectors = (byte_in_sec + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
+        hn4_addr_t read_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, sector_off);
+        uint32_t   read_n   = (byte_in_sec + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
 
-         if (read_sectors * ss > io_sz) { 
-            hn4_hal_mem_free(buf);
-            return HN4_ERR_INTERNAL_FAULT;
-        }
-
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, read_lba, buf, read_sectors) != HN4_OK) {
-            continue; 
-        }
+        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, read_lba, buf, read_n) != HN4_OK) continue;
 
         const hn4_anchor_t* raw = (const hn4_anchor_t*)((uint8_t*)buf + byte_in_sec);
         
-        /* 1. Empty Slot Check (The "Wall") */
-        /* An empty slot (Zero ID + Invalid + Not Tombstone) terminates the probe chain */
-        uint64_t dclass       = hn4_le64_to_cpu(raw->data_class);
-        bool     is_valid     = (dclass & HN4_FLAG_VALID);
-        bool     is_tombstone = (dclass & HN4_FLAG_TOMBSTONE);
-        bool     is_zero_id   = (raw->seed_id.lo == 0 && raw->seed_id.hi == 0);
+        uint64_t dclass = hn4_le64_to_cpu(raw->data_class);
+        bool is_valid = (dclass & HN4_FLAG_VALID);
+        bool is_tomb  = (dclass & HN4_FLAG_TOMBSTONE);
+        bool is_zero  = (raw->seed_id.lo == 0 && raw->seed_id.hi == 0);
 
-        if (is_zero_id && !is_valid && !is_tombstone) {
-            /* End of Chain */
-            break; 
-        }
+        if (is_zero && !is_valid && !is_tomb) break; /* Wall */
+        if (!is_valid && !is_tomb) continue;
 
-        if (!is_valid && !is_tombstone) continue;
-
-        /* 2. Identity Match */
         hn4_u128_t cand_id = hn4_le128_to_cpu(raw->seed_id);
         if (cand_id.lo == target_seed.lo && cand_id.hi == target_seed.hi) {
-            
-            /* Check CRC */
             hn4_anchor_t temp;
             memcpy(&temp, raw, sizeof(hn4_anchor_t));
-            
-            uint32_t stored_crc = hn4_le32_to_cpu(temp.checksum);
-            
+            uint32_t stored = hn4_le32_to_cpu(temp.checksum);
             temp.checksum = 0;
-
-            uint32_t calc_crc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
-
-            if (stored_crc == calc_crc) {
-                uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
-                
-                /* 
-                 * 3. Generation Selection
-                 * If we find a newer version, replace the candidate.
-                 * Note: Tombstones are valid matches for ID lookup,
-                 * but we track them to ensure we don't return an older valid file 
-                 * over a newer tombstone.
-                 */
-                if (!found || curr_gen > max_gen) {
+            if (stored == hn4_crc32(0, &temp, sizeof(hn4_anchor_t))) {
+                uint32_t g = hn4_le32_to_cpu(temp.write_gen);
+                if (!found || g > max_gen) {
                     memcpy(&best_cand, &temp, sizeof(hn4_anchor_t));
                     best_slot = curr_slot;
-                    max_gen = curr_gen;
+                    max_gen = g;
                     found = true;
                 }
             }
@@ -280,15 +319,9 @@ hn4_result_t _ns_scan_cortex_slot(
     hn4_hal_mem_free(buf);
 
     if (found) {
-        /* Check if the winner is a tombstone */
-        uint64_t best_dclass = hn4_le64_to_cpu(best_cand.data_class);
-        if (best_dclass & HN4_FLAG_TOMBSTONE) {
-            return HN4_ERR_TOMBSTONE;
-        }
-        
-        memcpy(out_anchor, &best_cand, sizeof(hn4_anchor_t));
+        if (hn4_le64_to_cpu(best_cand.data_class) & HN4_FLAG_TOMBSTONE) return HN4_ERR_TOMBSTONE;
+        if (out_anchor) memcpy(out_anchor, &best_cand, sizeof(hn4_anchor_t));
         if (out_slot_idx) *out_slot_idx = best_slot;
-        
         return HN4_OK;
     }
 

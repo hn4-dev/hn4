@@ -2,7 +2,7 @@
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
  * MODULE:      Namespace Logic Tests (Spec Compliance)
  * SOURCE:      hn4_namespace_tests.c
- * STATUS:      FIXED / PRODUCTION
+ * STATUS:      PRODUCTION
  *
  * TEST OBJECTIVE:
  * Verify Spec 6.0 Compliance for Hashing, URI Grammar, Slicing, and Extensions.
@@ -1194,6 +1194,7 @@ hn4_TEST(Namespace, Multi_Generation_Shadowing) {
     v1.write_gen = hn4_cpu_to_le32(1);
     v1.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
     strncpy((char*)v1.inline_buffer, "shared.txt", 20);
+    v1.checksum = 0; /* Clear before calc */
     v1.checksum = hn4_cpu_to_le32(hn4_crc32(0, &v1, sizeof(hn4_anchor_t)));
 
     /* --- Gen 5: Newest Version --- */
@@ -1209,14 +1210,20 @@ hn4_TEST(Namespace, Multi_Generation_Shadowing) {
     v3.checksum = 0; 
     v3.checksum = hn4_cpu_to_le32(hn4_crc32(0, &v3, sizeof(hn4_anchor_t)));
 
-    /* Write chain: [Slot] -> Gen1, [Slot+1] -> Gen5, [Slot+2] -> Gen3 */
+    /* Write chain to DISK: [Slot] -> Gen1, [Slot+1] -> Gen5, [Slot+2] -> Gen3 */
     _local_write_anchor(dev, &vol.sb, start_slot, &v1);
     _local_write_anchor(dev, &vol.sb, (start_slot + 1) % total_slots, &v5);
     _local_write_anchor(dev, &vol.sb, (start_slot + 2) % total_slots, &v3);
 
+    /* 
+     * The optimized driver reads from RAM if vol.nano_cortex is set.
+     * We must populate the RAM from the Disk writes we just performed.
+     */
+    hn4_hal_sync_io(dev, HN4_IO_READ, vol.sb.info.lba_cortex_start, vol.nano_cortex, 256);
+
     hn4_anchor_t out;
 
-    /* Test 1: ID Lookup (Probing) */
+    /* Test 1: ID Lookup (Probing via RAM Fast Path) */
     char id_str[64];
     snprintf(id_str, 64, "id:%016llX%016llX", 
              (unsigned long long)id.hi, (unsigned long long)id.lo);
@@ -1224,11 +1231,8 @@ hn4_TEST(Namespace, Multi_Generation_Shadowing) {
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_str, &out));
     ASSERT_EQ(5, hn4_le32_to_cpu(out.write_gen));
 
-    /* Test 2: Name Lookup (Scanning) */
+    /* Test 2: Name Lookup (Scanning via RAM Fast Path) */
     /* Note: Resonance scan finds ALL matches and picks highest gen. */
-    /* Re-sync RAM for Name Lookup (which might use it depending on config) */
-    hn4_hal_sync_io(dev, HN4_IO_READ, vol.sb.info.lba_cortex_start, vol.nano_cortex, 256);
-    
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, "shared.txt", &out));
     ASSERT_EQ(5, hn4_le32_to_cpu(out.write_gen));
 
@@ -1903,5 +1907,181 @@ hn4_TEST(Namespace, Extension_Type_Filter) {
     ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, "HeadTail", &out));
     ASSERT_EQ(HN4_ERR_NOT_FOUND, hn4_ns_resolve(&vol, "HeadSKIP_METail", &out));
 
+    ns_teardown(dev);
+}
+
+
+/* =========================================================================
+ * OPTIMIZATION VERIFICATION SUITE
+ * ========================================================================= */
+
+/* 
+ * TEST 38: IO Fallback Path (RAM Cache Bypass)
+ * PROVES: The system correctly falls back to the "Slow Path" (Direct IO)
+ * when the Nano-Cortex (RAM) is unavailable, ensuring durability.
+ */
+hn4_TEST(Namespace, Opt_RAM_Cache_Bypass) {
+    hn4_hal_device_t* dev = ns_setup();
+    hn4_volume_t vol = {0}; 
+    vol.target_device = dev;
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
+
+    /* Explicitly NULL the RAM cache to force IO path */
+    vol.nano_cortex = NULL;
+    vol.cortex_size = 0;
+
+    hn4_u128_t id = { .lo = 0xAA, .hi = 0xBB };
+    hn4_anchor_t a = {0};
+    a.seed_id = hn4_cpu_to_le128(id);
+    a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    strncpy((char*)a.inline_buffer, "bypass.txt", 20);
+
+    /* Calculate slot and write to DISK */
+    uint64_t h = _local_hash_uuid(id);
+    uint64_t total_slots = (256 * NS_SECTOR_SIZE) / sizeof(hn4_anchor_t);
+    _local_write_anchor(dev, &vol.sb, h % total_slots, &a);
+
+    hn4_anchor_t out;
+    /* Should succeed via IO read loop */
+    const char* id_uri = "id:00000000000000BB00000000000000AA";
+    ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_uri, &out));
+    ASSERT_EQ(0xAA, out.seed_id.lo);
+
+    ns_teardown(dev);
+}
+
+/* 
+ * TEST 39: Prefetch Boundary (Exact Lookahead Match)
+ * PROVES: The optimized loop finds an item located exactly at the 
+ * prefetch lookahead distance (Index + 4) without skipping it.
+ */
+hn4_TEST(Namespace, Opt_Prefetch_Boundary_Hit) {
+    hn4_hal_device_t* dev = ns_setup();
+    hn4_volume_t vol = {0}; 
+    vol.target_device = dev;
+    
+    /* 1. Initialize Superblock in Volume Struct from Disk */
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
+
+    /* 2. Setup RAM Cache (Simulate Nano-Cortex) */
+    uint64_t cortex_bytes = 256 * NS_SECTOR_SIZE;
+    vol.nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+    vol.cortex_size = cortex_bytes;
+
+    /* 3. Calculate target slot */
+    hn4_u128_t id = { .lo = 0x123, .hi = 0 };
+    uint64_t h = _local_hash_uuid(id);
+    uint64_t total_slots = cortex_bytes / sizeof(hn4_anchor_t);
+    uint64_t start_slot = h % total_slots;
+
+    /* 4. Construct Anchor */
+    hn4_anchor_t a = {0};
+    a.seed_id = hn4_cpu_to_le128(id);
+    a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    
+    /* Calculate CRC: Checksum field must be 0 during calculation */
+    a.checksum = 0; 
+    a.checksum = hn4_cpu_to_le32(hn4_crc32(0, &a, sizeof(hn4_anchor_t)));
+
+    /* 5. Inject at Prefetch Boundary (Start + 4) */
+    hn4_anchor_t* ram = (hn4_anchor_t*)vol.nano_cortex;
+    ram[(start_slot + 4) % total_slots] = a;
+
+    /* 6. Execute Lookup */
+    hn4_anchor_t out;
+    const char* id_uri = "id:00000000000000000000000000000123";
+    
+    ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_uri, &out));
+    ASSERT_EQ(0x123, hn4_le64_to_cpu(out.seed_id.lo));
+
+    hn4_hal_mem_free(vol.nano_cortex);
+    ns_teardown(dev);
+}
+
+
+/* 
+ * TEST 41: Dense Cluster Generation Selection
+ * PROVES: The loop correctly identifies the highest generation even when
+ * multiple versions exist within a dense cluster of collisions.
+ */
+hn4_TEST(Namespace, Opt_Dense_Cluster_Max_Gen) {
+    hn4_hal_device_t* dev = ns_setup();
+    hn4_volume_t vol = {0}; 
+    vol.target_device = dev;
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
+
+    uint64_t cortex_bytes = 8192;
+    vol.nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+    vol.cortex_size = cortex_bytes;
+    
+    hn4_u128_t id = { .lo = 999, .hi = 999 };
+    uint64_t start_slot = _local_hash_uuid(id) % (cortex_bytes / sizeof(hn4_anchor_t));
+    hn4_anchor_t* ram = (hn4_anchor_t*)vol.nano_cortex;
+
+    /* Fill 8 consecutive slots with increasing generations */
+    for(int i=0; i<8; i++) {
+        hn4_anchor_t t = {0};
+        t.seed_id = hn4_cpu_to_le128(id);
+        t.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+        t.write_gen = hn4_cpu_to_le32(10 + i); /* Gens: 10..17 */
+        t.checksum = hn4_cpu_to_le32(hn4_crc32(0, &t, sizeof(hn4_anchor_t)));
+        
+        ram[(start_slot + i) % (cortex_bytes/128)] = t;
+    }
+
+    hn4_anchor_t out;
+    const char* id_uri = "id:00000000000003E700000000000003E7";
+    ASSERT_EQ(HN4_OK, hn4_ns_resolve(&vol, id_uri, &out));
+    
+    /* Must pick Gen 17 (highest), ensuring loop didn't stop early */
+    ASSERT_EQ(17, hn4_le32_to_cpu(out.write_gen));
+
+    hn4_hal_mem_free(vol.nano_cortex);
+    ns_teardown(dev);
+}
+
+/* 
+ * TEST 42: Max Probe Depth Limit
+ * PROVES: The loop strictly obeys HN4_NS_MAX_PROBES (1024), preventing
+ * infinite loops in fully saturated Cortex regions.
+ */
+hn4_TEST(Namespace, Opt_Max_Probe_Limit) {
+    hn4_hal_device_t* dev = ns_setup();
+    hn4_volume_t vol = {0}; 
+    vol.target_device = dev;
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), &vol.sb, 1);
+
+    /* Allocate Large Cortex */
+    uint64_t cortex_bytes = 2048 * sizeof(hn4_anchor_t);
+    vol.nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+    vol.cortex_size = cortex_bytes;
+    hn4_anchor_t* ram = (hn4_anchor_t*)vol.nano_cortex;
+
+    hn4_u128_t id = { .lo = 55, .hi = 0 };
+    uint64_t start_slot = _local_hash_uuid(id) % 2048;
+
+    /* Fill 1100 slots with garbage to block the probe path */
+    for(int i=0; i<1100; i++) {
+        hn4_anchor_t fill = {0};
+        fill.seed_id.lo = 0xFF; /* Mismatch ID */
+        fill.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+        ram[(start_slot + i) % 2048] = fill;
+    }
+
+    /* Place Target at 1025th slot (Just beyond limit) */
+    hn4_anchor_t target = {0};
+    target.seed_id = hn4_cpu_to_le128(id);
+    target.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    target.checksum = hn4_cpu_to_le32(hn4_crc32(0, &target, sizeof(hn4_anchor_t)));
+    
+    ram[(start_slot + 1025) % 2048] = target;
+
+    hn4_anchor_t out;
+    const char* id_uri = "id:00000000000000000000000000000037";
+    
+    /* Should NOT find it, because it's beyond MAX_PROBES */
+    ASSERT_EQ(HN4_ERR_NOT_FOUND, hn4_ns_resolve(&vol, id_uri, &out));
+
+    hn4_hal_mem_free(vol.nano_cortex);
     ns_teardown(dev);
 }
