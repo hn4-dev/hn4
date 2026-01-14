@@ -419,7 +419,7 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
 static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
     
-    uint64_t used = atomic_load_explicit(&vol->used_blocks, memory_order_acquire);
+    uint64_t used = atomic_load_explicit(&vol->alloc.used_blocks, memory_order_acquire);
     uint64_t cap_blocks;
 
 #ifdef HN4_USE_128BIT
@@ -552,14 +552,14 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
          * required for space accounting; eventual consistency suffices.
          * This prevents global bus locking during high-IOPS write storms.
          */
-        atomic_fetch_add_explicit(&vol->used_blocks, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&vol->alloc.used_blocks, 1, memory_order_relaxed);
 
-        if (vol->l2_summary_bitmap) {
+        if (vol->locking.l2_summary_bitmap) {
              uint64_t l2_idx  = block_idx / HN4_L2_COVERAGE_BITS;
              uint64_t l2_word = l2_idx / 64;
              uint64_t l2_mask = (1ULL << (l2_idx % 64));
              
-             _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_word];
+             _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word];
 
              /* 
               * CACHE OPTIMIZATION (Read-For-Ownership Avoidance):
@@ -584,24 +584,24 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
          * (Double Free or Counter Drift). We log CRIT and dirty the volume 
          * to force an fsck, but we do not panic the kernel.
          */
-        uint64_t current = atomic_load(&vol->used_blocks);
+        uint64_t current = atomic_load(&vol->alloc.used_blocks);
         do {
             if (HN4_UNLIKELY(current == 0)) {
                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
                 HN4_LOG_ERR("Allocator Underflow! Used=0 but freeing block %llu.", (unsigned long long)block_idx);
                 break; 
             }
-        } while (!atomic_compare_exchange_weak(&vol->used_blocks, &current, current - 1));
+        } while (!atomic_compare_exchange_weak(&vol->alloc.used_blocks, &current, current - 1));
         
         /* Update L2 Summary */
-        if (vol->l2_summary_bitmap) {
+        if (vol->locking.l2_summary_bitmap) {
             /* 
              * SYSTEM PROFILE LOCKING:
              * For OS Root volumes, we enforce strict serialization to prevent
              * any possibility of "Ghost Free" regions during boot/update.
              */
             bool use_lock = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
-            if (use_lock) hn4_hal_spinlock_acquire(&vol->l2_lock);
+            if (use_lock) hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
 
             uint64_t word_idx = block_idx / 64;
             /* Align to the start of the 512-bit (8-word) L2 region */
@@ -611,9 +611,13 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
              * SCAN: Check if the entire 512-block region is now empty.
              * We check 8 contiguous 64-bit words in the Level 1 bitmap.
              */
+            size_t total_words = vol->bitmap_size / sizeof(hn4_armored_word_t);
+
             bool region_empty = true;
             for (int i = 0; i < 8; i++) {
-                /* Relaxed load is acceptable here; strictness comes later */
+                /* Boundary Check */
+                if ((start_w + i) >= total_words) break;
+
                 if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
                     memory_order_relaxed) != 0) {
                     region_empty = false;
@@ -625,7 +629,7 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
                 uint64_t l2_idx = block_idx / HN4_L2_COVERAGE_BITS;
                 uint64_t l2_word_idx = l2_idx / 64;
                 uint64_t l2_mask = (1ULL << (l2_idx % 64));
-                _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_word_idx];
+                _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word_idx];
 
                 /* 
                  * STEP 1: OPTIMISTIC CLEAR (OPTIMIZED)
@@ -667,7 +671,7 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
                 }
             }
 
-            if (use_lock) hn4_hal_spinlock_release(&vol->l2_lock);
+            if (use_lock) hn4_hal_spinlock_release(&vol->locking.l2_lock);
         }
     }
 }
@@ -721,7 +725,7 @@ hn4_result_t _bitmap_op(
         /* 
          * Serialize access via the L2 lock to prevent RMW races.
          */
-        hn4_hal_spinlock_acquire(&vol->l2_lock);
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
 
         uint32_t sectors_to_io = 1;
         if ((offset_in_sec + sizeof(hn4_armored_word_t)) > ss) {
@@ -734,7 +738,7 @@ hn4_result_t _bitmap_op(
             goto pico_cleanup;
         }
 
-        hn4_armored_word_t* word = (hn4_armored_word_t*)(sector_buf + offset_in_sec);
+        hn4_armored_word_t* word = (hn4_armored_word_t*)((uint8_t*)sector_buf + offset_in_sec);
 
         /* 2. VALIDATE: Check ECC and heal if necessary */
         uint64_t safe_data;
@@ -797,7 +801,7 @@ hn4_result_t _bitmap_op(
 
     pico_cleanup:
         if (sector_buf) hn4_hal_mem_free(sector_buf);
-        hn4_hal_spinlock_release(&vol->l2_lock);
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
         return res;
     }
 
@@ -882,10 +886,10 @@ hn4_result_t _bitmap_op(
                  * HEALING L2: Even if L1 (Main) is correct, L2 might be stale.
                  * If we intended to SET, ensure L2 reflects it.
                  */
-                if (op == BIT_SET && vol->l2_summary_bitmap) {
+                if (op == BIT_SET && vol->locking.l2_summary_bitmap) {
                     uint64_t l2_idx = block_idx / HN4_L2_COVERAGE_BITS;
                     uint64_t l2_word = l2_idx / 64;
-                    atomic_fetch_or_explicit((_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_word], 
+                    atomic_fetch_or_explicit((_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word], 
                                              (1ULL << (l2_idx % 64)), memory_order_release);
                 }
 
@@ -944,7 +948,7 @@ hn4_result_t _bitmap_op(
     
     /* Telemetry */
     if (HN4_UNLIKELY(heal_event_pending)) {
-        atomic_fetch_add(&vol->stats.heal_count, 1);
+        atomic_fetch_add(&vol->health.heal_count, 1);
     }
 
     /* Result */
@@ -958,7 +962,7 @@ hn4_result_t _bitmap_op(
 
     if (commit_side_effects) {
         /* GHOST BIT PROTECTION & HEALING PERSISTENCE */
-        if (op != BIT_FORCE_CLEAR && !vol->in_eviction_path) {
+        if (op != BIT_FORCE_CLEAR && !vol->locking.in_eviction_path) {
             atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_seq_cst);
         }
 
@@ -1021,7 +1025,7 @@ _alloc_cortex_run(
     uint64_t total_slots = ((end_sect - start_sect) * sector_size) / HN4_CORTEX_SLOT_SIZE;
 
     /* Performance: Resume scan from the last known cursor to reduce latency */
-    uint64_t current_slot = vol->cortex_search_head; 
+    uint64_t current_slot = vol->alloc.cortex_search_head; 
     if (current_slot >= total_slots) current_slot = 0;
 
     /*
@@ -1040,7 +1044,13 @@ _alloc_cortex_run(
     if (scan_size < sector_size) scan_size = sector_size;
 
     void* io_buffer = hn4_hal_mem_alloc(scan_size);
-    if (!io_buffer) return HN4_ERR_NOMEM;
+    void* claim_buf = hn4_hal_mem_alloc(sector_size > 4096 ? sector_size : 4096); 
+
+    if (!io_buffer || !claim_buf) {
+        if (io_buffer) hn4_hal_mem_free(io_buffer);
+        if (claim_buf) hn4_hal_mem_free(claim_buf);
+        return HN4_ERR_NOMEM;
+    }
 
     uint32_t free_run_length = 0;
     uint64_t run_start_index = 0;
@@ -1061,7 +1071,7 @@ _alloc_cortex_run(
          * If the L2 Summary indicates a region is fully dense/dirty, skip it entirely.
          * This reduces IO pressure significantly on full drives.
          */
-        if (vol->l2_summary_bitmap) {
+        if (vol->locking.l2_summary_bitmap) {
             uint64_t byte_offset = current_slot * HN4_CORTEX_SLOT_SIZE;
             
             /* Calculate absolute physical coordinates */
@@ -1074,7 +1084,7 @@ _alloc_cortex_run(
             uint64_t l2_bit = l2_idx % 64;
             
             /* Atomic load to check density state */
-            uint64_t l2_val = atomic_load_explicit((_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_word], memory_order_relaxed);
+            uint64_t l2_val = atomic_load_explicit((_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word], memory_order_relaxed);
             
             if ((l2_val >> l2_bit) & 1) {
                 /* Region is saturated. Calculate skip distance. */
@@ -1130,8 +1140,7 @@ _alloc_cortex_run(
 
         }
 
-        /* 3. Execute I/O (Variables already defined) */
-
+        /* 3. Execute I/O into the main batch buffer */
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, io_buffer, sectors_to_read) != HN4_OK) {
             status = HN4_ERR_HW_IO;
             goto Cleanup;
@@ -1150,10 +1159,8 @@ _alloc_cortex_run(
             uint64_t* words = (uint64_t*)slot_ptr;
             hn4_nano_header_t* hdr = (hn4_nano_header_t*)slot_ptr;
 
-        /* Check 1: Is it completely zero? */
-            
+            /* Check 1: Is it completely zero? */
             bool all_zero = true;
-        
             for (int k = 0; k < (HN4_CORTEX_SLOT_SIZE / 8); k++) {
                   if (words[k] != 0) {
                     all_zero = false;
@@ -1161,22 +1168,22 @@ _alloc_cortex_run(
                 }
             }
 
-        if (all_zero) {
-            is_free = true;
-        } 
+            if (all_zero) {
+                is_free = true;
+            } 
+            
+            /* Check 2: Is it a stale reservation? */
+            else if (hdr->magic == hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
+                uint64_t claim_ts = hn4_le64_to_cpu(hdr->version);
+                uint64_t now = hn4_hal_get_time_ns();
         
-        /* Check 2: Is it a stale reservation? */
-        else if (hdr->magic == hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
-            uint64_t claim_ts = hn4_le64_to_cpu(hdr->version);
-            uint64_t now = hn4_hal_get_time_ns();
-    
-            /* Lease Timeout: 30 Seconds (30 * 1e9 ns) */
-            if (now > claim_ts && (now - claim_ts) > 30000000000ULL) {
-                is_free = true; // Expired lease, safe to reclaim
+                /* Lease Timeout: 30 Seconds (30 * 1e9 ns) */
+                if (now > claim_ts && (now - claim_ts) > 30000000000ULL) {
+                    is_free = true; // Expired lease, safe to reclaim
+                }
             }
-        }
 
-        if (is_free) {
+            if (is_free) {
 
                 if (free_run_length == 0) run_start_index = current_slot + i;
                 free_run_length++;
@@ -1196,13 +1203,17 @@ _alloc_cortex_run(
                     
                     hn4_addr_t claim_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, head_sect_offset);
                     
-                    /* RMW Cycle: Read the specific sector for the head */
-                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, claim_lba, io_buffer, 1) != HN4_OK) {
+                    /* 
+                     * FIX: RMW Cycle into separate CLAIM BUFFER 
+                     * Do NOT use io_buffer here, or we destroy the batch context for the loop.
+                     */
+                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, claim_lba, claim_buf, 1) != HN4_OK) {
                         status = HN4_ERR_HW_IO; 
                         goto Cleanup;
                     }
                     
-                    hn4_nano_header_t* claim_hdr = (hn4_nano_header_t*)((uint8_t*)io_buffer + head_buf_offset);
+                    /* Use claim_buf for the header check */
+                    hn4_nano_header_t* claim_hdr = (hn4_nano_header_t*)((uint8_t*)claim_buf + head_buf_offset);
     
                     if (claim_hdr->magic != 0) {
     
@@ -1223,7 +1234,7 @@ _alloc_cortex_run(
                         }
                     }
                     
-                    /* Populate Pending Marker */
+                    /* Populate Pending Marker in claim_buf */
                     claim_hdr->magic = hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING);
                     claim_hdr->payload_len = 0; /* Zero length indicates specialized marker */
                     claim_hdr->version = hn4_cpu_to_le64(hn4_hal_get_time_ns());
@@ -1236,8 +1247,8 @@ _alloc_cortex_run(
 
                     claim_hdr->header_crc = hn4_cpu_to_le32(p_crc);
 
-                    /* Commit Reservation */
-                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, claim_lba, io_buffer, 1) != HN4_OK) {
+                    /* FIX: Commit Reservation using claim_buf */
+                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, claim_lba, claim_buf, 1) != HN4_OK) {
                         status = HN4_ERR_HW_IO; 
                         goto Cleanup;
                     }
@@ -1246,7 +1257,7 @@ _alloc_cortex_run(
                     hn4_hal_barrier(vol->target_device);
 
                     *out_slot_idx = run_start_index;
-                    vol->cortex_search_head = run_start_index + slots_needed; /* Update cursor */
+                    vol->alloc.cortex_search_head = run_start_index + slots_needed; /* Update cursor */
                     status = HN4_OK;
                     goto Cleanup;
                 }
@@ -1259,7 +1270,8 @@ _alloc_cortex_run(
     }
 
 Cleanup:
-    hn4_hal_mem_free(io_buffer);
+    if (io_buffer) hn4_hal_mem_free(io_buffer);
+    if (claim_buf) hn4_hal_mem_free(claim_buf); 
     return status;
 }
 
@@ -1700,8 +1712,7 @@ Return Value:
     false - Block is toxic, out of bounds, or insufficient quality.
 
 --*/
-static bool
-_is_quality_compliant(
+static bool _is_quality_compliant(
     HN4_IN hn4_volume_t* vol,
     uint64_t lba,
     uint8_t intent
@@ -1712,13 +1723,18 @@ _is_quality_compliant(
     uint64_t word_idx = lba / 32;
 
     if ((word_idx * 8) >= vol->qmask_size) {
-        /* Flag critical geometry error (Panic) before rejecting */
         atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC | HN4_VOL_DIRTY);
         return false;
     }
 
     uint32_t shift = (lba % 32) * 2;
-    uint64_t q_word = vol->quality_mask[word_idx];
+    
+    /* Atomic Load to prevent torn reads during concurrent repair */
+    uint64_t q_word = atomic_load_explicit(
+        (_Atomic uint64_t*)&vol->quality_mask[word_idx], 
+        memory_order_relaxed
+    );
+    
     uint8_t q_val = (q_word >> shift) & 0x3;
 
     if (q_val == HN4_Q_TOXIC) return false;
@@ -1729,6 +1745,7 @@ _is_quality_compliant(
 
     return true;
 }
+
 
 /*++
 
@@ -1990,7 +2007,7 @@ hn4_alloc_genesis(
                      * actuator seek time, while applying jitter to avoid hotspots.
                      */
                     if (vol->sb.info.device_type_tag == HN4_DEV_HDD) {
-                        uint64_t last = atomic_load_explicit(&vol->last_alloc_g, memory_order_relaxed);
+                        uint64_t last = atomic_load_explicit(&vol->alloc.last_alloc_g, memory_order_relaxed);
                         if (last != 0) {
                             /* Mathematical Safety: Modulo-safe Window Jitter */
                             uint64_t jitter = (hn4_hal_get_random_u64() % 32); 
@@ -2144,7 +2161,7 @@ hn4_alloc_genesis(
                     
                     /* Cache G for HDD locality optimization */
                     if (vol->sb.info.device_type_tag == HN4_DEV_HDD) {
-                        atomic_store_explicit(&vol->last_alloc_g, G, memory_order_relaxed);
+                        atomic_store_explicit(&vol->alloc.last_alloc_g, G, memory_order_relaxed);
                     }
                     
                     *out_G = G;
@@ -2204,7 +2221,7 @@ hn4_alloc_genesis(
  *              v
  *   [ SOUTH SUPERBLOCK ]
  *
- * THE CALCULATION PARADOX (FIXED):
+ * THE CALCULATION PARADOX:
  * In the Format spec (`hn4_format.c`), `lba_stream_start` is initialized 
  * to the exact same value as `lba_horizon_start`.
  *
@@ -2290,7 +2307,7 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
     uint64_t max_probes = 4;
 
     for (uint64_t i = 0; i < max_probes; i++) {
-        uint64_t head = atomic_fetch_add(&vol->horizon_write_head, 1);
+        uint64_t head = atomic_fetch_add(&vol->alloc.horizon_write_head, 1);
         uint64_t block_offset = head % capacity_blocks;
         
         /* 
@@ -2375,7 +2392,7 @@ void hn4_free_block(HN4_INOUT hn4_volume_t* vol, hn4_addr_t phys_lba) {
                      (unsigned long long)phys_lba, (unsigned long long)max_blk);
         
         atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
-        uint32_t t = atomic_fetch_add(&vol->taint_counter, 1);
+        uint32_t t = atomic_fetch_add(&vol->health.taint_counter, 1);
         
         /* Hard Gate: Too many violations -> Panic */
         if (t > HN4_TAINT_THRESHOLD_RO) {
@@ -2562,12 +2579,6 @@ hn4_alloc_block(
         #else
             *out_lba = hlba;
         #endif
-        
-        /* 
-         * FIX: Spec 3.4 Horizon Sentinel.
-         * We MUST set k=15 to signal that this block resides in the Linear Log.
-         * This tells the reader to ignore the Ballistic Equation and use direct LBA.
-         */
         *out_k = HN4_HORIZON_FALLBACK_K; /* 15 */
         
         return HN4_OK;

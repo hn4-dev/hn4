@@ -239,6 +239,10 @@ typedef int32_t hn4_result_t;
 #define HN4_ERR_KEY_EXPIRED             -0x613
 
 #define HN4_ERR_INTERNAL                -0x614
+
+/* Volume is busy (active handles prevent unmount). */
+#define HN4_ERR_BUSY                    -0x615
+
 /* =========================================================================
  * 7. UTILITY FUNCTIONS
  * ========================================================================= */

@@ -487,12 +487,6 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
         return HN4_ERR_GEOMETRY;
     }
 
-    /* Check Max Cap (Handle Unlimited for AI) */
-    if (capacity_bytes < spec->min_cap) {
-        HN4_LOG_VAL("Capacity too large for profile", capacity_bytes);
-        return HN4_ERR_GEOMETRY;
-    }
-
     if (spec->max_cap != HN4_CAP_UNLIMITED && capacity_bytes > spec->max_cap) {
         HN4_LOG_VAL("Capacity out of bounds for profile", capacity_bytes);
         return HN4_ERR_GEOMETRY;
@@ -556,7 +550,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     offset = HN4_ALIGN_UP(offset, bs);
 
     /* Epoch Ring */
-    uint64_t epoch_sz = pid == HN4_PROFILE_PICO ?  epoch_sz = 2 * bs : HN4_EPOCH_RING_SIZE; 
+    uint64_t epoch_sz = (pid == HN4_PROFILE_PICO) ? (2 * bs) : HN4_EPOCH_RING_SIZE;
     epoch_sz = HN4_ALIGN_UP(epoch_sz, bs);
     
     /* Use from_sectors, as (offset/ss) yields a sector index */
@@ -621,7 +615,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     /* Explicit Lower Bound Check before subtraction */
     uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); 
     
-    if (capacity_bytes < min_required) {
+    if (capacity_bytes < tail_rsv) {
         HN4_LOG_ERR("Drive too small for layout. Need %llu bytes.", min_required);
         return HN4_ERR_ENOSPC;
     }

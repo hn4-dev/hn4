@@ -57,11 +57,15 @@
     #define HN4_OP_ISOTOPE          0x40
     #define HN4_OP_GRADIENT         0x80
     #define HN4_OP_RESERVED         0xC0
-
+    #define HN4_OP_LITERAL          0x00
+    #define HN4_OP_ISOTOPE          0x40
+    #define HN4_OP_GRADIENT         0x80
+    #define HN4_OP_BITMASK          0xC0 /* Tensor Sparse Mask */
     #define HN4_OP_MASK             0xC0
     #define HN4_LEN_MASK            0x3F
     #define HN4_VARINT_MARKER       255
 
+    
     /* 
     * Varint Safety Limit & Grammar Definition:
     * 
@@ -454,137 +458,147 @@
     * ========================================================================= */
 
     _Check_return_
-    hn4_result_t hn4_decompress_block(
-        HN4_IN  const void* src_void,
-        HN4_IN  uint32_t    src_len,
-        HN4_OUT void*       dst_void,
-        HN4_IN  uint32_t    dst_capacity,
-        HN4_OUT uint32_t*   out_size
-    )
-    {
-        if (HN4_UNLIKELY(!src_void || !dst_void || !out_size)) return HN4_ERR_INVALID_ARGUMENT;
+hn4_result_t hn4_decompress_block(
+    HN4_IN  const void* src_void,
+    HN4_IN  uint32_t    src_len,
+    HN4_OUT void*       dst_void,
+    HN4_IN  uint32_t    dst_capacity,
+    HN4_OUT uint32_t*   out_size
+)
+{
+    if (HN4_UNLIKELY(!src_void || !dst_void || !out_size)) return HN4_ERR_INVALID_ARGUMENT;
 
-        const uint8_t* ip     = (const uint8_t*)src_void;
-        const uint8_t* iend   = ip + src_len;
-        uint8_t*       op     = (uint8_t*)dst_void;
-        uint8_t*       ostart = op;
-        uint8_t*       oend   = op + dst_capacity;
+    const uint8_t* ip     = (const uint8_t*)src_void;
+    const uint8_t* iend   = ip + src_len;
+    uint8_t*       op     = (uint8_t*)dst_void;
+    uint8_t*       ostart = op;
+    uint8_t*       oend   = op + dst_capacity;
 
-        while (ip < iend) {
-            uint8_t raw_token = *ip++;
-            uint8_t tag = raw_token & HN4_OP_MASK;
-            uint32_t len = raw_token & HN4_LEN_MASK;
+    while (ip < iend) {
+        /* 1. Fetch Token */
+        uint8_t raw_token = *ip++;
+        uint8_t tag = raw_token & HN4_OP_MASK;
+        uint32_t len = raw_token & HN4_LEN_MASK;
 
-            if (HN4_UNLIKELY(tag == HN4_OP_RESERVED)) return HN4_ERR_DATA_ROT;
+        if (HN4_UNLIKELY(tag == HN4_OP_RESERVED)) return HN4_ERR_DATA_ROT;
 
-            /* 
-            * VarInt Decode Logic
-            * Adjusted to correctly handle the "Remainder" byte.
-            * The loop continues only while the byte is 255.
-            * The trailing byte (which is < 255 in a terminated sequence, or 
-            * implicitly the last one if we hit limit) is added but NOT counted
-            * as an extension.
-            */
-            if (len == HN4_LEN_MASK) {
-                uint32_t extensions = 0;
-                uint8_t s = 255;
+        /* 
+         * 2. VarInt Decode Logic
+         * If len == 63 (Mask), reading extension bytes.
+         */
+        if (len == HN4_LEN_MASK) {
+            uint32_t extensions = 0;
+            uint8_t s = 255;
+            
+            while (s == HN4_VARINT_MARKER) {
+                if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
+                s = *ip++;
                 
-                while (s == HN4_VARINT_MARKER) {
-                    if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
-                    s = *ip++;
-                    
-                    /* Overflow protection */
-                    if (len > (UINT32_MAX - s)) return HN4_ERR_DATA_ROT;
-                    len += s;
-                    
-                    /* 
-                    * Only count 0xFF as an extension byte.
-                    * The logic: Base(63) + Ext(255) + ... + Rem(x).
-                    * If s == 255, we consumed an extension slot.
-                    */
-                    if (s == HN4_VARINT_MARKER) {
-                        extensions++;
-                        if (extensions > HN4_VARINT_MAX_BYTES) return HN4_ERR_DATA_ROT;
-                    }
-                }
-            }
-
-            /* 
-            * Semantic Length Check (Pre-Bias)
-            * Ensure the encoded length is valid within the grammar BEFORE adding
-            * the compression bias.
-            */
-            if (len > HN4_MAX_TOKEN_LEN) return HN4_ERR_DATA_ROT;
-
-            /* Apply Token Bias (Unpack logical length) */
-            if (tag != HN4_OP_LITERAL) {
-                if (len > (HN4_BLOCK_LIMIT - HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
-                len += HN4_TENSOR_MIN_SPAN;
+                /* Overflow protection */
+                if (len > (UINT32_MAX - s)) return HN4_ERR_DATA_ROT;
+                len += s;
                 
-                /* Post-Bias Semantic Check */
-                /* Ensure the biased length is still within legal token limits */
-                if (len > (HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
-            }
-
-            /* Output Bounds Check */
-            if (HN4_UNLIKELY((size_t)(oend - op) < len)) return HN4_ERR_DATA_ROT;
-
-            switch (tag) {
-                case HN4_OP_LITERAL:
-                    if (HN4_UNLIKELY((size_t)(iend - ip) < len)) return HN4_ERR_DATA_ROT;
-                    memmove(op, ip, len);
-                    op += len;
-                    ip += len;
-                    break;
-
-                case HN4_OP_ISOTOPE:
-                    if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
-                    memset(op, *ip++, len);
-                    op += len;
-                    break;
-
-                case HN4_OP_GRADIENT:
-                {
-                    if (HN4_UNLIKELY(ip + 2 > iend)) return HN4_ERR_DATA_ROT;
-                    uint8_t val = *ip++;
-                    int8_t slope = (int8_t)*ip++; 
-                    
-                    if (slope == 0 || slope == -128) return HN4_ERR_DATA_ROT;
-
-                    /* 
-                     * Strict Range Pre-Validation
-                     * Calculate total delta using 32-bit math.
-                     * If the total progression exceeds the byte range [0, 255]
-                     * at the extremes, reject immediately.
-                     */
-                    if (len > 0) {
-                        int32_t total_delta = (int32_t)(len - 1) * slope;
-                        int32_t final_val   = (int32_t)val + total_delta;
-
-                        /* 
-                         * Since it's linear, we only need to check the start and end.
-                         * If both are within [0, 255], all intermediate points are too.
-                         */
-                        if (final_val < 0 || final_val > 255) return HN4_ERR_DATA_ROT;
-                    }
-
-                    int32_t acc = val;
-                    
-                    while (len--) {
-                        *op++ = (uint8_t)acc;
-                        acc += slope;
-                        /* Loop guard removed as Pre-Validation guarantees safety */
-                    }
-                    break;
+                /* 
+                 * HN4_VARINT_MAX_BYTES defines strict recursion limit.
+                 */
+                if (s == HN4_VARINT_MARKER) {
+                    extensions++;
+                    if (extensions > HN4_VARINT_MAX_BYTES) return HN4_ERR_DATA_ROT;
                 }
             }
         }
 
-        if (HN4_UNLIKELY(ip != iend)) return HN4_ERR_DATA_ROT;
+        /* 
+         * 3. Semantic Limit Check
+         * Ensure the encoded length is valid within the grammar.
+         */
+        if (len > HN4_MAX_TOKEN_LEN) return HN4_ERR_DATA_ROT;
 
-        *out_size = (uint32_t)(op - ostart);
-        return HN4_OK;
+        /* 
+         * 4. Apply Token Bias (Unpack logical length) 
+         * Compressed ops (Isotope/Gradient) encode length - MIN_SPAN.
+         */
+        if (tag != HN4_OP_LITERAL) {
+            if (len > (HN4_BLOCK_LIMIT - HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
+            len += HN4_TENSOR_MIN_SPAN;
+            
+            /* Post-Bias Check */
+            if (len > (HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
+        }
+
+        /* 
+         * 5. Output Bounds Check 
+         * Strict pointer arithmetic check preventing wrap-around.
+         */
+        size_t rem_space = (size_t)(oend - op);
+        if (HN4_UNLIKELY(len > rem_space)) {
+            return HN4_ERR_DATA_ROT; /* Buffer overrun attempt */
+        }
+
+        /* 6. Execute Opcode */
+        switch (tag) {
+            case HN4_OP_LITERAL:
+                /* Input Bounds Check */
+                if (HN4_UNLIKELY((size_t)(iend - ip) < len)) return HN4_ERR_DATA_ROT;
+                
+                memmove(op, ip, len);
+                op += len;
+                ip += len;
+                break;
+
+            case HN4_OP_ISOTOPE:
+                /* Input Bounds Check (Need 1 byte for pattern) */
+                if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
+                
+                memset(op, *ip++, len);
+                op += len;
+                break;
+
+            case HN4_OP_GRADIENT:
+            {
+                /* Input Bounds Check (Need 2 bytes: Start + Slope) */
+                if (HN4_UNLIKELY(ip + 2 > iend)) return HN4_ERR_DATA_ROT;
+                
+                uint8_t val = *ip++;
+                int8_t slope = (int8_t)*ip++; 
+                
+                if (slope == 0 || slope == -128) return HN4_ERR_DATA_ROT;
+
+                /* 
+                 * [BUG FIX] CRITICAL SAFETY CHECK
+                 * If len is 0 (due to corruption or fuzzing), 'len - 1' below 
+                 * would underflow to UINT32_MAX, causing heap corruption.
+                 * Explicitly break if length is zero.
+                 */
+                if (len == 0) break;
+
+                /* 
+                 * Strict Range Pre-Validation
+                 * Calculate total delta using 64-bit math to avoid overflow.
+                 * If the progression exits [0, 255], the stream is corrupt.
+                 */
+                int64_t total_delta = (int64_t)(len - 1) * (int64_t)slope;
+                int64_t final_val   = (int64_t)val + total_delta;
+
+                if (final_val < 0 || final_val > 255) return HN4_ERR_DATA_ROT;
+
+                /* Execute Gradient Fill */
+                int32_t acc = val;
+                while (len--) {
+                    *op++ = (uint8_t)acc;
+                    acc += slope;
+                }
+                break;
+            }
+        }
     }
+
+    /* Verify stream consumed exactly */
+    if (HN4_UNLIKELY(ip != iend)) return HN4_ERR_DATA_ROT;
+
+    *out_size = (uint32_t)(op - ostart);
+    return HN4_OK;
+}
 
     /* =========================================================================
     * 5. BOUNDS CALCULATION

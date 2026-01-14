@@ -549,7 +549,10 @@ static uint64_t _ns_parse_time_slice(const char* s)
     uint64_t y = 0, m = 0, d = 1; /* Default to 1st of month */
     
     /* Parse Year */
-    while (*s >= '0' && *s <= '9') y = (y * 10) + (*s++ - '0');
+     while (*s >= '0' && *s <= '9') {
+        y = (y * 10) + (*s++ - '0');
+        if (y > 3000) return 0; /* Cap at Year 3000 to prevent overflow/nonsense */
+    }
     if (*s == '-') s++;
     
     /* Parse Month */
@@ -668,7 +671,6 @@ hn4_result_t hn4_ns_gather_tensor_shards(
                 temp.checksum = 0;
                 
                  uint32_t calc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
-                calc = hn4_crc32(calc, temp.inline_buffer, sizeof(temp.inline_buffer));
                 
                 if (stored == calc) {
                     /* D. Collect Shard */

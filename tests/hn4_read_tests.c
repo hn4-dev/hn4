@@ -681,7 +681,7 @@ hn4_TEST(Stats, Read_CRC_Stats_Once) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
     /* Reset Stats */
-    atomic_store(&vol->stats.crc_failures, 0);
+    atomic_store(&vol->health.crc_failures, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x1323;
@@ -700,7 +700,7 @@ hn4_TEST(Stats, Read_CRC_Stats_Once) {
     /* Note: If logic tracks per candidate *loop*, it might be 1. 
        If retry loop counts, it might be 2. 
        The FIX was to count once per failure event. */
-    ASSERT_EQ(1, atomic_load(&vol->stats.crc_failures));
+    ASSERT_EQ(1, atomic_load(&vol->health.crc_failures));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -717,7 +717,7 @@ hn4_TEST(Stats, Read_CRC_Stats_Accumulation) {
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
-    atomic_store(&vol->stats.crc_failures, 0);
+    atomic_store(&vol->health.crc_failures, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x555;
@@ -740,7 +740,7 @@ hn4_TEST(Stats, Read_CRC_Stats_Accumulation) {
     /* 
      * Expectation: 2 failures (One for k=0, One for k=1).
      */
-    ASSERT_EQ(1, atomic_load(&vol->stats.crc_failures));
+    ASSERT_EQ(1, atomic_load(&vol->health.crc_failures));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -820,7 +820,7 @@ hn4_TEST(Pico, Read_Pico_No_Healing) {
     hn4_hal_device_t* dev = read_fixture_setup();
     hn4_volume_t* vol = _mount_with_profile(dev, HN4_PROFILE_PICO);
     
-    atomic_store(&vol->stats.heal_count, 0);
+    atomic_store(&vol->health.heal_count, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0xA2;
@@ -837,7 +837,7 @@ hn4_TEST(Pico, Read_Pico_No_Healing) {
     hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
 
     /* Assert NO healing attempt was made */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -989,7 +989,7 @@ hn4_TEST(Recovery, Heal_Single_Corruption) {
     ASSERT_EQ(0, memcmp(buf, "GOOD_DAT", 8));
     
     /* Verify Heal */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1028,7 +1028,7 @@ hn4_TEST(Recovery, Heal_Deep_Corruption) {
     ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, buf, 4096));
     
     /* Both previous orbits must be healed */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1090,7 +1090,7 @@ hn4_TEST(Recovery, Skip_Heal_If_Compressed) {
     hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
 
     /* Healing MUST be skipped for compressed sources */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1406,7 +1406,7 @@ hn4_TEST(Performance, Read_Candidate_Deduplication) {
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
-    atomic_store(&vol->stats.crc_failures, 0);
+    atomic_store(&vol->health.crc_failures, 0);
 
     /* 
      * Hypothetical: If we simulate a collision by manually populating the bitmap
@@ -1845,7 +1845,7 @@ hn4_TEST(Telemetry, Trajectory_Collapse_Counter) {
     hn4_volume_t* vol = _mount_with_profile(dev, HN4_PROFILE_GENERIC);
 
     /* Reset counter manually for test isolation */
-    atomic_store(&vol->stats.trajectory_collapse_counter, 0);
+    atomic_store(&vol->health.trajectory_collapse_counter, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x123E;
@@ -1867,7 +1867,7 @@ hn4_TEST(Telemetry, Trajectory_Collapse_Counter) {
      * Valid Candidates = 1. Limit = 12. 
      * 1 < (12/2) is True. Counter must increment. 
      */
-    ASSERT_EQ(1, atomic_load(&vol->stats.trajectory_collapse_counter));
+    ASSERT_EQ(1, atomic_load(&vol->health.trajectory_collapse_counter));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -2246,7 +2246,7 @@ hn4_TEST(Read, Trajectory_Collapse) {
     hn4_hal_device_t* dev = read_fixture_setup();
     hn4_volume_t* vol = _mount_with_profile(dev, HN4_PROFILE_GENERIC); /* Depth 12 */
 
-    atomic_store(&vol->stats.trajectory_collapse_counter, 0);
+    atomic_store(&vol->health.trajectory_collapse_counter, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0xC12;
@@ -2263,7 +2263,7 @@ hn4_TEST(Read, Trajectory_Collapse) {
     hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
 
     /* Valid Candidates = 1. Limit = 12. 1 < 6. Counter increments. */
-    ASSERT_TRUE(atomic_load(&vol->stats.trajectory_collapse_counter) > 0);
+    ASSERT_TRUE(atomic_load(&vol->health.trajectory_collapse_counter) > 0);
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -2873,7 +2873,7 @@ hn4_TEST(Pico, CRC_Failure_No_Heal) {
     hn4_volume_t* vol = _setup_pico_volume(dev);
     
     /* Ensure Heal Count is 0 */
-    atomic_store(&vol->stats.heal_count, 0);
+    atomic_store(&vol->health.heal_count, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0xBAD5D;
@@ -2894,7 +2894,7 @@ hn4_TEST(Pico, CRC_Failure_No_Heal) {
     ASSERT_EQ(HN4_ERR_PAYLOAD_ROT, res);
 
     /* CRITICAL: Must NOT have attempted healing (Count == 0) */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -3058,7 +3058,7 @@ hn4_TEST(Recovery, Sick_Replica_Selective_Healing) {
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
-    atomic_store(&vol->stats.heal_count, 0);
+    atomic_store(&vol->health.heal_count, 0);
 
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x1010;
@@ -3094,7 +3094,7 @@ hn4_TEST(Recovery, Sick_Replica_Selective_Healing) {
      * NOTE: Since we hinted k=2 directly, the reader never touched k=0 or k=1.
      * Therefore, NO healing should occur. The test expectation changes.
      */
-    ASSERT_EQ(0, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0, atomic_load(&vol->health.heal_count));
 
     /* Verify k=1 content is still ALIEN (unchanged) */
     uint32_t bs = vol->vol_block_size;
@@ -3991,6 +3991,133 @@ hn4_TEST(Resilience, Ghost_Alloc_Bit_Clear) {
     ASSERT_EQ(HN4_INFO_SPARSE, res);
     ASSERT_EQ(0, buf[0]);
 
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+/*
+ * TEST: Policy.Encrypted_Compressed_Conflict
+ * OBJECTIVE: Verify that the reader enforces security policy by rejecting blocks
+ *            that claim to be Compressed (TCC) when the Anchor is flagged Encrypted.
+ *            (Encryption should happen *after* compression, so FS-layer compression
+ *            flags inside an encrypted container imply structure tampering).
+ * REF: hn4_read.c [FIX: Policy Validation]
+ */
+hn4_TEST(Policy, Encrypted_Compressed_Conflict) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol; hn4_mount_params_t p = {0};
+    hn4_mount(dev, &p, &vol);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xBAD1;
+    anchor.gravity_center = hn4_cpu_to_le64(100);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    
+    /* CONFIG: Anchor says "I am Encrypted". */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_ENCRYPTED);
+
+    uint32_t bs = vol->vol_block_size;
+    uint8_t* raw = calloc(1, bs);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id = hn4_cpu_to_le128(anchor.seed_id);
+    h->generation = hn4_cpu_to_le64(1);
+    
+    /* ATTACK: Block Header says "I am Compressed" (Inconsistent with Encryption) */
+    h->comp_meta = hn4_cpu_to_le32((10 << 4) | HN4_COMP_TCC);
+    
+    uint32_t cap = bs - sizeof(hn4_block_header_t);
+    h->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, h->payload, cap));
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
+
+    uint64_t lba = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_lba_from_blocks(lba * (bs/512)), raw, bs/512);
+    bool c; _bitmap_op(vol, lba, 0, &c);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    /* 
+     * EXPECTATION: Access Denied.
+     * The driver correctly refuses to process encrypted files without a key context,
+     * protecting against the malformed block parsing entirely.
+     */
+    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
+
+    free(raw);
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+/*
+ * TEST: Compression.Gradient_Range_Rejection
+ * OBJECTIVE: Verify that the decompressor correctly validates the projected 
+ *            range of a Gradient (Linear Interpolation) to prevent value wrapping.
+ *            This ensures the signed math fix (int64 cast) is working or at least 
+ *            that logic rejects mathematically invalid gradients.
+ */
+hn4_TEST(Compression, Gradient_Range_Rejection) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol; hn4_mount_params_t p = {0};
+    hn4_mount(dev, &p, &vol);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xBAD2;
+    anchor.gravity_center = hn4_cpu_to_le64(200);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    uint32_t bs = vol->vol_block_size;
+    uint8_t* raw = calloc(1, bs);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id = hn4_cpu_to_le128(anchor.seed_id);
+    h->generation = hn4_cpu_to_le64(1);
+
+    /* 
+     * Construct Malicious Gradient Payload
+     * Op: 0x80 (GRADIENT) | Len: 5 (Encoded as 1, Bias +4 = 5)
+     */
+    uint8_t* payload = h->payload;
+    *payload++ = 0x80 | 1; 
+    *payload++ = 250; /* Start Value: 250 */
+    *payload++ = 10;  /* Slope: +10 */
+    
+    /* 
+     * Mathematical Projection:
+     * Start = 250
+     * End   = 250 + ((5 - 1) * 10) = 290
+     * 290 > 255 (Byte Max).
+     * 
+     * If the check fails (bug), it would wrap to 34 and decode garbage.
+     * The fix ensures we reject this as Data Rot.
+     */
+    
+    uint32_t comp_len = (uint32_t)(payload - h->payload);
+    h->comp_meta = hn4_cpu_to_le32((comp_len << 4) | 3); /* TCC Algo */
+
+    /* Valid CRC for the bad instructions (Logic error, not bitrot) */
+    uint32_t cap = bs - sizeof(hn4_block_header_t);
+    h->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, h->payload, cap));
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
+
+    /* Write */
+    uint64_t lba = _calc_trajectory_lba(vol, 200, 0, 0, 0, 0);
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_lba_from_blocks(lba * (bs/512)), raw, bs/512);
+    bool c; _bitmap_op(vol, lba, 0, &c);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+
+    /* Decompressor returns ERR_DATA_ROT when range check fails */
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    free(raw);
     hn4_unmount(vol);
     read_fixture_teardown(dev);
 }

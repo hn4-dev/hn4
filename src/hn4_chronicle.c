@@ -32,6 +32,7 @@ _Static_assert(sizeof(hn4_addr_t) == 8, "Chronicle requires 64-bit hn4_addr_t");
  * ========================================================================= */
 
 #define HN4_LOG_RATE_LIMIT_NS (5ULL * 1000000000ULL) /* 5 Seconds */
+#define HN4_CHRONICLE_MAX_VERIFY_DEPTH 65536
 
 static void _log_ratelimited(hn4_volume_t* vol, const char* msg, uint64_t val) {
     hn4_time_t now = hn4_hal_get_time_ns();
@@ -417,7 +418,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
                     if (chain_ok) {
 
                          /* STEP 6: Telemetry */
-                        atomic_fetch_add(&vol->stats.heal_count, 1);
+                        atomic_fetch_add(&vol->health.heal_count, 1);
 
                          hn4_addr_t next_head = hn4_addr_add(head, 1);
                     #ifdef HN4_USE_128BIT
@@ -498,7 +499,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
     if (sb_seq > 0 && tip_seq < sb_seq) {
         _log_ratelimited(vol, "SECURITY: Time-Travel Detected! Log Seq < SB Seq", tip_seq);
         
-        atomic_fetch_add(&vol->stats.trajectory_collapse_counter, HN4_ERR_TAMPERED);
+        atomic_fetch_add(&vol->health.trajectory_collapse_counter, HN4_ERR_TAMPERED);
         vol->sb.info.state_flags |= HN4_VOL_PANIC;
         
         hn4_hal_mem_free(buf); hn4_hal_mem_free(prev_buf);
@@ -509,8 +510,14 @@ hn4_result_t hn4_chronicle_verify_integrity(
     hn4_result_t status = HN4_OK;
     uint64_t steps = 0;
     uint64_t max_steps = (end - start);
-
+    
     while (steps < max_steps) {
+
+        if (steps >= HN4_CHRONICLE_MAX_VERIFY_DEPTH) {
+            HN4_LOG_WARN("Chronicle: Verified recent history (%llu). Deep scan skipped.", 
+                         (unsigned long long)steps);
+            break;
+        }
         hn4_chronicle_header_t* curr = (hn4_chronicle_header_t*)buf;
         uint64_t curr_seq = hn4_le64_to_cpu(curr->sequence);
         uint32_t expected_prev_hash = hn4_le32_to_cpu(curr->prev_sector_crc);
@@ -552,7 +559,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
 
     if (status != HN4_OK) {
         /* STEP 7: Track Barrier/IO Fails */
-        atomic_fetch_add(&vol->stats.barrier_failures, 1);
+        atomic_fetch_add(&vol->health.barrier_failures, 1);
         vol->sb.info.state_flags |= HN4_VOL_PANIC;
     }
 

@@ -220,6 +220,7 @@ hn4_result_t hn4_tensor_open(
      * --------------------------------------------------------------------- */
     ctx->vol              = vol;
     ctx->shard_count      = found_count;
+    atomic_fetch_add(&vol->ref_count, 1);
     ctx->total_size_bytes = accumulator;
     ctx->block_size       = vol->vol_block_size;
     
@@ -385,16 +386,16 @@ cleanup:
 
 void hn4_tensor_close(hn4_tensor_ctx_t* ctx) 
 {
-    /* 
-     * CLEANUP
-     * Pre-condition: Caller guarantees no concurrent readers.
-     */
     if (ctx) {
+        /* Release Reference */
+        if (ctx->vol) {
+            atomic_fetch_sub(&ctx->vol->ref_count, 1);
+        }
+
         if (ctx->shards)        hn4_hal_mem_free(ctx->shards);
         if (ctx->shard_offsets) hn4_hal_mem_free(ctx->shard_offsets);
         
 #ifdef HN4_DEBUG
-        /* Poisoning for debug builds only */
         memset(ctx, 0xDD, sizeof(hn4_tensor_ctx_t));
 #endif
         hn4_hal_mem_free(ctx);

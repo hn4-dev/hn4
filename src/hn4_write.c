@@ -62,29 +62,6 @@ static const uint8_t _prof_policy_lut[8] = {
 };
 
 /* =========================================================================
- * ZNS HELPER DEFINITIONS
- * ========================================================================= */
-
-/*
- * Asynchronous Context for ZNS Zone Append operations.
- * Allows polling for completion and capturing the resulting LBA.
- */
-typedef struct {
-    volatile bool         done;
-    volatile hn4_result_t res;
-} _zns_write_ctx_t;
-
-static void _zns_append_callback(hn4_io_req_t* r, hn4_result_t res)
-{
-    _zns_write_ctx_t* ctx = (_zns_write_ctx_t*)r->user_ctx;
-    ctx->res = res;
-
-    /* Ensure result visibility before signaling completion */
-    atomic_thread_fence(memory_order_release);
-    ctx->done = true;
-}
-
-/* =========================================================================
  * INTERNAL HELPERS
  * ========================================================================= */
 
@@ -244,28 +221,28 @@ uint64_t _resolve_residency_verified(
      * If the file is flagged as Horizon, data is sequential starting at G.
      * ===================================================================== */
     if (dclass & HN4_HINT_HORIZON) {
-        /*
-         * In Horizon Mode:
-         * G = Physical Block Index of the start of the chain.
-         * Offset = Logical_Index * Fractal_Stride (2^M).
-         */
         uint64_t stride = (1ULL << M);
 
-        /* Check for overflow before calc */
+        /* Check 1: Multiplication Overflow */
         if (block_idx < (UINT64_MAX / stride)) {
-            uint64_t linear_lba = G + (block_idx * stride);
-
-            if (_verify_block_at_lba(vol, linear_lba, check_buf, my_well_id, block_idx, current_gen)) {
-                found_lba = linear_lba;
-                goto Cleanup;
+            uint64_t offset = block_idx * stride;
+            
+            /* Ensure G + offset does not wrap UINT64_MAX */
+            if ((UINT64_MAX - G) >= offset) {
+                
+                uint64_t linear_lba = G + offset;
+                uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+                
+                if (linear_lba < max_vol_blocks) {
+                    if (_verify_block_at_lba(vol, linear_lba, check_buf, my_well_id, block_idx, current_gen)) {
+                        found_lba = linear_lba;
+                        goto Cleanup;
+                    }
+                }
+            } else {
+                HN4_LOG_WARN("Horizon LBA Wrap detected. File logical offset exceeds 64-bit physical space.");
             }
         }
-        /*
-         * Fallthrough Safety:
-         * Even if HINT_HORIZON is set, we continue to check Ballistic Orbits.
-         * During a "Gravity Collapse" or "Re-Ballistification" transition,
-         * the file might be in a mixed state (some blocks moved, some not).
-         */
     }
 
     /* =====================================================================
@@ -307,6 +284,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
         HN4_LOG_CRIT("WRITE_ATOMIC: Invalid Args (NULL ptr)");
         return HN4_ERR_INVALID_ARGUMENT;
     }
+retry_transaction:;
     if (vol->read_only) {
         HN4_LOG_CRIT("WRITE_ATOMIC: Volume is RO");
         return HN4_ERR_ACCESS_DENIED;
@@ -576,7 +554,7 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
         uint64_t usable_blks = raw_blks - (raw_blks / 20); /* 5% overhead */
         uint64_t threshold   = (usable_blks * 90) / 100;
 
-        if (atomic_load(&vol->used_blocks) < threshold) {
+        if (atomic_load(&vol->alloc.used_blocks) < threshold) {
             atomic_fetch_and(&vol->sb.info.state_flags, ~HN4_VOL_RUNTIME_SATURATED);
         }
     } else {
@@ -817,20 +795,22 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
         }
 
         if (!rescued) {
-            HN4_LOG_CRIT("WRITE_ATOMIC: IO Error %d. Rolling back.", io_res);
+             HN4_LOG_CRIT("WRITE_ATOMIC: IO Error %d. Rolling back.", io_res);
 
-            /*
-             * LATENT WRITE PROTECTION (The Leak):
-             * We can only free the bitmap if we are certain the drive stopped.
-             * On Timeout, we must leak to prevent data corruption of future allocs.
+            /* Check ZNS capability before freeing bitmap */
+            bool is_zns = (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE);
+
+            /* 
+             * On ZNS, any write attempt (even failed) might advance the WP. 
+             * We MUST leak the block (keep it marked 'used') to preserve sequentiality.
              */
-            if (io_res != HN4_ERR_ATOMICS_TIMEOUT) {
+            if (!is_zns && io_res != HN4_ERR_ATOMICS_TIMEOUT) {
                 _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
             } else {
-                HN4_LOG_CRIT("WRITE_ATOMIC: Timeout persists. Leaking Block %llu for Scavenger.",
+                /* For ZNS or Timeouts, we leak the block and mark dirty for Scavenger */
+                HN4_LOG_CRIT("Leaking Block %llu (ZNS/Timeout) to preserve alignment.", 
                              (unsigned long long)target_lba);
-
-                /* Mark Volume as Dirty so Scavenger knows to scan eventually */
+                
                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
 
                 /* 2. Downgrade Silicon Quality (Firmware distress signal) */
@@ -891,14 +871,34 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     /* 9. Metadata Update */
     atomic_thread_fence(memory_order_release);
 
-    uint32_t old_gen_le = anchor->write_gen;
-    while (!atomic_compare_exchange_weak(
+    /* We expect the generation to be exactly what we read at the start (current_gen). */
+    /* Note: current_gen was captured in Step 5 logic above. */
+    uint32_t expected_gen_le = hn4_cpu_to_le32(current_gen);
+    uint32_t new_gen_le      = hn4_cpu_to_le32((uint32_t)next_gen);
+
+    if (!atomic_compare_exchange_strong(
         (_Atomic uint32_t*)&anchor->write_gen, 
-        &old_gen_le, 
-        hn4_cpu_to_le32((uint32_t)next_gen)));
+        &expected_gen_le, 
+        new_gen_le))
+    {
+        HN4_LOG_WARN("WRITE_ATOMIC: Race detected. Expected Gen %u, Found %u. Retrying.", 
+                     current_gen, hn4_le32_to_cpu(expected_gen_le));
+
+        /* ROLLBACK: Free the NEW block we just wrote (target_lba) */
+        /* We do NOT free old_lba because we failed to claim the transaction. */
+        _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+
+        /* Cleanup memory before jumping back */
+        hn4_hal_mem_free(io_buf);
+
+        /* Backoff and Retry */
+        hn4_hal_micro_sleep(100);
+        goto retry_transaction;
+    }
 
     uint64_t now_le = hn4_cpu_to_le64(hn4_hal_get_time_ns());
     atomic_store((_Atomic uint64_t*)&anchor->mod_clock, now_le);
+
 
     uint64_t end_byte = (block_idx * payload_cap) + len;
     uint64_t curr_mass_le = atomic_load((_Atomic uint64_t*)&anchor->mass);

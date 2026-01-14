@@ -261,7 +261,7 @@ hn4_TEST(PicoProfile, Micro_Horizon_Cycle) {
     uint64_t start = 500;
     vol->sb.info.lba_horizon_start = start;
     vol->sb.info.journal_start = start + 2;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     uint64_t lba;
     

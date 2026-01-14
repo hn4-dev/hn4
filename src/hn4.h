@@ -22,6 +22,18 @@
 extern "C" {
 #endif
 
+/* Check for 128-bit atomic support (Hardware CAS) for the Armored Bitmap */
+#if defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16) || defined(__x86_64__) || defined(__aarch64__)
+    #define HN4_HW_ATOMICS_128 1
+#else
+    #define HN4_HW_ATOMICS_128 0
+#endif
+
+#ifndef HN4_CACHE_LINE_SIZE
+    #define HN4_CACHE_LINE_SIZE 64
+#endif
+
+
 /* =========================================================================
  * 0. COMPILER ABSTRACTION & SAFETY
  * ========================================================================= */
@@ -395,23 +407,17 @@ typedef struct HN4_PACKED {
     uint8_t     inline_buffer[24];  /* Filename or Tiny Data (Section 8.5) */
 } hn4_anchor_t;
 
-/* 9.3 Tether Structure - Access Control */
-#define HN4_TARGET_FILE_ID      0
-#define HN4_TARGET_TAG_HASH     1
-
+/* 9.3 Tether Structure - Optimized for 64-bit Bus Width */
 typedef struct HN4_PACKED {
-    uint32_t    target_type;        /* FILE_ID (0) or TAG_HASH (1) */
-    uint32_t    permissions;        /* Granted permissions */
-    uint64_t    expiry_ts;          /* 0 = Forever */
-    hn4_u128_t  target_value;       /* UUID or Tag Hash */
-    uint8_t     signature[64];      /* Ed25519 Signature */
-    uint8_t     padding[32];        /* Pad to 128 bytes */
+    uint32_t    target_type;        /* 0x00 */
+    uint32_t    permissions;        /* 0x04 - Naturally Aligned */
+    uint64_t    expiry_ts;          /* 0x08 - Naturally Aligned */
+    hn4_u128_t  target_value;       /* 0x10 - 16-byte Aligned (Critical) */
+    uint8_t     signature[64];      /* 0x20 - Cache Line Aligned */
+    uint8_t     padding[32];        /* 0x60 - Pad to 128 */
 } hn4_tether_t;
 
 /* 8.6 Extension Blocks */
-#define HN4_EXT_TYPE_VECTOR     1   /* 384-bit Semantic Vector */
-#define HN4_EXT_TYPE_LONGNAME   2   /* Filename > 23 bytes */
-#define HN4_EXT_TYPE_TAG        3   /* Tag Metadata Entry */
 
 typedef struct HN4_PACKED {
     uint32_t    magic;              /* HN4_MAGIC_META */
@@ -584,24 +590,29 @@ typedef struct {
 
 /* Runtime Volume Handle */
 typedef struct {
-    /* Opaque HAL target device */
+    /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
     void*               target_device;
-
-    /* Cached Geometry */
-    hn4_size_t          vol_capacity_bytes;
-    uint32_t            vol_block_size;
-
-    /* Superblock State & Offsets */
+    
+    /* Superblock & Geometry */
     hn4_superblock_t    sb;
     uint64_t            sb_offsets_bytes[4]; 
+
+    /* MATH OPTIMIZATION: Shift/Masks replace CPU Division */
+    /* Use: offset >> vol->block_shift instead of offset / block_size */
+    uint32_t            block_shift;      
+    /* Use: lba & vol->cap_mask instead of lba % capacity (if Power-of-2) */
+    hn4_size_t          cap_mask;         
+    
+    hn4_size_t          vol_capacity_bytes;
+    uint32_t            vol_block_size;
 
     /* Memory Structures */
     hn4_armored_word_t* void_bitmap;
     size_t              bitmap_size;
-    uint64_t*           quality_mask;   /* 64-bit words containing 32 blocks each */
+    uint64_t*           quality_mask;   
     size_t              qmask_size;
     
-    /* D0 Cortex Cache (Optional/Profile dependent) */
+    /* D0 Cortex Cache (Optional) */
     void*               nano_cortex;
     size_t              cortex_size; 
     
@@ -609,39 +620,63 @@ typedef struct {
     int64_t             time_offset;
     bool                read_only;
 
-    /* Atomic Counters */
-    _Atomic uint64_t    used_blocks; 
-    _Atomic uint64_t    horizon_write_head;
-    _Atomic uint32_t    taint_counter; /* Session error tracker */
-    _Atomic uint64_t    toxic_blocks;  /* Tracks blocks lost to physical rot */
-    _Atomic uint64_t    last_alloc_g;  /* Tracks last successful Gravity Center for locality */
- 
-    uint64_t            cortex_search_head;  /* Cursor for Nano-Allocator */
-    /* Optimizations */
-    uint64_t*           l2_summary_bitmap; 
-    bool                in_eviction_path; 
-    hn4_spinlock_t      l2_lock;       /* Protects L2 bitmap for System volumes */
+    /* --- HOT ZONE A: ALLOCATOR (Core Write Path) --- */
+    /* 
+     * ALIGNMENT CRITICAL: 
+     * Forces this struct to start on a new 64-byte Cache Line.
+     * Prevents writes here from invalidating 'health' cache lines.
+     */
+    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+        _Atomic uint64_t    used_blocks; 
+        _Atomic uint64_t    horizon_write_head;
+        _Atomic uint64_t    last_alloc_g;
+        uint64_t            cortex_search_head;
+        uint64_t            scavenger_cursor; 
+    } alloc;
 
-    /* AI Topology Map (Path-Aware Striping) */
+
+    /* --- HOT ZONE B: HEALTH & RECOVERY (Scavenger/Monitor Path) --- */
+    /* 
+     * ALIGNMENT CRITICAL:
+     * Keeps high-frequency counters away from allocator locks.
+     * Replaces previous 'stats' nested struct.
+     */
+    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+        _Atomic uint32_t    taint_counter; 
+        _Atomic uint64_t    toxic_blocks;  
+        _Atomic uint32_t    ref_count;
+        
+        /* Flattened stats */
+        _Atomic uint64_t    heal_count;
+        _Atomic uint64_t    crc_failures;
+        _Atomic uint64_t    barrier_failures;
+        _Atomic uint32_t    trajectory_collapse_counter;
+    } health;
+
+    /* --- COLD ZONE (Locking & Topology) --- */
+    
+    /* AI Topology Map */
     struct {
-        uint32_t gpu_id;         /* PCI ID of the GPU */
-        uint32_t affinity_weight;/* 0=SameSwitch, 1=SameNuma, 2=Remote */
-        uint64_t lba_start;      /* Start of NVMe Namespace physically close */
-        uint64_t lba_len;        /* Length of that Namespace */
-    } *topo_map;                 /* Array of mapped accelerators */
+        uint32_t gpu_id;
+        uint32_t affinity_weight;
+        uint64_t lba_start;
+        uint64_t lba_len;
+    } *topo_map;
     uint32_t topo_count;
 
-    /* STEP 2: Add Telemetry & Rate Limiting */
-    struct {
-        _Atomic uint64_t heal_count;
-        _Atomic uint64_t crc_failures;
-        _Atomic uint64_t barrier_failures;
-        _Atomic uint32_t trajectory_collapse_counter;
-    } stats;
-    hn4_medic_queue_t medic_queue;
-    int64_t last_log_ts; /* For rate limiting */
+    /* Repair Queue */
+    hn4_medic_queue_t   medic_queue;
+    int64_t             last_log_ts;
+
+    /* L2 Locking (Isolated) */
+    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+        hn4_spinlock_t      l2_lock;       
+        uint64_t*           l2_summary_bitmap; 
+        bool                in_eviction_path; 
+    } locking;
 
 } hn4_volume_t;
+
 
 /* =========================================================================
  * 8. API, FORMATTING & BALLISTICS
@@ -769,7 +804,7 @@ typedef struct HN4_PACKED {
     _Static_assert(sizeof(hn4_epoch_header_t) == 128, "HN4 Epoch Header must be 128 bytes");
     _Static_assert(sizeof(hn4_tether_t) == 128, "HN4 Tether must be 128 bytes");
     _Static_assert(sizeof(hn4_armored_word_t) == 16, "HN4 Armored Word must be 16 bytes for 128-bit atomic CAS");
-    
+    _Static_assert(offsetof(hn4_tether_t, target_value) % 16 == 0, "Tether target_value misaligned!");
     /* Use offsetof() for structs with flexible array members to ensure layout correctness */
     _Static_assert(offsetof(hn4_block_header_t, payload) == 48, "HN4 Block Header Payload offset wrong");
     _Static_assert(offsetof(hn4_stream_header_t, payload) == 64, "HN4 Stream Header Payload offset wrong");

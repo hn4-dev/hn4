@@ -1224,7 +1224,7 @@ hn4_TEST(Write, Write_Taint_Accumulation) {
        state in RAM during the call? Difficult.
        
        Let's stick to verifiable state: Taint should start at 0. */
-    ASSERT_EQ(0, vol->taint_counter);
+    ASSERT_EQ(0, vol->health.taint_counter);
     
     /* We will simulate a "Recovered Error" flow if possible, or just verify 0 */
     /* Placeholder for full HAL Mock test */
@@ -2092,7 +2092,7 @@ hn4_TEST(Write, Write_Payload_CRC_Mismatch_Reject) {
 
     /* 6. Verify Auto-Medic Triggered (Stats) */
     /* Only explicit CRC failures (Rot) increment this counter */
-    ASSERT_TRUE(atomic_load(&vol->stats.crc_failures) > 0);
+    ASSERT_TRUE(atomic_load(&vol->health.crc_failures) > 0);
 
     free(raw); free(read_buf);
     hn4_unmount(vol);
@@ -2899,7 +2899,7 @@ hn4_TEST(Write, ShadowHop_NoInfiniteSearch) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
     /* Mock usage > 95% capacity to trigger Saturation (Spec 18.8) */
-    atomic_store(&vol->used_blocks, (vol->vol_capacity_bytes / vol->vol_block_size) - 100);
+    atomic_store(&vol->alloc.used_blocks, (vol->vol_capacity_bytes / vol->vol_block_size) - 100);
     
     /* Clog the specific G trajectory (D1) */
     uint64_t G = 7000;
@@ -5565,7 +5565,7 @@ hn4_TEST(Performance, ShadowHop_NoReadBeforeWrite) {
     ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, len));
     
     /* Reset Stats */
-    atomic_store(&vol->stats.crc_failures, 0); 
+    atomic_store(&vol->health.crc_failures, 0); 
     /* NOTE: In a real environment, we would check HW stats. 
        Here we verify via logic: Overwrite shouldn't trigger CRC failure 
        or read-modify-write artifacts. */
@@ -5576,7 +5576,7 @@ hn4_TEST(Performance, ShadowHop_NoReadBeforeWrite) {
     /* If a read occurred on garbage/old data and failed validation, 
        crc_failures might have incremented in some implementations. 
        Ensure it's 0. */
-    ASSERT_EQ(0, atomic_load(&vol->stats.crc_failures));
+    ASSERT_EQ(0, atomic_load(&vol->health.crc_failures));
 
     free(data);
     hn4_unmount(vol);
@@ -6029,7 +6029,7 @@ hn4_TEST(Logic, Saturation_Decay_Threshold_Adjustment) {
     atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_RUNTIME_SATURATED);
 
     /* 2. Mock Used Blocks to be just ABOVE threshold */
-    atomic_store(&vol->used_blocks, threshold + 10);
+    atomic_store(&vol->alloc.used_blocks, threshold + 10);
 
     /* Trigger Write (which checks saturation) */
     hn4_anchor_t anchor = {0};
@@ -6044,7 +6044,7 @@ hn4_TEST(Logic, Saturation_Decay_Threshold_Adjustment) {
     ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_RUNTIME_SATURATED);
 
     /* 3. Drop Usage BELOW threshold */
-    atomic_store(&vol->used_blocks, threshold - 10);
+    atomic_store(&vol->alloc.used_blocks, threshold - 10);
 
     /* Trigger Write again */
     hn4_write_block_atomic(vol, &anchor, 0, buf, 4);
@@ -6156,7 +6156,7 @@ hn4_TEST(MediaTopology, Floppy_Pico_WriteRead) {
     _bitmap_op(vol, lba_k0, BIT_SET, &changed);
     
     /* FIX: Update accounting so allocator sees volume usage */
-    atomic_fetch_add(&vol->used_blocks, 1);
+    atomic_fetch_add(&vol->alloc.used_blocks, 1);
 
     anchor.gravity_center = hn4_cpu_to_le64(G_clog);
     
@@ -7763,7 +7763,7 @@ hn4_TEST(Epoch, Time_Dilation_Detection) {
      */
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     ASSERT_TRUE(vol->read_only);
-    ASSERT_TRUE(vol->taint_counter > 0);
+    ASSERT_TRUE(vol->health.taint_counter > 0);
 
     hn4_unmount(vol);
     write_fixture_teardown(dev);

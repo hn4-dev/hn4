@@ -110,7 +110,7 @@ hn4_TEST(StateValidation, HighTaintTolerance) {
     hn4_volume_t* vol = create_volume_fixture();
     void* dev_ptr = vol->target_device;
 
-    vol->taint_counter = 500; /* Very high taint */
+    vol->health.taint_counter = 500; /* Very high taint */
 
     /* Should still proceed to unmount (might mark degraded, but returns OK/IO) */
     hn4_result_t res = hn4_unmount(vol);
@@ -231,8 +231,8 @@ hn4_TEST(ResourceTeardown, L2SummaryCleanup) {
     void* dev_ptr = vol->target_device;
 
     /* Simulate L2 allocation (usually done during mount/alloc) */
-    vol->l2_summary_bitmap = hn4_hal_mem_alloc(128);
-    ASSERT_TRUE(vol->l2_summary_bitmap != NULL);
+    vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(128);
+    ASSERT_TRUE(vol->locking.l2_summary_bitmap != NULL);
 
     /* Unmount should detect non-NULL ptr, free it, and zero it */
     hn4_result_t res = hn4_unmount(vol);
@@ -391,7 +391,7 @@ hn4_TEST(StateValidation, DirtyBitTaint) {
     hn4_volume_t* vol = create_volume_fixture();
     void* dev_ptr = vol->target_device;
 
-    vol->taint_counter = 1;
+    vol->health.taint_counter = 1;
 
     /* We can't verify the disk write easily, but we verify the call succeeds */
     hn4_result_t res = hn4_unmount(vol);
@@ -647,7 +647,7 @@ hn4_TEST(StateValidation, AlreadyCleanLogic) {
     void* dev_ptr = vol->target_device;
 
     vol->sb.info.state_flags |= HN4_VOL_CLEAN;
-    vol->taint_counter = 10;
+    vol->health.taint_counter = 10;
 
     hn4_result_t res = hn4_unmount(vol);
     ASSERT_EQ(HN4_OK, res);
@@ -671,8 +671,8 @@ hn4_TEST(ResourceTeardown, L2SummaryOnly) {
     hn4_hal_mem_free(vol->nano_cortex); vol->nano_cortex = NULL;
 
     /* Alloc ONLY L2 */
-    vol->l2_summary_bitmap = hn4_hal_mem_alloc(256);
-    ASSERT_TRUE(vol->l2_summary_bitmap != NULL);
+    vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(256);
+    ASSERT_TRUE(vol->locking.l2_summary_bitmap != NULL);
 
     hn4_result_t res = hn4_unmount(vol);
     ASSERT_EQ(HN4_OK, res);
@@ -690,7 +690,7 @@ hn4_TEST(StateValidation, TaintCounterSaturation) {
     hn4_volume_t* vol = create_volume_fixture();
     void* dev_ptr = vol->target_device;
 
-    vol->taint_counter = UINT32_MAX;
+    vol->health.taint_counter = UINT32_MAX;
 
     hn4_result_t res = hn4_unmount(vol);
     ASSERT_EQ(HN4_OK, res);
@@ -968,7 +968,7 @@ hn4_TEST(StateValidation, TaintPersistenceOnCleanUnmount) {
     vol->sb.info.state_flags = HN4_VOL_CLEAN;
     
     /* ...but experienced a correctable error during the session. */
-    vol->taint_counter = 1;
+    vol->health.taint_counter = 1;
 
     /*
      * Execution flow in _broadcast_superblock:
@@ -1099,8 +1099,8 @@ hn4_TEST(MemoryLeak, OrphanedL2Summary) {
     hn4_hal_mem_free(vol->quality_mask); vol->quality_mask = NULL;
 
     /* L2 Summary is valid (The potential leak) */
-    vol->l2_summary_bitmap = hn4_hal_mem_alloc(4096);
-    ASSERT_TRUE(vol->l2_summary_bitmap != NULL);
+    vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(4096);
+    ASSERT_TRUE(vol->locking.l2_summary_bitmap != NULL);
 
     /* Unmount should free L2, preventing the leak */
     hn4_result_t res = hn4_unmount(vol);
@@ -1765,7 +1765,7 @@ hn4_TEST(Lifecycle, ReadOnly_SkipsPersistence_VerifiesLogic) {
      * taint bit. In Read-Only mode, this MUST be ignored to prevent media writes.
      */
     vol->sb.info.state_flags = HN4_VOL_DIRTY;
-    vol->taint_counter = 100;
+    vol->health.taint_counter = 100;
 
     /* 
      * 4. Capture Pre-Condition State 
@@ -2267,7 +2267,7 @@ hn4_TEST(StateValidation, Clean_But_Tainted_Success) {
     void* dev_ptr = vol->target_device;
 
     vol->sb.info.state_flags = HN4_VOL_CLEAN;
-    vol->taint_counter = 5;
+    vol->health.taint_counter = 5;
 
     hn4_result_t res = hn4_unmount(vol);
     ASSERT_EQ(HN4_OK, res);

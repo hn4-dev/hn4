@@ -1,6 +1,7 @@
 /*
  * hn4-CAPACITOR: Portable C Test Runner v2.3
  * Fixed: Added MSVC CRT Section logic for automatic test registration.
+ * Update: Added ASSERT_NE for compatibility.
  */
 
 #ifndef _HN4_TEST_H_
@@ -75,6 +76,10 @@ void hn4_free(void* ptr, hn4_test_ctx_t* ctx);
 #define ASSERT_NEQ(e, a) if ((uint64_t)(e) == (uint64_t)(a)) \
     HN4_FAIL("NEQ failed: Both are 0x%llx", (unsigned long long)(e))
 
+/* Added per request */
+#define ASSERT_NE(e, a) if ((uint64_t)(e) == (uint64_t)(a)) \
+    HN4_FAIL("NE failed: Both are 0x%llx", (unsigned long long)(e))
+
 #define ASSERT_STR_EQ(e, a) if (strcmp(e, a) != 0) \
     HN4_FAIL("STR_EQ failed: '%s' vs '%s'", e, a)
 
@@ -137,4 +142,5 @@ extern hn4_registry_node_t* _hn4_head;
 #ifdef __cplusplus
 }
 #endif
-#endif
+
+#endif /* _HN4_TEST_H_ */

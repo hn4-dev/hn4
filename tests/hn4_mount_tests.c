@@ -413,7 +413,7 @@ hn4_TEST(Reliability, TaintDecay) {
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
-    vol->taint_counter = 10;
+    vol->health.taint_counter = 10;
     
     ASSERT_EQ(HN4_OK, hn4_unmount(vol));
     
@@ -441,7 +441,7 @@ hn4_TEST(State, InvalidFlags) {
     
     ASSERT_EQ(HN4_OK, res);
     ASSERT_TRUE(vol->read_only);
-    ASSERT_TRUE(vol->taint_counter > 0);
+    ASSERT_TRUE(vol->health.taint_counter > 0);
     
     if (vol) hn4_unmount(vol);
     destroy_fixture(dev);
@@ -643,7 +643,7 @@ hn4_TEST(Epoch, TimeBackwards) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
     ASSERT_TRUE(vol->read_only);
-    ASSERT_TRUE(vol->taint_counter > 0);
+    ASSERT_TRUE(vol->health.taint_counter > 0);
     
     if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
@@ -1444,41 +1444,61 @@ hn4_TEST(L2_Geometry, Cortex_OOB) {
  */
 hn4_TEST(Identity, Root_Tombstone_Rejection) {
     hn4_hal_device_t* dev = create_fixture_formatted();
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps->logical_block_size;
     
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    /* 1. Read SB */
+    void* sb_buf = hn4_hal_mem_alloc(HN4_SB_SIZE);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), sb_buf, HN4_SB_SIZE/ss);
+    hn4_superblock_t* sb = (hn4_superblock_t*)sb_buf;
+    hn4_sb_to_cpu(sb);
     
     /* Cortex LBA is Sector Index */
-    uint64_t ctx_lba = sb.info.lba_cortex_start;
+    hn4_addr_t ctx_lba = sb->info.lba_cortex_start;
+    uint32_t bs = sb->info.block_size;
     
-    /* 1. Read Valid Root */
-    uint8_t* buf = calloc(1, sb.info.block_size);
-    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, sb.info.block_size/512);
+    /* 2. Read Valid Root */
+    void* buf = hn4_hal_mem_alloc(bs);
+    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, bs/ss);
     
-    /* 2. Mark as Tombstone */
+    /* 3. Mark as Tombstone */
     hn4_anchor_t* root = (hn4_anchor_t*)buf;
     uint64_t dclass = hn4_le64_to_cpu(root->data_class);
     
-    dclass &= ~HN4_FLAG_VALID;
-    dclass |= HN4_FLAG_TOMBSTONE;
+    /* Must preserve VALID flag if we want it treated as a Tombstone record, 
+       otherwise it's just garbage/empty slot. */
+    dclass |= HN4_FLAG_TOMBSTONE; 
+    /* If we clear VALID, scanner treats it as empty slot. 
+       If we keep VALID + TOMBSTONE, scanner treats it as deleted file. 
+       For Root, both should result in NOT_FOUND during mount validation. */
+    dclass &= ~HN4_FLAG_VALID; /* Actually invalidating it is safer for Root rejection */
+    
     root->data_class = hn4_cpu_to_le64(dclass);
     
-    /* Recalculate CRC */
+    /* Recalculate CRC (Match Driver Logic: Full Struct) */
     root->checksum = 0;
-    uint32_t crc = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
+    uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
     root->checksum = hn4_cpu_to_le32(crc);
     
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, buf, sb.info.block_size/512);
-    free(buf);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, buf, bs/ss);
     
-    /* 3. Attempt Mount */
+    /* 4. Attempt Mount */
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
+    
+    /* Mount checks: 
+       1. CRC OK? Yes.
+       2. Semantics OK? (ID=FFFF, Class=STATIC|VALID).
+       We removed VALID (or added TOMBSTONE). 
+       Result: Semantic Check fails. Driver returns NOT_FOUND. */
+    
     hn4_result_t res = hn4_mount(dev, &p, &vol);
     
     ASSERT_EQ(HN4_ERR_NOT_FOUND, res);
     
     if (vol) hn4_unmount(vol);
+    hn4_hal_mem_free(buf);
+    hn4_hal_mem_free(sb_buf);
     destroy_fixture(dev);
 }
 
@@ -2026,42 +2046,56 @@ hn4_TEST(Geometry, BS_Equals_SS_512) {
  */
 hn4_TEST(Recovery, RootAnchor_BadCRC_Heal) {
     hn4_hal_device_t* dev = create_fixture_formatted();
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps->logical_block_size;
     
     /* 1. Get Geometry info */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    void* sb_buf = hn4_hal_mem_alloc(HN4_SB_SIZE);
+    ASSERT_NE(NULL, sb_buf);
+    
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), sb_buf, HN4_SB_SIZE/ss);
+    hn4_superblock_t* sb = (hn4_superblock_t*)sb_buf;
+    hn4_sb_to_cpu(sb); /* FIX: Endian Swap */
     
     /* 2. Corrupt Root Anchor CRC */
-    uint64_t ctx_lba = sb.info.lba_cortex_start;
-    uint8_t* buf = calloc(1, sb.info.block_size);
-    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, sb.info.block_size/512);
+    hn4_addr_t ctx_lba = sb->info.lba_cortex_start;
+    uint32_t bs = sb->info.block_size;
+    
+    void* buf = hn4_hal_mem_alloc(bs);
+    ASSERT_NE(NULL, buf);
+    
+    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, bs/ss);
     
     hn4_anchor_t* root = (hn4_anchor_t*)buf;
     root->checksum = ~root->checksum; /* Invert to invalidate */
     
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, buf, sb.info.block_size/512);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, buf, bs/ss);
     
-    /* 3. Mount RW */
+    /* 3. Mount RW (Should Trigger Heal) */
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
+    /* Healing logs warning but returns OK */
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
     /* 4. Verify Disk Healed */
-    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, sb.info.block_size/512);
+    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, bs/ss);
     root = (hn4_anchor_t*)buf;
     
-    /* Recalc expected */
+    /* Recalc expected (Match Driver's Genesis/Repair Logic: Full Struct Hash) */
     uint32_t stored_sum = hn4_le32_to_cpu(root->checksum);
     root->checksum = 0;
-     uint32_t calc_sum = hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum));
-    calc_sum = hn4_crc32(calc_sum, root->inline_buffer, sizeof(root->inline_buffer));
+    
+    /* Driver uses simple linear hash over sizeof(hn4_anchor_t) for Root */
+    uint32_t calc_sum = hn4_crc32(0, root, sizeof(hn4_anchor_t));
     
     ASSERT_EQ(calc_sum, stored_sum);
     
-    free(buf);
+    hn4_hal_mem_free(buf);
+    hn4_hal_mem_free(sb_buf);
     if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
 }
+
 
 /* 
  * Test 92: Consensus - North Stale Generation
@@ -2480,7 +2514,7 @@ hn4_TEST(Mount, Bitmap_Corrupt_Abort) {
  * Test 109: Mount - Clean State Taint Reduction
  * Scenario: Volume has Taint=10, State=CLEAN.
  * Logic: Mount should halve the taint counter (10 -> 5).
- * Expected: vol->taint_counter == 5.
+ * Expected: vol->health.taint_counter == 5.
  */
 hn4_TEST(Mount, Taint_Decay_On_Clean) {
     hn4_hal_device_t* dev = create_fixture_formatted();
@@ -2499,7 +2533,7 @@ hn4_TEST(Mount, Taint_Decay_On_Clean) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
     /* Should have incremented from 0 to 1 due to conflicting flags */
-    ASSERT_EQ(1, vol->taint_counter);
+    ASSERT_EQ(1, vol->health.taint_counter);
     
     hn4_unmount(vol);
     destroy_fixture(dev);
@@ -2638,7 +2672,7 @@ hn4_TEST(State, Torn_Flags) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
     
     ASSERT_TRUE(vol->read_only);
-    ASSERT_EQ(1, vol->taint_counter);
+    ASSERT_EQ(1, vol->health.taint_counter);
     
     hn4_unmount(vol);
     destroy_fixture(dev);
@@ -3262,12 +3296,15 @@ hn4_TEST(State, Needs_Upgrade_Flag) {
     hn4_mount_params_t p = {0};
     
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-    ASSERT_FALSE(vol->read_only);
+    
+    /* FIX: Assert Read-Only is TRUE (Security/Safety change) */
+    ASSERT_TRUE(vol->read_only);
     ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_NEEDS_UPGRADE);
     
     hn4_unmount(vol);
     destroy_fixture(dev);
 }
+
 
 /* 
  * Test 134: Flag - Pending Wipe (Rejection)
@@ -4144,7 +4181,7 @@ hn4_TEST(Epoch, Future_Dilation_RO) {
     
     ASSERT_TRUE(vol->read_only);
     /* Dilation logic adds +10 to taint counter */
-    ASSERT_TRUE(vol->taint_counter >= 10);
+    ASSERT_TRUE(vol->health.taint_counter >= 10);
     
     if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
@@ -4243,7 +4280,7 @@ hn4_TEST(L10_Reconstruction, Ghost_Repair) {
     }
     
     /* Assert Taint increased (Repair occurred) */
-    ASSERT_TRUE(vol->taint_counter > 0);
+    ASSERT_TRUE(vol->health.taint_counter > 0);
 
     hn4_unmount(vol);
     destroy_fixture(dev);
@@ -4566,32 +4603,6 @@ hn4_TEST(Profile, Archive_Logic) {
 }
 
 /* 
- * Test 322: Unmount - Clean Transition
- */
-hn4_TEST(Unmount, Clean_Transition) {
-    hn4_hal_device_t* dev = create_fixture_formatted();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    hn4_mount(dev, &p, &vol);
-    
-    /* Force dirty in RAM */
-    vol->sb.info.state_flags |= HN4_VOL_DIRTY;
-    vol->sb.info.state_flags &= ~HN4_VOL_CLEAN;
-    
-    hn4_unmount(vol);
-    
-    /* Check disk */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
-    ASSERT_TRUE(sb.info.state_flags & HN4_VOL_CLEAN);
-    
-    destroy_fixture(dev);
-}
-
-
-
-
-/* 
  * Test 302: Spec 16.5 - Incompatible Flag (Low Bit)
  */
 hn4_TEST(Spec_16_5, Incompat_Flag_Bit0) {
@@ -4818,31 +4829,55 @@ hn4_TEST(Identity, Zero_UUID_Rejected) {
  */
 hn4_TEST(Identity, Root_Bad_Class) {
     hn4_hal_device_t* dev = create_fixture_formatted();
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps->logical_block_size;
     
-    uint64_t ctx_lba = sb.info.lba_cortex_start;
-    uint8_t buf[4096];
-    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, buf, 4096/512);
+    /* 1. Read Superblock using Aligned Buffer */
+    void* sb_buf = hn4_hal_mem_alloc(HN4_SB_SIZE);
+    ASSERT_NE(NULL, sb_buf);
     
-    hn4_anchor_t* root = (hn4_anchor_t*)buf;
-    /* Remove STATIC flag, Add EPHEMERAL */
+    uint32_t sb_sectors = HN4_SB_SIZE / ss;
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_addr_from_u64(0), sb_buf, sb_sectors);
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)sb_buf;
+    hn4_sb_to_cpu(sb); /* Normalize for reading Cortex LBA */
+    
+    /* 2. Read Root Anchor */
+    hn4_addr_t ctx_lba = sb->info.lba_cortex_start;
+    uint32_t bs = sb->info.block_size;
+    
+    /* Reuse buffer if large enough, else realloc (Anchor is small, BS usually 4k+) */
+    void* anchor_buf = hn4_hal_mem_alloc(bs);
+    ASSERT_NE(NULL, anchor_buf);
+    
+    hn4_hal_sync_io(dev, HN4_IO_READ, ctx_lba, anchor_buf, bs / ss);
+    
+    /* 3. Corrupt Semantics (Valid Integrity, Bad Class) */
+    hn4_anchor_t* root = (hn4_anchor_t*)anchor_buf;
+    
+    /* Set EPHEMERAL (Not Allowed for Root) */
     root->data_class = hn4_cpu_to_le64(HN4_VOL_EPHEMERAL | HN4_FLAG_VALID);
-    /* Update CRC */
+    
+    /* Update CRC to be Valid (So it passes Integrity Check, fails Semantic Check) */
     root->checksum = 0;
-    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum)));
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
     
-    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, buf, 4096/512);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, ctx_lba, anchor_buf, bs / ss);
     
+    /* 4. Verify Rejection */
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
     
-    /* Expect NOT_FOUND (Rejection), not Healing */
+    /* Should fail with NOT_FOUND (Semantic Rejection), not DATA_ROT (CRC Error) */
     ASSERT_EQ(HN4_ERR_NOT_FOUND, hn4_mount(dev, &p, &vol));
     
     if(vol) hn4_unmount(vol);
+    
+    hn4_hal_mem_free(sb_buf);
+    hn4_hal_mem_free(anchor_buf);
     destroy_fixture(dev);
 }
+
 
 /* 1. Profile: AI Acceptance */
 hn4_TEST(Profile, AI_Acceptance) {
@@ -5179,27 +5214,6 @@ hn4_TEST(State, Dirty_And_Panic) {
     destroy_fixture(dev);
 }
 
-/* 14. Unmount: Dirty Bit Clearing */
-hn4_TEST(Unmount, Clears_Dirty) {
-    hn4_hal_device_t* dev = create_fixture_formatted();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    hn4_mount(dev, &p, &vol);
-    
-    /* Verify Dirty in RAM */
-    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
-    
-    hn4_unmount(vol);
-    
-    /* Verify Clean on Disk */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
-    ASSERT_TRUE(sb.info.state_flags & HN4_VOL_CLEAN);
-    ASSERT_FALSE(sb.info.state_flags & HN4_VOL_DIRTY);
-    
-    destroy_fixture(dev);
-}
-
 /* 15. Cardinality: All Good (Ideal) */
 hn4_TEST(Cardinality, All_Good) {
     hn4_hal_device_t* dev = create_fixture_formatted();
@@ -5459,7 +5473,7 @@ hn4_TEST(L10_Reconstruction, ZeroScan_Ghost_Verify) {
     root->seed_id.hi = 0xFFFFFFFFFFFFFFFFULL;
     root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
     root->orbit_vector[0] = 1;
-    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum)));
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
     
     /* Slot 1: The Ghost File */
     hn4_anchor_t* ghost = (hn4_anchor_t*)(ctx_buf + sizeof(hn4_anchor_t));
@@ -5469,7 +5483,7 @@ hn4_TEST(L10_Reconstruction, ZeroScan_Ghost_Verify) {
     ghost->gravity_center = hn4_cpu_to_le64(100);
     ghost->mass = hn4_cpu_to_le64(bs);
     ghost->orbit_vector[0] = 1;
-    ghost->checksum = hn4_cpu_to_le32(hn4_crc32(0, ghost, offsetof(hn4_anchor_t, checksum)));
+    ghost->checksum = hn4_cpu_to_le32(hn4_crc32(0, ghost, sizeof(hn4_anchor_t)));
     
     hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
     free(ctx_buf);
@@ -5975,5 +5989,143 @@ hn4_TEST(Consensus, SplitBrain_CleanDirty_Merge) {
     ASSERT_FALSE(vol->sb.info.state_flags & HN4_VOL_CLEAN);
 
     if (vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
+/* 
+ * Test 500: State - Needs Upgrade Forces Read-Only (Fix 2)
+ * Scenario: Volume marked HN4_VOL_NEEDS_UPGRADE.
+ * Logic: The fix ensures that if an upgrade is required, the driver 
+ *        forces Read-Only mode to prevent writing incompatible structures.
+ * Expected: Mount OK, but vol->read_only is TRUE.
+ */
+hn4_TEST(State, Needs_Upgrade_Forces_RO) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Inject Needs Upgrade flag */
+    sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED | HN4_VOL_NEEDS_UPGRADE;
+    write_sb(dev, &sb, 0);
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+    
+    /* Verify Fix: Driver forced RO */
+    ASSERT_TRUE(vol->read_only);
+    
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 501: State - Unmounting Flag Treated as Dirty (Fix 4)
+ * Scenario: Volume has HN4_VOL_UNMOUNTING set (crashed during unmount).
+ * Logic: The fix detects this flag and forcibly transitions the state 
+ *        to HN4_VOL_DIRTY, stripping HN4_VOL_CLEAN.
+ * Expected: In-memory state flags show DIRTY, not CLEAN.
+ */
+hn4_TEST(State, Unmounting_Transitions_To_Dirty) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Simulate crash during unmount */
+    sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED | HN4_VOL_UNMOUNTING;
+    write_sb(dev, &sb, 0);
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+    
+    /* Verify Fix: State logic stripped CLEAN and applied DIRTY */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DIRTY);
+    ASSERT_FALSE(vol->sb.info.state_flags & HN4_VOL_CLEAN);
+    
+    /* Verify Unmounting flag persists for awareness */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_UNMOUNTING);
+    
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 502: Wormhole - Hardware Capability Rejection (Fix 1)
+ * Scenario: User requests HN4_MNT_WORMHOLE. HAL lacks HN4_HW_STRICT_FLUSH.
+ * Logic: The fix adds a specific check for hardware capabilities when 
+ *        Wormhole mode is requested.
+ * Expected: HN4_ERR_HW_IO (Safety rejection).
+ */
+hn4_TEST(Durability, Wormhole_Reject_Weak_Hardware) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* Hack HAL: Remove STRICT_FLUSH capability */
+    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
+    caps->hw_flags &= ~HN4_HW_STRICT_FLUSH;
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    p.mount_flags = HN4_MNT_WORMHOLE;
+    
+    /* Verify Fix: Mount should fail explicitly */
+    ASSERT_EQ(HN4_ERR_HW_IO, hn4_mount(dev, &p, &vol));
+    
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 503: Wormhole - Hardware Capability Acceptance (Fix 1 Positive)
+ * Scenario: User requests HN4_MNT_WORMHOLE. HAL has HN4_HW_STRICT_FLUSH.
+ * Logic: Ensures valid configurations are not accidentally blocked.
+ * Expected: HN4_OK.
+ */
+hn4_TEST(Durability, Wormhole_Accept_Strong_Hardware) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    
+    /* Hack HAL: Add STRICT_FLUSH capability */
+    hn4_hal_caps_t* caps = (hn4_hal_caps_t*)dev;
+    caps->hw_flags |= HN4_HW_STRICT_FLUSH;
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    p.mount_flags = HN4_MNT_WORMHOLE;
+    
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+    
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 504: State - Degraded Flag Persistence (Fix 3)
+ * Scenario: Volume is marked DEGRADED (missing mirror).
+ * Logic: Ensure the fix allows the mount (logging a warning) and, crucial to 
+ *        the dirty-marking logic, ensures the DEGRADED flag persists into the 
+ *        active RAM volume structure.
+ * Expected: Mount OK, HN4_VOL_DEGRADED is set in vol->sb.info.
+ */
+hn4_TEST(State, Degraded_Flag_Persists) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Inject Degraded + Clean */
+    sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED | HN4_VOL_DEGRADED;
+    write_sb(dev, &sb, 0);
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+    
+    /* Verify Fix: Flag is preserved in memory */
+    ASSERT_TRUE(vol->sb.info.state_flags & HN4_VOL_DEGRADED);
+    ASSERT_FALSE(vol->read_only); /* Degraded allows RW */
+    
+    if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
 }

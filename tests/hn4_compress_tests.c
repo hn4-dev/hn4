@@ -1,11 +1,11 @@
 /*
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
- * MODULE:      ORE Compression Tests (Updated for v60.3 API)
+ * MODULE:      TCC Compression Tests (Updated for v60.3 API)
  * SOURCE:      hn4_compress_tests.c
  * STATUS:      PRODUCTION / TEST SUITE
  *
  * TEST OBJECTIVE:
- * Verify ORE compression logic, structure detection, decompression safety,
+ * Verify TCC compression logic, structure detection, decompression safety,
  * and hardware-specific optimization paths (Deep Scan / NVM Stream).
  */
 
@@ -143,7 +143,7 @@ static void compress_teardown(hn4_hal_device_t* dev) {
  * BASIC TESTS (Adapted for New Signature)
  * ========================================================================= */
 
-hn4_TEST(Compress, ORE_HighEntropy_Passthrough) {
+hn4_TEST(Compress, _TCC_HighEntropy_Passthrough) {
     hn4_hal_device_t* dev = compress_setup();
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
@@ -184,7 +184,7 @@ hn4_TEST(Compress, ORE_HighEntropy_Passthrough) {
  * EDGE CASE TESTS (Updated Signature)
  * ========================================================================= */
 
-hn4_TEST(Compress, ORE_Gradient_Slope_Extremes) {
+hn4_TEST(Compress, _TCC_Gradient_Slope_Extremes) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* Valid Gradient (+2) */
@@ -210,10 +210,10 @@ hn4_TEST(Compress, ORE_Gradient_Slope_Extremes) {
 }
 
 /*
- * Test 25: ORE_Max_Token_Exact_Boundary
+ * Test 25: _TCC_Max_Token_Exact_Boundary
  * Updated: Passing HN4_DEV_SSD, 0
  */
-hn4_TEST(Compress, ORE_Max_Token_Exact_Boundary) {
+hn4_TEST(Compress, _TCC_Max_Token_Exact_Boundary) {
     hn4_hal_device_t* dev = compress_setup();
     
     uint32_t target_len = 8227; 
@@ -241,10 +241,10 @@ hn4_TEST(Compress, ORE_Max_Token_Exact_Boundary) {
 }
 
 /*
- * Test 26: ORE_Max_Token_Plus_One (Split Check)
+ * Test 26: _TCC_Max_Token_Plus_One (Split Check)
  * Updated: Passing HN4_DEV_SSD, 0
  */
-hn4_TEST(Compress, ORE_Max_Token_Plus_One) {
+hn4_TEST(Compress, _TCC_Max_Token_Plus_One) {
     hn4_hal_device_t* dev = compress_setup();
     
     uint32_t target_len = 8228;
@@ -276,10 +276,10 @@ hn4_TEST(Compress, ORE_Max_Token_Plus_One) {
 }
 
 /*
- * Test 28: ORE_End_Of_Buffer_Scan
+ * Test 28: _TCC_End_Of_Buffer_Scan
  * Updated: Using fixed pattern (sawtooth) and passing HN4_DEV_SSD, 0
  */
-hn4_TEST(Compress, ORE_End_Of_Buffer_Scan) {
+hn4_TEST(Compress, _TCC_End_Of_Buffer_Scan) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* Sawtooth (Literals) then Isotope */
@@ -301,12 +301,8 @@ hn4_TEST(Compress, ORE_End_Of_Buffer_Scan) {
     compress_teardown(dev);
 }
 
-/* =========================================================================
- * NEW ARCHITECTURE TESTS (Deep Scan & NVM)
- * ========================================================================= */
-
 /*
- * Test 33: ORE_HDD_DeepScan_Trigger
+ * Test 33: _TCC_HDD_DeepScan_Trigger
  * Objective: Verify that passing HN4_DEV_HDD triggers Deep Scan logic.
  * Logic:
  *   1. Create a data pattern where a gradient is valid for 16 bytes, but breaks at 8 bytes?
@@ -320,7 +316,7 @@ hn4_TEST(Compress, ORE_End_Of_Buffer_Scan) {
  *      Deep Scan (32 bytes): Sees 0..15 then Junk. Fails at 16.
  *      
  *      Wait, the code says: "If we matched at least 16 bytes before failing, return the slope anyway."
- *      So Deep Scan is MORE tolerant of tails if the head is strong.
+ *      So Deep Scan is MTCC tolerant of tails if the head is strong.
  * 
  *      Let's test the heuristic:
  *      Pattern: 0..16 (Gradient), then 0xFF (Junk).
@@ -334,7 +330,7 @@ hn4_TEST(Compress, ORE_End_Of_Buffer_Scan) {
  *      Functional differentiation is hard without mocking internal static functions.
  *      We rely on correctness of the previous tests + flag propagation.
  */
-hn4_TEST(Compress, ORE_HDD_DeepScan_Execution) {
+hn4_TEST(Compress, _TCC_HDD_DeepScan_Execution) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* 32 bytes of perfect gradient */
@@ -361,11 +357,11 @@ hn4_TEST(Compress, ORE_HDD_DeepScan_Execution) {
 }
 
 /*
- * Test 34: ORE_NVM_Stream_Execution
+ * Test 34: TCC_NVM_Stream_Execution
  * Objective: Verify that passing HN4_HW_NVM flag produces valid output.
  *            (We cannot verify NT stores happened without HW counters, but we check correctness).
  */
-hn4_TEST(Compress, ORE_NVM_Stream_Execution) {
+hn4_TEST(Compress, _TCC_NVM_Stream_Execution) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* 
@@ -403,7 +399,7 @@ hn4_TEST(Compress, ORE_NVM_Stream_Execution) {
 
 /* (Include tests 17, 19, 20, 21, 22 from previous response, updated with HN4_DEV_SSD, 0 args) */
 
-hn4_TEST(Compress, ORE_Decompress_Output_Overflow) {
+hn4_TEST(Compress, _TCC_Decompress_Output_Overflow) {
     hn4_hal_device_t* dev = compress_setup();
     uint32_t len = 1024;
     uint8_t* data = calloc(1, len);
@@ -418,7 +414,7 @@ hn4_TEST(Compress, ORE_Decompress_Output_Overflow) {
     free(data); free(out_buf); compress_teardown(dev);
 }
 
-hn4_TEST(Compress, ORE_Zero_Byte_Input) {
+hn4_TEST(Compress, _TCC_Zero_Byte_Input) {
     hn4_hal_device_t* dev = compress_setup();
     uint8_t src[1] = {0};
     uint8_t dst[64];
@@ -434,7 +430,7 @@ hn4_TEST(Compress, ORE_Zero_Byte_Input) {
     compress_teardown(dev);
 }
 
-hn4_TEST(Compress, ORE_Truncated_Stream_Header) {
+hn4_TEST(Compress, _TCC_Truncated_Stream_Header) {
     hn4_hal_device_t* dev = compress_setup();
     uint32_t len = 128;
     uint8_t* data = calloc(1, len);
@@ -449,7 +445,7 @@ hn4_TEST(Compress, ORE_Truncated_Stream_Header) {
     free(data); free(out_buf); free(check_buf); compress_teardown(dev);
 }
 
-hn4_TEST(Compress, ORE_Decompress_Garbage_Stream) {
+hn4_TEST(Compress, _TCC_Decompress_Garbage_Stream) {
     hn4_hal_device_t* dev = compress_setup();
     uint32_t garbage_len = 1024;
     uint8_t* garbage = calloc(1, garbage_len);
@@ -464,10 +460,10 @@ hn4_TEST(Compress, ORE_Decompress_Garbage_Stream) {
 
 
 /*
- * Test 35: ORE_Mixed_Optimization_Flags
+ * Test 35: _TCC_Mixed_Optimization_Flags
  * Objective: Verify stability when both optimizations are requested (unlikely but possible config).
  */
-hn4_TEST(Compress, ORE_Mixed_Optimization_Flags) {
+hn4_TEST(Compress, _TCC_Mixed_Optimization_Flags) {
     hn4_hal_device_t* dev = compress_setup();
     
     uint32_t len = 64;
@@ -495,12 +491,12 @@ hn4_TEST(Compress, ORE_Mixed_Optimization_Flags) {
 }
 
 /*
- * Test 36: ORE_Gradient_Slope_Reversal
+ * Test 36: _TCC_Gradient_Slope_Reversal
  * Objective: Verify behavior when a gradient suddenly reverses slope.
  *            e.g., 0, 1, 2, 3 -> 2, 1, 0.
  *            Ensure the encoder breaks the run and starts a new token.
  */
-hn4_TEST(Compress, ORE_Gradient_Slope_Reversal) {
+hn4_TEST(Compress, _TCC_Gradient_Slope_Reversal) {
     hn4_hal_device_t* dev = compress_setup();
     uint8_t data[] = { 10, 11, 12, 13, 14, 15, 16, 17, /* Up */
                        16, 15, 14, 13, 12, 11, 10, 9   /* Down */ };
@@ -533,11 +529,11 @@ hn4_TEST(Compress, ORE_Gradient_Slope_Reversal) {
 
 
 /*
- * Test 37: ORE_Isotope_Interrupted_By_Zero
+ * Test 37: _TCC_Isotope_Interrupted_By_Zero
  * Objective: Verify that a sequence of Zeros is treated as an Isotope,
  *            but a single non-zero byte breaks it cleanly.
  */
-hn4_TEST(Compress, ORE_Isotope_Interrupted_By_Zero) {
+hn4_TEST(Compress, _TCC_Isotope_Interrupted_By_Zero) {
     hn4_hal_device_t* dev = compress_setup();
     /* 00...00 (8 bytes) -> 01 -> 00...00 (8 bytes) */
     uint8_t data[17] = {0,0,0,0,0,0,0,0,  1,  0,0,0,0,0,0,0,0};
@@ -563,11 +559,11 @@ hn4_TEST(Compress, ORE_Isotope_Interrupted_By_Zero) {
 }
 
 /*
- * Test 38: ORE_NVM_Misaligned_Buffer
+ * Test 38: _TCC_NVM_Misaligned_Buffer
  * Objective: Stress the NVM SIMD path with unaligned buffers.
  *            The code handles alignment manually; verify it doesn't segfault or corrupt.
  */
-hn4_TEST(Compress, ORE_NVM_Misaligned_Buffer) {
+hn4_TEST(Compress, _TCC_NVM_Misaligned_Buffer) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* Allocation guarantees some alignment, we intentionally offset it */
@@ -600,11 +596,11 @@ hn4_TEST(Compress, ORE_NVM_Misaligned_Buffer) {
 }
 
 /*
- * Test 39: ORE_NVM_Tiny_Tail_Write
+ * Test 39: _TCC_NVM_Tiny_Tail_Write
  * Objective: Verify NVM path handles the <16 byte tail correctly 
  *            after a large SIMD block copy.
  */
-hn4_TEST(Compress, ORE_NVM_Tiny_Tail_Write) {
+hn4_TEST(Compress, _TCC_NVM_Tiny_Tail_Write) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* Length = 64 (Threshold) + 1 byte */
@@ -634,11 +630,11 @@ hn4_TEST(Compress, ORE_NVM_Tiny_Tail_Write) {
 }
 
 /*
- * Test 40: ORE_HDD_DeepScan_False_Positive_Rejection
+ * Test 40: _TCC_HDD_DeepScan_False_Positive_Rejection
  * Objective: Ensure Deep Scan doesn't incorrectly accept a gradient that 
  *            matches the "Strided" check (Index 0, 16, 31) but fails in the middle.
  */
-hn4_TEST(Compress, ORE_HDD_DeepScan_False_Positive_Rejection) {
+hn4_TEST(Compress, _TCC_HDD_DeepScan_False_Positive_Rejection) {
     hn4_hal_device_t* dev = compress_setup();
     
     uint8_t data[32];
@@ -676,11 +672,11 @@ hn4_TEST(Compress, ORE_HDD_DeepScan_False_Positive_Rejection) {
 }
 
 /*
- * Test 41: ORE_Zero_Length_Literal_Flush
+ * Test 41: _TCC_Zero_Length_Literal_Flush
  * Objective: Verify _flush_literal_buffer handles 0-length calls gracefully.
  *            (Called internally when switching modes).
  */
-hn4_TEST(Compress, ORE_Zero_Length_Literal_Flush) {
+hn4_TEST(Compress, _TCC_Zero_Length_Literal_Flush) {
     /* 
      * This requires internal access or a pattern that triggers 
      * a 0-length flush (e.g., Isotope at byte 0).
@@ -703,10 +699,10 @@ hn4_TEST(Compress, ORE_Zero_Length_Literal_Flush) {
 
 
 /*
- * Test 44: ORE_Invalid_Gradient_Slope_Neg128
+ * Test 44: _TCC_Invalid_Gradient_Slope_Neg128
  * Objective: Manually inject a Gradient token with Slope -128 (Illegal).
  */
-hn4_TEST(Compress, ORE_Invalid_Gradient_Slope_Neg128) {
+hn4_TEST(Compress, _TCC_Invalid_Gradient_Slope_Neg128) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* Tag: Gradient | Len 4 */
@@ -723,11 +719,11 @@ hn4_TEST(Compress, ORE_Invalid_Gradient_Slope_Neg128) {
 }
 
 /*
- * Test 45: ORE_Alternating_Gradient_Isotope
+ * Test 45: _TCC_Alternating_Gradient_Isotope
  * Objective: Verify correct transition between Gradient and Isotope
  *            without dropping bytes or confusing anchors.
  */
-hn4_TEST(Compress, ORE_Alternating_Gradient_Isotope) {
+hn4_TEST(Compress, _TCC_Alternating_Gradient_Isotope) {
     hn4_hal_device_t* dev = compress_setup();
     
     /* 
@@ -755,10 +751,10 @@ hn4_TEST(Compress, ORE_Alternating_Gradient_Isotope) {
 }
 
 /* 
- * Test: ORE_Benchmark_Gradient_vs_LZ_Entropy 
+ * Test: TCC_Benchmark_Gradient_vs_LZ_Entropy 
  * Scenario: Linear ramp data (0, 1, 2, 3...)
  * LZ Behavior: Sees "0, 1, 2, 3". No dictionary match. Encodes as Literals. Ratio ~1.0.
- * ORE Behavior: Detects slope +1. Encodes as Gradient token. Ratio ~0.02.
+ * TCC Behavior: Detects slope +1. Encodes as Gradient token. Ratio ~0.02.
  */
 hn4_TEST(CompressBench, Gradient_vs_LZ) {
     uint32_t len = 65536; // 64KB
@@ -790,7 +786,7 @@ hn4_TEST(CompressBench, Gradient_vs_LZ) {
 
 
 /*
- * Test: ORE_Structure_Detect_FalseNegative
+ * Test: TCC_Structure_Detect_FalseNegative
  * Scenario: Sparse data that aligns to 7 bytes, not 8.
  * Heuristic: Samples every 1/8th. 
  * If the sample points hit the "noise", it might reject the block.
@@ -833,7 +829,7 @@ hn4_TEST(CompressBench, Structure_Misclassification) {
 }
 
 /*
- * Test: ORE_Topology_Variance
+ * Test: TCC_Topology_Variance
  * Scenario: Noisy Gradient.
  * HDD (Deep) should compress it. SSD (Fast) should abandon it.
  * This proves compression layer is making storage decisions.
@@ -875,10 +871,10 @@ hn4_TEST(CompressBench, Topology_Variance) {
 }
 
 /*
- * Test: ORE_Text_Compression_Weakness
+ * Test: TCC_Text_Compression_Weakness
  * Scenario: "The quick brown fox..." repeated.
  * LZ would compress 2nd instance to ~3 bytes.
- * ORE (Isotope/Gradient) will encode as Literals (0 compression).
+ * TCC (Isotope/Gradient) will encode as Literals (0 compression).
  * This validates the design scope (HN4 is not for Log/Text files).
  */
 hn4_TEST(CompressBench, Text_Weakness) {
@@ -899,13 +895,300 @@ hn4_TEST(CompressBench, Text_Weakness) {
     
     /* 
      * Expectation: Out size >= In size (Expansion due to tokens).
-     * This confirms ORE is specialized for Signal/Vector data, not general purpose.
+     * This confirms TCC is specialized for Signal/Vector data, not general purpose.
      */
     if (out_size >= buf_len) {
-        printf("Confirmed: ORE does not deduplicate repeated string patterns (Design Choice).\n");
+        printf("Confirmed: TCC does not deduplicate repeated string patterns (Design Choice).\n");
     } else {
         printf("Unexpected: Compression occurred (Did you enable Echo?).\n");
     }
 
     free(data); free(out);
+}
+
+
+/* =========================================================================
+ * 42. TCC OVERFLOW DEFENSE (MALFORMED TOKEN STREAM)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the decompressor safely handles a stream where a token claims
+ * to produce more output bytes than the destination buffer can hold.
+ * This simulates a "Zip Bomb" or corrupted compression metadata attack.
+ */
+hn4_TEST(Compress, _TCC_Output_Buffer_Overrun_Defense) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Malicious Token: Isotope (0x40)
+     * Length: Max Token Length (e.g. 8000+) 
+     * Target Buffer: Tiny (64 bytes)
+     */
+    uint8_t malicious_stream[] = { 
+        0x7F, /* Literal Header (Length 63) */
+        /* ... missing payload ... */
+    };
+    /* Wait, let's construct a valid header that expands massively */
+    /* Isotope of 'A', Length 63 + Bias 4 = 67 bytes */
+    uint8_t iso_stream[] = { 0x40 | 63, 'A' }; 
+    
+    uint8_t dst[32]; /* Too small for 67 bytes */
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_decompress_block(iso_stream, sizeof(iso_stream), dst, 32, &out_len);
+    
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 43. TCC UNDERFLOW DEFENSE (TRUNCATED INPUT)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the decompressor handles input streams that end abruptly
+ * in the middle of a token definition or payload.
+ */
+hn4_TEST(Compress, _TCC_Input_Stream_Truncation) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Valid Stream: Literal (Len 4) + "ABCD"
+     * Truncated: Literal (Len 4) + "AB"
+     */
+    uint8_t truncated[] = { 0x00 | 4, 'A', 'B' }; /* Expects 4 bytes, gives 2 */
+    
+    uint8_t dst[64];
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_decompress_block(truncated, sizeof(truncated), dst, 64, &out_len);
+    
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 44. TCC VARINT PARSING LOOP (STACK EXHAUSTION)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the VarInt parser has a hard limit on extension bytes (32).
+ * A stream of 0xFF, 0xFF... should not cause an infinite loop or stack overflow.
+ */
+hn4_TEST(Compress, _TCC_VarInt_Loop_Limit) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* Construct a stream with 40 extension bytes (Limit is 32) */
+    uint8_t stream[50];
+    stream[0] = 0x40 | 0x3F; /* Isotope, Len 63 (VarInt Trigger) */
+    for(int i=1; i<=40; i++) stream[i] = 0xFF; /* Extension */
+    stream[41] = 0x00; /* Terminator */
+    stream[42] = 'A';  /* Isotope Value */
+    
+    uint8_t dst[128]; /* Destination size irrelevant if parser fails first */
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_decompress_block(stream, 43, dst, 128, &out_len);
+    
+    /* Should fail with DATA_ROT due to excessive extensions */
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 45. TCC INTERLEAVED PATTERN STRESS
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify correct encoding/decoding of rapidly switching patterns.
+ * Isotope -> Literal -> Gradient -> Isotope -> Literal.
+ * Ensures internal anchors and pointers are updated correctly between modes.
+ */
+hn4_TEST(Compress, _TCC_Mode_Switching_Stress) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Pattern:
+     * 1. Isotope (8x 'A')
+     * 2. Literal (1x 'B') - Breaks Isotope
+     * 3. Gradient (0, 2, 4... 14) - 8 bytes
+     * 4. Literal (1x 'C') - Breaks Gradient
+     */
+    uint8_t data[] = {
+        'A','A','A','A','A','A','A','A', /* Iso */
+        'B',                             /* Lit */
+        0, 2, 4, 6, 8, 10, 12, 14,       /* Grad */
+        'C'                              /* Lit */
+    };
+    uint32_t len = sizeof(data);
+    
+    void* out = calloc(1, 128);
+    uint32_t out_len = 0;
+
+    ASSERT_EQ(HN4_OK, hn4_compress_block(data, len, out, 128, &out_len, HN4_DEV_SSD, 0));
+
+    /* Verify decode matches original */
+    uint8_t* check = calloc(1, len);
+    uint32_t clen;
+    ASSERT_EQ(HN4_OK, hn4_decompress_block(out, out_len, check, len, &clen));
+    ASSERT_EQ(len, clen);
+    ASSERT_EQ(0, memcmp(data, check, len));
+
+    free(out);
+    free(check);
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 46. TCC GRADIENT WRAPAROUND SAFETY
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the gradient logic handles integer overflow/underflow correctly
+ * and does not attempt to encode gradients that wrap around 8-bit boundaries.
+ * (Spec 20.3: Gradients are strictly linear within [0, 255]).
+ */
+hn4_TEST(Compress, _TCC_Gradient_Wraparound_Reject) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Pattern: 250, 252, 254, 0, 2, 4, 6, 8 
+     * Slope +2. Wraps at index 3.
+     * The encoder MUST reject this as a Gradient and emit Literals.
+     */
+    uint8_t data[] = {250, 252, 254, 0, 2, 4, 6, 8};
+    
+    void* out = calloc(1, 64);
+    uint32_t out_len = 0;
+
+    ASSERT_EQ(HN4_OK, hn4_compress_block(data, 8, out, 64, &out_len, HN4_DEV_SSD, 0));
+
+    /* Check Opcode: Must be Literal (0x00), not Gradient (0x80) */
+    uint8_t tag = ((uint8_t*)out)[0] & 0xC0;
+    ASSERT_EQ(HN4_OP_LITERAL, tag);
+
+    /* Verify Integrity */
+    uint8_t check[8];
+    uint32_t clen;
+    ASSERT_EQ(HN4_OK, hn4_decompress_block(out, out_len, check, 8, &clen));
+    ASSERT_EQ(0, memcmp(data, check, 8));
+
+    free(out);
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 47. TCC RESERVED OPCODE TRAP
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the decompressor rejects tokens with the Reserved opcode (0xC0).
+ * This ensures future extensibility without breaking legacy readers.
+ */
+hn4_TEST(Compress, _TCC_Reserved_Opcode_Trap) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* Stream: Reserved Opcode (0xC0) | Len 0 */
+    uint8_t stream[] = { 0xC0 }; 
+    
+    uint8_t dst[64];
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_decompress_block(stream, 1, dst, 64, &out_len);
+    
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 48. TCC ZERO-SLOPE GRADIENT REJECTION
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that a "Gradient" with slope 0 is rejected (It should be an Isotope).
+ * This ensures canonical encoding and prevents ambiguity.
+ */
+hn4_TEST(Compress, _TCC_Zero_Slope_Gradient_Reject) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Manually construct a Gradient token with Slope 0.
+     * Header: Gradient (0x80) | Len 4 (biased)
+     * Data: Start=10, Slope=0
+     */
+    uint8_t stream[] = { 0x84, 10, 0 };
+    
+    uint8_t dst[64];
+    uint32_t out_len = 0;
+
+    /* Decompressor should reject Slope 0 as invalid/corrupt stream */
+    hn4_result_t res = hn4_decompress_block(stream, sizeof(stream), dst, 64, &out_len);
+    
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 49. TCC HUGE ALLOCATION SIMULATION (4GB LIMIT)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the compressor refuses inputs larger than HN4_BLOCK_LIMIT (1GB)
+ * to prevent integer overflows in internal offset calculations.
+ */
+hn4_TEST(Compress, _TCC_Huge_Input_Rejection) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* Mock a huge pointer (we won't actually access it, just pass length) */
+    /* Using NULL source is safe because the check happens before dereference */
+    void* huge_ptr = (void*)0xDEADBEEF; 
+    uint32_t huge_len = (1UL << 30) + 1; /* 1GB + 1 byte */
+    
+    void* out = calloc(1, 64);
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_compress_block(huge_ptr, huge_len, out, 64, &out_len, HN4_DEV_SSD, 0);
+    
+    ASSERT_EQ(HN4_ERR_INVALID_ARGUMENT, res);
+
+    free(out);
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 50. TCC TINY BUFFER FUZZ (1-3 BYTES)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify compressor behavior on extremely small buffers that are smaller than
+ * the minimum span for Isotope/Gradient detection (4 bytes).
+ * Ensures they are correctly passed through as Literals without buffer underreads.
+ */
+hn4_TEST(Compress, _TCC_Tiny_Buffer_Fuzz) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    for (uint32_t len = 1; len <= 3; len++) {
+        uint8_t data[3] = {1, 2, 3}; /* Gradient-like, but too short */
+        uint8_t out[16];
+        uint32_t out_len = 0;
+        
+        ASSERT_EQ(HN4_OK, hn4_compress_block(data, len, out, 16, &out_len, HN4_DEV_SSD, 0));
+        
+        /* Must be Literal */
+        ASSERT_EQ(HN4_OP_LITERAL, out[0] & 0xC0);
+        
+        /* Verify Decode */
+        uint8_t check[3];
+        uint32_t clen;
+        ASSERT_EQ(HN4_OK, hn4_decompress_block(out, out_len, check, 3, &clen));
+        ASSERT_EQ(len, clen);
+        ASSERT_EQ(0, memcmp(data, check, len));
+    }
+
+    compress_teardown(dev);
 }

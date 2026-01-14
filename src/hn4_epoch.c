@@ -108,13 +108,20 @@ static inline hn4_result_t _epoch_phys_map(
     /* Overflow check for byte calculation */
     if (block_idx > (UINT64_MAX / block_size)) return HN4_ERR_GEOMETRY;
     
+    if (block_size > 0 && block_idx > (UINT64_MAX / block_size)) {
+    HN4_LOG_CRIT("Epoch: Block Index calculation would overflow 64-bits");
+    return HN4_ERR_GEOMETRY;
+    }
+
     uint64_t byte_offset = block_idx * block_size;
-    
+
     /* Capacity check */
     if (byte_offset >= vol_cap_bytes) return HN4_ERR_GEOMETRY;
 
     /* Overflow check for sector calculation */
-    if (block_idx > (UINT64_MAX / sectors_per_block)) return HN4_ERR_GEOMETRY;
+    if (sectors_per_block > 0 && block_idx > (UINT64_MAX / sectors_per_block)) {
+        return HN4_ERR_GEOMETRY;
+    }
 
     *out_lba = block_idx * sectors_per_block;
 #endif
@@ -308,13 +315,30 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
     uint64_t mem_id  = sb->info.current_epoch_id;
     hn4_epoch_drift_state_t state;
 
-    if (HN4_LIKELY(disk_id == mem_id)) {
+    /* Drift Analysis with Wrap-Around Support */
+    uint64_t diff;
+    bool is_future;
+
+    if (disk_id >= mem_id) {
+        diff = disk_id - mem_id;
+        is_future = true;
+    } else {
+        /* Check for wrap-around case: disk=small, mem=huge */
+        /* If mem_id is near MAX and disk_id is near 0 */
+        if (mem_id > (UINT64_MAX - 10000) && disk_id < 10000) {
+        diff = (UINT64_MAX - mem_id) + 1 + disk_id;
+        is_future = true; /* It wrapped, so it's "future" */
+    } else {
+        diff = mem_id - disk_id;
+        is_future = false; /* Genuine past */
+    }
+}
+
+    if (diff == 0) {
         state = EPOCH_SYNCED;
-    } else if (disk_id > mem_id) {
-        uint64_t diff = disk_id - mem_id;
+    } else if (is_future) {
         state = (diff > HN4_EPOCH_DRIFT_MAX_FUTURE) ? EPOCH_FUTURE_TOXIC : EPOCH_FUTURE_DILATION;
     } else {
-        uint64_t diff = mem_id - disk_id;
         state = (diff > HN4_EPOCH_DRIFT_MAX_PAST) ? EPOCH_PAST_TOXIC : EPOCH_PAST_SKEW;
     }
 
@@ -384,8 +408,10 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     epoch.epoch_id = next_id;
     epoch.timestamp = hn4_hal_get_time_ns();
     epoch.flags = HN4_VOL_UNMOUNTING;
-    epoch.d0_root_checksum = 0; 
-    epoch.epoch_crc = hn4_epoch_calc_crc(&epoch);
+    
+    /* Bind Epoch to Superblock Generation to detect timeline forks */
+    uint64_t gen_state = sb->info.copy_generation;
+    epoch.d0_root_checksum = hn4_cpu_to_le32(hn4_crc32(0, &gen_state, sizeof(uint64_t)));
 
     _secure_zero(io_buf, bs);
     hn4_epoch_to_disk(&epoch, io_buf);

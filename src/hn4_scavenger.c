@@ -133,6 +133,18 @@ typedef struct {
     bool     secure_shred; /* HN4_FLAG_SHRED support */
 } _reaper_batch_t;
 
+static int _addr_cmp(const void* a, const void* b) {
+    hn4_addr_t va = *(const hn4_addr_t*)a;
+    hn4_addr_t vb = *(const hn4_addr_t*)b;
+#ifdef HN4_USE_128BIT
+    return hn4_u128_cmp(va, vb);
+#else
+    if (va < vb) return -1;
+    if (va > vb) return 1;
+    return 0;
+#endif
+}
+
 /*
  * _reaper_flush
  * Executes the physical destruction of data followed by logical release.
@@ -160,30 +172,52 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
         zero_buf = hn4_hal_mem_alloc(batch->block_size);
         if (zero_buf) {
             _secure_zero(zero_buf, batch->block_size);
-        } else {
-            HN4_LOG_WARN("Reaper: OOM during Secure Shred. Falling back to DISCARD.");
         }
     }
 
-    /* --- PHASE 1: PHYSICAL SANITIZATION (The Hardware Commit) --- */
-    for (uint32_t i = 0; i < batch->count; i++) {
-        hn4_addr_t phys = batch->lbas[i];
+    qsort(batch->lbas, batch->count, sizeof(hn4_addr_t), _addr_cmp);
+
+    /* --- PHASE 1: PHYSICAL SANITIZATION --- */
+    uint32_t i = 0;
+    while (i < batch->count) {
+        hn4_addr_t start = batch->lbas[i];
+        uint32_t merged = 1;
         
-        if (batch->secure_shred && zero_buf) {
-            /* Overwrite with Zeros */
-            hn4_hal_sync_io(dev, HN4_IO_WRITE, phys, zero_buf, sectors_per_blk);
-        } else {
-            /* Standard Trim/Unmap */
-            hn4_hal_sync_io(dev, HN4_IO_DISCARD, phys, NULL, sectors_per_blk);
+        /* Look ahead for contiguous blocks */
+        while ((i + merged) < batch->count) {
+            hn4_addr_t next_expected = hn4_addr_add(start, merged * sectors_per_blk);
+            hn4_addr_t next_actual = batch->lbas[i + merged];
+            
+            /* Check equality */
+            #ifdef HN4_USE_128BIT
+            if (hn4_u128_cmp(next_expected, next_actual) != 0) break;
+            #else
+            if (next_expected != next_actual) break;
+            #endif
+            
+            merged++;
         }
+
+        /* Issue Single IO for the Range */
+        if (batch->secure_shred && zero_buf) {
+            for (uint32_t k = 0; k < merged; k++) {
+                hn4_addr_t target = hn4_addr_add(start, k * sectors_per_blk);
+                hn4_hal_sync_io(dev, HN4_IO_WRITE, target, zero_buf, sectors_per_blk);
+            }
+        } else {
+            /* Standard Trim - Single Command */
+            hn4_hal_sync_io(dev, HN4_IO_DISCARD, start, NULL, sectors_per_blk * merged);
+        }
+        
+        i += merged;
     }
 
     /* --- PHASE 2: THE WALL (Barrier) --- */
     hn4_hal_barrier(dev);
 
-    /* --- PHASE 3: LOGICAL RELEASE (The Bitmap Update) --- */
-    for (uint32_t i = 0; i < batch->count; i++) {
-        hn4_free_block(vol, batch->lbas[i]);
+    /* --- PHASE 3: LOGICAL RELEASE --- */
+    for (uint32_t k = 0; k < batch->count; k++) {
+        hn4_free_block(vol, batch->lbas[k]);
     }
 
     if (zero_buf) hn4_hal_mem_free(zero_buf);
@@ -204,15 +238,13 @@ static void _reaper_add(hn4_volume_t* vol, _reaper_batch_t* batch, hn4_addr_t ph
     }
 
     /* Standard Batching */
-    if (batch->count < HN4_REAPER_BATCH_SIZE) {
-        batch->lbas[batch->count++] = phys_sector_lba;
-    }
-    
-    /* Flush if full */
-    if (batch->count >= HN4_REAPER_BATCH_SIZE) {
+     if (batch->count >= HN4_REAPER_BATCH_SIZE) {
         _reaper_flush(vol->target_device, batch, vol);
         hn4_hal_poll(vol->target_device);
     }
+
+    /* Now guaranteed to have space */
+    batch->lbas[batch->count++] = phys_sector_lba;
 }
 
 
@@ -310,26 +342,29 @@ static hn4_result_t _reap_tombstone(
     /* Zero the anchor in the sector buffer */
     memset((uint8_t*)sector_buf + offset_in_sector, 0, sizeof(hn4_anchor_t));
 
-    /* Commit to disk */
     hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, sector_buf, 1);
-    
-    /* Zero the anchor in RAM immediately to reflect disk state */
-    if (res == HN4_OK) {
-        _secure_zero(anchor, sizeof(hn4_anchor_t));
+
+   if (res == HN4_OK) {
+
+    hn4_result_t b_res = hn4_hal_barrier(vol->target_device);
+    if (b_res != HN4_OK) {
+        res = b_res;
+        } else {
+            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+            _secure_zero(anchor, sizeof(hn4_anchor_t));
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        }
     }
 
     hn4_hal_mem_free(sector_buf);
 
-    /* If writing the zero-anchor failed, we abort. The file remains "Deleted-but-visible". */
     if (res != HN4_OK) {
         hn4_hal_mem_free(vbuf);
         return res;
     }
 
-    /* 
-     * 6. EXECUTE SCAVENGING (The Cleanup)
-     * Now that the Anchor is dead, it is safe to release the blocks back to the pool.
-     */
+    /* 6. EXECUTE SCAVENGING (The Cleanup) */
+    /* Safe to proceed: Anchor is dead on NAND. */
     uint64_t saved_dclass = hn4_le64_to_cpu(saved_anchor.data_class);
 
     /* Nano Object Handling */
@@ -538,12 +573,21 @@ static void _evacuate_zns_victim(
 
             /* Perform write using the SHADOW anchor so live physics remain valid */
             if (hn4_write_block_atomic(vol, &shadow_anchor, logic_seq, hdr->payload, move_len) == HN4_OK) {
-                
+    
+            hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, &shadow_anchor);
+    
+            if (anchor_res == HN4_OK) {
+                hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
                 memcpy(owner_anchor, &shadow_anchor, sizeof(hn4_anchor_t));
-                
-                hn4_write_anchor_atomic(vol, owner_anchor);
+                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        
                 evacuated_count++;
             } else {
+                HN4_LOG_CRIT("ZNS Evacuator: Anchor persistence failed. Abort.");
+                hn4_hal_mem_free(io_buf);
+                return;
+            }
+        }else {
                 HN4_LOG_ERR("ZNS Evacuator: Move failed for block %llu.", (unsigned long long)logic_seq);
                 hn4_hal_mem_free(io_buf);
                 return; /* Hard abort on write failure */
@@ -763,33 +807,38 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
     }
 
     /* ATOMIC COMMIT */
-    if (migration_success) {
-        /* Re-check Generation one last time before CAS */
+     if (migration_success) {
+        /* Re-check Generation one last time */
         if (hn4_le32_to_cpu(anchor->write_gen) != start_gen_native) goto cleanup_deltas;
 
-        uint32_t expected_raw = anchor->write_gen; /* LE bits */
+        /* FIX: Persist to Disk FIRST using the new_anchor struct */
+        if (hn4_write_anchor_atomic(vol, &new_anchor) != HN4_OK) {
+            HN4_LOG_WARN("Osteoplasty: Disk Commit Failed. Aborting RAM update.");
+            goto cleanup_deltas;
+        }
+
+        /* Disk is safe. Now update RAM via CAS to make it visible to readers */
+        uint32_t expected_raw = anchor->write_gen;
         
-        /* 
-         * CAS: If we win this, the file logically "snaps" to the new trajectory.
-         * The old blocks are now garbage (to be reaped by Scavenger later).
-         */
         if (atomic_compare_exchange_strong((_Atomic uint32_t*)&anchor->write_gen, 
                                            &expected_raw, 
                                            new_anchor.write_gen)) 
         {
-            /* Success: Update RAM Source of Truth */
+            /* Sync remaining fields to live pointer */
             memcpy(anchor->orbit_vector, new_anchor.orbit_vector, 6);
             anchor->gravity_center = new_anchor.gravity_center;
             anchor->mass = new_anchor.mass; 
             anchor->mod_clock = new_anchor.mod_clock;
+            
+            HN4_LOG_CRIT("Osteoplasty Complete. Full file migrated.");
             
             /* Persist to Disk */
             hn4_write_anchor_atomic(vol, anchor);
             
             HN4_LOG_CRIT("Osteoplasty Complete. Full file (%llu blocks) migrated.", (unsigned long long)total_blocks);
             
-            if (vol->stats.trajectory_collapse_counter > 0)
-                atomic_fetch_sub(&vol->stats.trajectory_collapse_counter, 1);
+            if (vol->health.trajectory_collapse_counter > 0)
+                atomic_fetch_sub(&vol->health.trajectory_collapse_counter, 1);
         } else {
             HN4_LOG_WARN("Osteoplasty CAS Failed: Writer Intervened at final commit.");
         }
@@ -979,7 +1028,7 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
     hn4_time_t now = hn4_hal_get_time_ns();
 
     /* 1. Vital Signs */
-    uint32_t collapse_cnt = atomic_load(&vol->stats.trajectory_collapse_counter);
+    uint32_t collapse_cnt = atomic_load(&vol->health.trajectory_collapse_counter);
     bool medic_mode = (collapse_cnt > HN4_OSTEOPOROSIS_THRESHOLD);
 
     /* 2. ZNS Mode Check */
@@ -1039,8 +1088,8 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
          * Scan 64 anchors. If we find problems, push to queue or reap immediately.
          */
 
-        static _Atomic size_t cursor = 0;
-        size_t start_idx = atomic_fetch_add(&cursor, 64);
+        size_t start_idx = vol->alloc.scavenger_cursor;
+        vol->alloc.scavenger_cursor = (start_idx + 64) % count;
 
         for (size_t i = 0; i < 64; i++) {
             size_t idx = (start_idx + i) % count;

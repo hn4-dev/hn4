@@ -181,9 +181,9 @@ hn4_TEST(SmallFiles, SlackSpace_Verification) {
     
     /* Verify logical vs physical capacity usage */
     /* Alloc 1 block */
-    atomic_fetch_add(&vol->used_blocks, 1);
+    atomic_fetch_add(&vol->alloc.used_blocks, 1);
     
-    uint64_t used_bytes = atomic_load(&vol->used_blocks) * vol->vol_block_size;
+    uint64_t used_bytes = atomic_load(&vol->alloc.used_blocks) * vol->vol_block_size;
     ASSERT_EQ(4096ULL, used_bytes);
     
     cleanup_small_fixture(vol);
@@ -213,7 +213,7 @@ hn4_TEST(SmallFiles, Promotion_Boundary) {
     ASSERT_TRUE(allocated);
     
     /* Verify exactly 1 block used */
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_small_fixture(vol);
 }
@@ -265,7 +265,7 @@ hn4_TEST(SmallFiles, SparseTail_Allocation) {
     ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, logical_n, &lba, &k));
     
     /* Only 1 block allocated total (Sparse) */
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_small_fixture(vol);
 }
@@ -299,7 +299,7 @@ hn4_TEST(SmallFiles, MT_TinyWrites_NoAlloc) {
     pthread_join(t2, NULL);
     
     /* Confirm Allocator was never touched */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_small_fixture(vol);
 }
@@ -360,7 +360,7 @@ hn4_TEST(SmallFiles, Boundary_48_vs_49) {
     ASSERT_FALSE(needs_block_a);
     
     /* Verify allocator is NOT invoked for 48B */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
 
     /* Case B: 49 Bytes */
     uint64_t size_b = 49;
@@ -370,7 +370,7 @@ hn4_TEST(SmallFiles, Boundary_48_vs_49) {
     /* Allocate for 49B */
     hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &lba, &k);
     ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
 
     cleanup_small_fixture(vol);
 }
@@ -423,11 +423,11 @@ hn4_TEST(SmallFiles, LargeBlock_SmallWrite_Waste) {
     ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &lba, &k));
     
     /* Verify Allocator State */
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
     
     /* Verify Physical Consumption */
     /* 1 Block * 65536 Bytes */
-    uint64_t consumed_bytes = atomic_load(&vol->used_blocks) * vol->vol_block_size;
+    uint64_t consumed_bytes = atomic_load(&vol->alloc.used_blocks) * vol->vol_block_size;
     ASSERT_EQ(65536ULL, consumed_bytes);
 
     cleanup_small_fixture(vol);
@@ -458,7 +458,7 @@ hn4_TEST(SmallFiles, Offset_Triggers_Alloc) {
     hn4_addr_t lba; uint8_t k;
     
     ASSERT_EQ(HN4_OK, hn4_alloc_block(vol, &anchor, 0, &lba, &k));
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
 
     cleanup_small_fixture(vol);
 }
@@ -475,13 +475,13 @@ hn4_TEST(SmallFiles, Immediate_Ignores_Horizon) {
     hn4_volume_t* vol = create_small_fixture();
     
     /* Setup Horizon Head */
-    atomic_store(&vol->horizon_write_head, 1000);
+    atomic_store(&vol->alloc.horizon_write_head, 1000);
     
     /* Create 30 byte file (Immediate) */
     /* Logic: Do NOT call alloc_block */
     
     /* Verify Horizon Head did NOT move */
-    uint64_t head = atomic_load(&vol->horizon_write_head);
+    uint64_t head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_EQ(1000ULL, head);
     
     /* Create 60 byte file (Alloc D1) */
@@ -493,7 +493,7 @@ hn4_TEST(SmallFiles, Immediate_Ignores_Horizon) {
      * Even standard allocation shouldn't touch Horizon unless Ballistics fail.
      * With an empty map, ballistics succeed. Horizon Head still static.
      */
-    head = atomic_load(&vol->horizon_write_head);
+    head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_EQ(1000ULL, head);
 
     cleanup_small_fixture(vol);

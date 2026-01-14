@@ -503,12 +503,16 @@ static hn4_result_t _execute_cardinal_vote(
                 if (_read_sb_at_lba(dev, lba, sector_sz, bs, probe_buf, &check) != HN4_OK) {
                     needs_heal = true; 
                 } else {
-                    int64_t ts_diff = (int64_t)check.info.last_mount_time - (int64_t)best_sb.info.last_mount_time;
-                    if (ts_diff < 0) ts_diff = -ts_diff;
+                    uint64_t t1 = (uint64_t)check.info.last_mount_time;
+                    uint64_t t2 = (uint64_t)best_sb.info.last_mount_time;
+                    uint64_t diff_abs;
+
+                    if (t1 > t2) diff_abs = t1 - t2;
+                    else diff_abs = t2 - t1;
 
                     if (check.info.copy_generation != best_sb.info.copy_generation) {
                         needs_heal = true;
-                    } else if (ts_diff > (HN4_REPLAY_WINDOW_NS * 10)) {
+                    } else if (diff_abs > (HN4_REPLAY_WINDOW_NS * 10)) {
                         needs_heal = true;
                     }
                 }
@@ -566,11 +570,11 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     uint32_t bs = vol->vol_block_size;
     uint64_t cap = vol->vol_capacity_bytes;
 
-    if (vol->taint_counter >= HN4_TAINT_THRESHOLD_RO) return HN4_ERR_MEDIA_TOXIC;
+    if (vol->health.taint_counter >= HN4_TAINT_THRESHOLD_RO) return HN4_ERR_MEDIA_TOXIC;
 
     hn4_superblock_t original_sb = vol->sb;
     hn4_superblock_t dirty_sb = vol->sb;
-    uint32_t old_taint = vol->taint_counter; 
+    uint32_t old_taint = vol->health.taint_counter; 
 
     if ((dirty_sb.info.state_flags & HN4_VOL_CLEAN) && (dirty_sb.info.state_flags & HN4_VOL_DIRTY)) {
         return HN4_ERR_INTERNAL_FAULT;
@@ -583,7 +587,7 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     dirty_sb.info.copy_generation++;
     dirty_sb.info.last_mount_time = hn4_hal_get_time_ns();
 
-    if (vol->taint_counter > 0) dirty_sb.info.dirty_bits |= HN4_DIRTY_BIT_TAINT;
+    if (vol->health.taint_counter > 0) dirty_sb.info.dirty_bits |= HN4_DIRTY_BIT_TAINT;
 
     uint32_t io_sz = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
     void* io_buf = hn4_hal_mem_alloc(io_sz);
@@ -719,7 +723,7 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
 
         /* Restore In-Memory State */
         vol->sb = original_sb;
-        vol->taint_counter = old_taint;
+        vol->health.taint_counter = old_taint;
 
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_HW_IO;
@@ -729,7 +733,7 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
 
     /* Update RAM struct on success */
     if (vol->sb.info.state_flags & HN4_VOL_CLEAN) {
-        if (vol->taint_counter > 0) vol->taint_counter /= 2;
+        if (vol->health.taint_counter > 0) vol->health.taint_counter /= 2;
     }
 
     vol->sb = dirty_sb;
@@ -764,14 +768,25 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
 
     uint64_t cap_blocks = cap_64 / bs;
     
-    /* Check for overflow in size_t calc (e.g. 32-bit systems) */
-    if (cap_blocks > (SIZE_MAX / sizeof(hn4_armored_word_t)) * 64) {
+    /* FIX: Strict Overflow Checking for Allocation Size */
+    size_t armor_words = (size_t)((cap_blocks + 63) / 64);
+    size_t struct_size = sizeof(hn4_armored_word_t); // 16 bytes
+    
+    /* check: armor_words * struct_size > SIZE_MAX */
+    if (armor_words > (SIZE_MAX / struct_size)) {
+        HN4_LOG_CRIT("Mount Fail: Bitmap allocation size overflows system addressable memory.");
+        return HN4_ERR_NOMEM;
+    }
+    
+    size_t alloc_bytes = armor_words * struct_size;
+
+    /* If the bitmap takes > 25% of theoretical address space (e.g. 1GB on 32-bit), reject */
+    if (alloc_bytes > (SIZE_MAX / 4)) {
+        HN4_LOG_CRIT("Mount Fail: Bitmap requires excessive kernel RAM (%zu bytes).", alloc_bytes);
         return HN4_ERR_NOMEM;
     }
 
-    size_t armor_words = (size_t)((cap_blocks + 63) / 64);
-    
-    vol->void_bitmap = hn4_hal_mem_alloc(armor_words * sizeof(hn4_armored_word_t));
+    vol->void_bitmap = hn4_hal_mem_alloc(alloc_bytes);
     if (!vol->void_bitmap) return HN4_ERR_NOMEM;
     vol->bitmap_size = armor_words * sizeof(hn4_armored_word_t);
 
@@ -1341,7 +1356,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     HN4_LOG_WARN("Healing Root Anchor (Genesis Repair)...");
 
-    memset(io_buf, 0, alloc_sz);
+    memset(io_buf, 0, sizeof(hn4_anchor_t));
     root = (hn4_anchor_t*)io_buf;
 
     root->seed_id.lo = 0xFFFFFFFFFFFFFFFFULL;
@@ -1585,7 +1600,7 @@ static hn4_result_t _reconstruct_cortex_state(
     if (ghost_repairs > 0) {
         HN4_LOG_WARN("Zero-Scan Reconstruction: Healed %llu Ghost Allocations.", ghost_repairs);
         /* Mark volume as having been repaired (Taint logic) */
-        vol->taint_counter++;
+        vol->health.taint_counter++;
     } else {
         HN4_LOG_VAL("Zero-Scan Complete. State Consistent", anchor_count);
     }
@@ -1631,18 +1646,28 @@ hn4_result_t hn4_mount(
     vol->target_device = dev;
 
     /* Initialize System L2 Lock */
-    hn4_hal_spinlock_init(&vol->l2_lock);
+    hn4_hal_spinlock_init(&vol->locking.l2_lock);
 
      /* Initialize Medic Priority Queue Lock */
     hn4_hal_spinlock_init(&vol->medic_queue.lock);
 
     if (params && (params->mount_flags & HN4_MNT_READ_ONLY)) force_ro = true;
+    
+
+  const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    if (params && (params->mount_flags & HN4_MNT_WORMHOLE)) {
+        if (!(caps->hw_flags & HN4_HW_STRICT_FLUSH)) {
+            HN4_LOG_CRIT("Mount Denied: Hardware lacks Strict Flush for Wormhole.");
+            res = HN4_ERR_HW_IO;
+            goto cleanup;
+        }
+    }
 
     /* --- PHASE 1: CARDINAL VOTE --- */
     res = _execute_cardinal_vote(dev, !force_ro, &vol->sb);
     if (res != HN4_OK) goto cleanup;
 
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    
     res = _validate_sb_layout(&vol->sb, caps);
     if (res != HN4_OK) {
         HN4_LOG_CRIT("Mount Rejected: Invalid Geometry/Layout in Superblock");
@@ -1690,7 +1715,7 @@ hn4_result_t hn4_mount(
         case HN4_ERR_TIME_DILATION: 
             HN4_LOG_WARN("Time Dilation (Mirror Lag). Forcing RO.");
             force_ro = true;
-            vol->taint_counter += 10;
+            vol->health.taint_counter += 10;
             res = HN4_OK; 
             break;
         case HN4_ERR_EPOCH_LOST:
@@ -1757,7 +1782,7 @@ hn4_result_t hn4_mount(
                 force_ro = true;
                 
                 /* Maximize taint to prevent any accidental write attempts */
-                vol->taint_counter = HN4_TAINT_THRESHOLD_RO + 1;
+                vol->health.taint_counter = HN4_TAINT_THRESHOLD_RO + 1;
                 
                 /* We permit the mount for forensics, but mark it compromised */
                 vol->sb.info.state_flags |= HN4_VOL_PANIC;
@@ -1767,6 +1792,16 @@ hn4_result_t hn4_mount(
 
     /* --- PHASE 2: STATE ANALYSIS --- */
     uint32_t st = vol->sb.info.state_flags;
+
+     if (st & HN4_VOL_NEEDS_UPGRADE) {
+        HN4_LOG_WARN("Volume marked NEEDS_UPGRADE. Forcing Read-Only to prevent structure corruption.");
+        force_ro = true;
+    }
+
+    if (st & HN4_VOL_DEGRADED) {
+        HN4_LOG_WARN("Mounting DEGRADED volume. Redundancy is compromised.");
+        /* We continue, but operations are at risk */
+    }
     
     switch (st & (HN4_VOL_PANIC | HN4_VOL_TOXIC | HN4_VOL_LOCKED | HN4_VOL_PENDING_WIPE)) {
         case 0: break; /* OK */
@@ -1782,6 +1817,13 @@ hn4_result_t hn4_mount(
         default: 
             HN4_LOG_WARN("Volume Flagged Panic/Toxic. Forcing RO.");
             force_ro = true;
+    }
+
+    /* Handle Interrupted Unmount (Treat as Dirty) */
+    if (st & HN4_VOL_UNMOUNTING) {
+        HN4_LOG_WARN("Previous unmount interrupted (UNMOUNTING flag set). Treating as DIRTY.");
+        st &= ~HN4_VOL_CLEAN;
+        st |= HN4_VOL_DIRTY;
     }
 
    /* ----- HARD FAIL CHECKS (not part of state_flags) ----- */
@@ -1815,15 +1857,15 @@ hn4_result_t hn4_mount(
         case (HN4_VOL_CLEAN | HN4_VOL_DIRTY):
             HN4_LOG_ERR("Invalid Flags (Clean+Dirty). Forcing RO+Taint.");
             force_ro = true;
-            vol->taint_counter++;
+            vol->health.taint_counter++;
             break;
     }
 
     /* ----- TAINT → RO ESCALATION ----- */
 
-    if (vol->taint_counter >= HN4_TAINT_THRESHOLD_RO) {
+    if (vol->health.taint_counter >= HN4_TAINT_THRESHOLD_RO) {
         HN4_LOG_WARN("Taint Threshold Exceeded (%u). Forcing RO.",
-                     vol->taint_counter);
+                     vol->health.taint_counter);
         force_ro = true;
     }
 
@@ -1840,7 +1882,7 @@ hn4_result_t hn4_mount(
 
     if (!force_ro) {
         if (st & HN4_VOL_CLEAN) {
-            vol->taint_counter /= 2;
+            vol->health.taint_counter /= 2;
         }
 
         res = _mark_volume_dirty_and_sync(dev, vol);
@@ -1918,6 +1960,10 @@ hn4_result_t hn4_mount(
     }
 
     vol->read_only = force_ro;
+    
+    /* Initialize Ref Count to 1 (The Mount itself) */
+    atomic_store(&vol->health.ref_count, 1);
+    
     *out_vol = vol;
     return HN4_OK;
 

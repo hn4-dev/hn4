@@ -247,7 +247,7 @@ hn4_TEST(Horizon, Wraparound_Dirty_Latch) {
      */
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start     = 20004;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* Clear any pre-existing dirty flags */
     atomic_store(&vol->sb.info.state_flags, HN4_VOL_CLEAN);
@@ -295,7 +295,7 @@ hn4_TEST(Horizon, Linear_Probe_MultiSkip) {
     
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start     = 21000;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 
      * Layout:
@@ -328,7 +328,7 @@ hn4_TEST(Horizon, Linear_Probe_MultiSkip) {
        The Loop logic: `atomic_fetch_add`. It increments per probe.
        So: 0(OK), 1(Fail), 2(Fail), 3(Fail), 4(OK). Next is 5.
     */
-    uint64_t head = atomic_load(&vol->horizon_write_head);
+    uint64_t head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_EQ(5ULL, head);
 
     cleanup_horizon_fixture(vol);
@@ -350,7 +350,7 @@ hn4_TEST(Horizon, Boundary_LastBlock) {
     vol->sb.info.journal_start     = 20100;
     
     /* Manually set head to 99 (Last index) */
-    atomic_store(&vol->horizon_write_head, 99);
+    atomic_store(&vol->alloc.horizon_write_head, 99);
     
     uint64_t lba;
     ASSERT_EQ(HN4_OK, hn4_alloc_horizon(vol, &lba));
@@ -410,7 +410,7 @@ hn4_TEST(Horizon, Head_Integer_Overflow) {
     
     /* Set Head to Max - 1 */
     uint64_t near_max = 0xFFFFFFFFFFFFFFFEULL;
-    atomic_store(&vol->horizon_write_head, near_max);
+    atomic_store(&vol->alloc.horizon_write_head, near_max);
     
     /* Clear space at predicted target */
     /* (Max - 1) % 100.
@@ -463,7 +463,7 @@ hn4_TEST(Horizon, Burst_Contiguity) {
     hn4_volume_t* vol = create_horizon_fixture();
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start     = 21000;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     uint64_t lba_prev = 0;
     uint64_t lba_curr;
@@ -539,7 +539,7 @@ hn4_TEST(Horizon, IdempotentReplaySafety) {
      */
     
     /* Rewind head to simulate replay attempt */
-    atomic_fetch_sub(&vol->horizon_write_head, 1);
+    atomic_fetch_sub(&vol->alloc.horizon_write_head, 1);
     
     /* Retry Alloc */
     ASSERT_EQ(HN4_OK, hn4_alloc_horizon(vol, &lba2));
@@ -642,7 +642,7 @@ hn4_TEST(Horizon, BitmapCursorRace) {
      * The test implies: Head advanced past X, but X is Free. 
      * Allocator should NOT go back to X unless it wraps.
      */
-    atomic_store(&vol->horizon_write_head, 5);
+    atomic_store(&vol->alloc.horizon_write_head, 5);
     
     /* Block 0 is FREE */
     bool st;
@@ -765,7 +765,7 @@ hn4_TEST(Horizon, IndexIdentityInvariant) {
     
     /* Set head to arbitrary value */
     uint64_t initial_head = 12345;
-    atomic_store(&vol->horizon_write_head, initial_head);
+    atomic_store(&vol->alloc.horizon_write_head, initial_head);
     
     /* Clear target to ensure success */
     uint64_t target_offset = initial_head % cap;
@@ -803,7 +803,7 @@ hn4_TEST(Horizon, DoubleFreeIdempotence) {
     
     /* Used count should be 0 (not -1 underflow) */
     /* Implementation of _bitmap_op/free checks state before decrementing */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_horizon_fixture(vol);
 }
@@ -826,7 +826,7 @@ hn4_TEST(Horizon, Ordering_BitmapBeforeCommit) {
     _bitmap_op(vol, start, BIT_SET, &st);
     
     /* 2. Reset Head to 0 (Crash simulation) */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 3. Alloc. Should SKIP Bit 0 and take Bit 1 */
     uint64_t lba;
@@ -878,7 +878,7 @@ hn4_TEST(Horizon, ProbeFromHeadNotLowest) {
     /* 4 is Free */
     
     /* Head is at 3 */
-    atomic_store(&vol->horizon_write_head, 3);
+    atomic_store(&vol->alloc.horizon_write_head, 3);
     
     uint64_t lba;
     hn4_alloc_horizon(vol, &lba);
@@ -900,7 +900,7 @@ hn4_TEST(Horizon, HugeHeadResilience) {
     
     /* Set Head to huge value */
     uint64_t huge = 0xFFFFFFFFFFFFFF00ULL; 
-    atomic_store(&vol->horizon_write_head, huge);
+    atomic_store(&vol->alloc.horizon_write_head, huge);
     
     /* Ensure target is free */
     uint64_t offset = huge % cap;
@@ -924,7 +924,7 @@ hn4_TEST(Horizon, BitmapLies_Safety) {
     uint64_t start = 20000;
     
     /* Head says 0 is next */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* Bitmap says 0 is OCCUPIED (Lie/Residue) */
     bool st;
@@ -953,7 +953,7 @@ hn4_TEST(Horizon, UsedBlockIntegrity) {
     }
     
     /* Counter must be exactly 0 */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_horizon_fixture(vol);
 }
@@ -970,7 +970,7 @@ hn4_TEST(Horizon, ToxicSlotDefense) {
     bool st;
     _bitmap_op(vol, start, BIT_SET, &st);
     
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     uint64_t lba;
     hn4_alloc_horizon(vol, &lba);
@@ -992,7 +992,7 @@ hn4_TEST(Horizon, HeadBitFlipResilience) {
     
     /* Head should be 0. Flip high bit. */
     uint64_t corrupted = 1ULL << 63;
-    atomic_store(&vol->horizon_write_head, corrupted);
+    atomic_store(&vol->alloc.horizon_write_head, corrupted);
     
     /* Ensure target slot (corrupted % cap) is free */
     uint64_t offset = corrupted % cap;
@@ -1074,9 +1074,9 @@ hn4_TEST(Horizon, DeterministicReplay) {
     }
     
     /* Reset State */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     memset(vol->void_bitmap, 0, vol->bitmap_size);
-    atomic_store(&vol->used_blocks, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
     
     /* Run B (Same ops) */
     for(int i=0; i<10; i++) {
@@ -1132,7 +1132,7 @@ hn4_TEST(Horizon, JournalShrinkDefense) {
     hn4_volume_t* vol = create_horizon_fixture();
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start     = 20020; /* Capacity 20 */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* Alloc 5 blocks (0..4) */
     uint64_t lba;
@@ -1166,7 +1166,7 @@ hn4_TEST(Horizon, CrashBeforeBitmapSet) {
      * Block 0 is physically FREE (Bitmap=0).
      * Head = 1.
      */
-    atomic_store(&vol->horizon_write_head, 1);
+    atomic_store(&vol->alloc.horizon_write_head, 1);
     
     uint64_t lba;
     ASSERT_EQ(HN4_OK, hn4_alloc_horizon(vol, &lba));
@@ -1198,12 +1198,12 @@ hn4_TEST(Horizon, UsedBlockTruth) {
     hn4_free_block(vol, start+1);
     
     /* Used should be 2 */
-    ASSERT_EQ(2ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(2ULL, atomic_load(&vol->alloc.used_blocks));
     
     /* Alloc 1 (Takes next, not hole) */
     hn4_alloc_horizon(vol, &lba);
     
-    ASSERT_EQ(3ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(3ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_horizon_fixture(vol);
 }
@@ -1255,7 +1255,7 @@ hn4_TEST(Horizon, LargeRingMath) {
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start = 20100;
     
-    atomic_store(&vol->horizon_write_head, head);
+    atomic_store(&vol->alloc.horizon_write_head, head);
     
     uint64_t lba;
     hn4_alloc_horizon(vol, &lba);
@@ -1283,7 +1283,7 @@ hn4_TEST(Horizon, SwissCheeseProbe) {
         _bitmap_op(vol, start+i, BIT_SET, &st); /* Occupy evens */
     }
     
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 
      * Alloc 1 -> Head 0 (Occupied) -> 1 (Free). Returns 1.
@@ -1362,7 +1362,7 @@ hn4_TEST(Horizon, RuntimeDisable) {
     ASSERT_EQ(HN4_ERR_ENOSPC, hn4_alloc_horizon(vol, &lba));
     
     /* Head index remains valid (incremented) */
-    ASSERT_TRUE(atomic_load(&vol->horizon_write_head) > 0);
+    ASSERT_TRUE(atomic_load(&vol->alloc.horizon_write_head) > 0);
     
     cleanup_horizon_fixture(vol);
 }
@@ -1386,9 +1386,9 @@ hn4_TEST(Horizon, TinyRingStress) {
     }
     
     /* Verify Counters */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     /* Head should be > 1000 */
-    ASSERT_TRUE(atomic_load(&vol->horizon_write_head) >= 1000);
+    ASSERT_TRUE(atomic_load(&vol->alloc.horizon_write_head) >= 1000);
     
     cleanup_horizon_fixture(vol);
 }
@@ -1415,7 +1415,7 @@ hn4_TEST(Integration, HorizonFreeLogic) {
     ASSERT_FALSE(st);
     
     /* Verify it didn't break counters */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     
     cleanup_horizon_fixture(vol);
 }

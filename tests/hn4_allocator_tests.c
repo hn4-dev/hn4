@@ -50,16 +50,16 @@ static hn4_volume_t* create_alloc_fixture(void) {
     memset(vol->quality_mask, 0xAA, vol->qmask_size);
 
     /* Allocate L2 for logic verification */
-    vol->l2_summary_bitmap = hn4_hal_mem_alloc(HN4_TOTAL_BLOCKS / 512 / 8); 
-    memset(vol->l2_summary_bitmap, 0, HN4_TOTAL_BLOCKS / 512 / 8);
+    vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(HN4_TOTAL_BLOCKS / 512 / 8); 
+    memset(vol->locking.l2_summary_bitmap, 0, HN4_TOTAL_BLOCKS / 512 / 8);
 
     vol->sb.info.lba_flux_start    = 100;
     vol->sb.info.lba_horizon_start = 20000;
     vol->sb.info.journal_start     = 21000;
     vol->sb.info.lba_stream_start  = 20000; 
 
-    atomic_store(&vol->used_blocks, 0);
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     return vol;
 }
@@ -69,7 +69,7 @@ static void cleanup_alloc_fixture(hn4_volume_t* vol) {
         if (vol->target_device) hn4_hal_mem_free(vol->target_device);
         if (vol->void_bitmap) hn4_hal_mem_free(vol->void_bitmap);
         if (vol->quality_mask) hn4_hal_mem_free(vol->quality_mask);
-        if (vol->l2_summary_bitmap) hn4_hal_mem_free(vol->l2_summary_bitmap);
+        if (vol->locking.l2_summary_bitmap) hn4_hal_mem_free(vol->locking.l2_summary_bitmap);
         hn4_hal_mem_free(vol);
     }
 }
@@ -89,7 +89,7 @@ hn4_TEST(Regression, SaturationLatchPersistence) {
     uint64_t threshold = (total * 90) / 100;
 
     /* 1. Trip the Latch (Force > 90%) */
-    atomic_store(&vol->used_blocks, threshold + 10);
+    atomic_store(&vol->alloc.used_blocks, threshold + 10);
     
     /* Trigger check via Genesis call */
     uint64_t G, V;
@@ -107,7 +107,7 @@ hn4_TEST(Regression, SaturationLatchPersistence) {
 
     /* 2. Drop Usage slightly (Simulate Free, but still > 85%) */
     /* Hysteresis requires dropping below 85% to clear. 90% - small amount is still > 85% */
-    atomic_store(&vol->used_blocks, threshold - 50);
+    atomic_store(&vol->alloc.used_blocks, threshold - 50);
 
     /* 
      * 3. Alloc Again - Should STILL Redirect (Latch holds) 
@@ -133,7 +133,7 @@ hn4_TEST(Hierarchy, L2_Clears_On_Empty) {
     _bitmap_op(vol, 500, BIT_SET, &st);
     
     /* Verify L2 Bit 0 is SET */
-    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word & 1) != 0);
     
     /* 2. Free Block 500 (The only used block in this region) */
@@ -147,7 +147,7 @@ hn4_TEST(Hierarchy, L2_Clears_On_Empty) {
      */
     ASSERT_FALSE((vol->void_bitmap[500/64].data & (1ULL << (500%64))) != 0); /* L3 Cleared */
     
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     
     /* FIX: Assert FALSE (0), because the code cleans up the bit */
     ASSERT_FALSE((l2_word & 1) != 0); 
@@ -250,7 +250,7 @@ hn4_TEST(Logic, HorizonWrapPressure) {
     /* Tiny Ring: 5 Blocks */
     vol->sb.info.lba_horizon_start = 1000;
     vol->sb.info.journal_start     = 1005;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
 
     uint64_t lba;
 
@@ -302,7 +302,7 @@ hn4_TEST(Logic, HorizonWrapPressure) {
     ASSERT_EQ(1000ULL, lba);
 
     /* 5. Verify Head Wrap/Advancement */
-    uint64_t head_val = atomic_load(&vol->horizon_write_head);
+    uint64_t head_val = atomic_load(&vol->alloc.horizon_write_head);
     /* It skipped many times, so head is large */
     ASSERT_TRUE(head_val > 5);
 
@@ -326,14 +326,14 @@ hn4_TEST(Logic, ForceClear_MetricConsistency) {
     bool state;
     _bitmap_op(vol, 100, BIT_SET, &state);
     
-    uint64_t used_peak = atomic_load(&vol->used_blocks);
+    uint64_t used_peak = atomic_load(&vol->alloc.used_blocks);
     ASSERT_EQ(1ULL, used_peak);
     
     /* 2. Force Clear (Rollback) */
     _bitmap_op(vol, 100, BIT_FORCE_CLEAR, &state);
     
     /* 3. Verify Metrics Restored */
-    uint64_t used_after = atomic_load(&vol->used_blocks);
+    uint64_t used_after = atomic_load(&vol->alloc.used_blocks);
     
     /* Usage must drop back to 0 */
     ASSERT_EQ(0ULL, used_after);
@@ -380,7 +380,7 @@ hn4_TEST(SafetyGuards, EccHealOnBitTest) {
     ASSERT_EQ(expected_ecc, healed_ecc);
     
     /* Telemetry check */
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -410,7 +410,7 @@ hn4_TEST(SaturationLogic, ImmediateHorizonFallback) {
     
     /* Force 99% Usage */
     uint64_t total = HN4_TOTAL_BLOCKS;
-    atomic_store(&vol->used_blocks, (total * 99) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 99) / 100);
     
     uint64_t G, V;
     hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
@@ -508,7 +508,7 @@ hn4_TEST(EccIntegrity, BitRotInjection) {
     /* Should Heal */
     ASSERT_EQ(HN4_INFO_HEALED, res);
     ASSERT_EQ(data, vol->void_bitmap[0].data); /* Persisted correction */
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
     
     /* Case 2: Double Bit Error (Bit 5 and Bit 12) */
     vol->void_bitmap[0].data ^= (1ULL << 5);
@@ -687,7 +687,7 @@ hn4_TEST(Hierarchy, L2_Summary_Coherency) {
     uint64_t l2_idx = blk / 512; /* Index 2 */
     
     /* 1. Verify initially 0 */
-    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_FALSE((l2_word >> l2_idx) & 1);
     
     /* 2. Alloc Block */
@@ -695,7 +695,7 @@ hn4_TEST(Hierarchy, L2_Summary_Coherency) {
     _bitmap_op(vol, blk, BIT_SET, &st);
     
     /* 3. Verify L2 bit Set */
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word >> l2_idx) & 1);
     
     /* 4. Alloc neighbor (1025) */
@@ -703,12 +703,12 @@ hn4_TEST(Hierarchy, L2_Summary_Coherency) {
     
     /* 5. Free 1024 (L2 should STAY set because 1025 is used) */
     _bitmap_op(vol, blk, BIT_CLEAR, &st);
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word >> l2_idx) & 1);
     
     /* 6. Free 1025 (L2 should CLEAR now) */
     _bitmap_op(vol, blk + 1, BIT_CLEAR, &st);
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_FALSE((l2_word >> l2_idx) & 1);
 
     cleanup_alloc_fixture(vol);
@@ -730,7 +730,7 @@ hn4_TEST(SaturationLogic, Probe_Exhaustion_Failover) {
      * to the Horizon (D1.5).
      */
     uint64_t total_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
-    atomic_store(&vol->used_blocks, total_blocks);
+    atomic_store(&vol->alloc.used_blocks, total_blocks);
     
     /* 
      * CRITICAL FIX: Do NOT fill the bitmap with 0xFF.
@@ -754,7 +754,7 @@ hn4_TEST(SaturationLogic, Probe_Exhaustion_Failover) {
     ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
     
     /* 4. Verify Taint wasn't incremented (This is a valid state, not an error) */
-    ASSERT_EQ(0ULL, atomic_load(&vol->taint_counter));
+    ASSERT_EQ(0ULL, atomic_load(&vol->health.taint_counter));
 
     cleanup_alloc_fixture(vol);
 }
@@ -842,7 +842,7 @@ hn4_TEST(FixVerification, Nvm_Enforces_ECC_Healing) {
      * If Fixed: Data is restored (ends in ...0), Heal Count 1.
      */
     ASSERT_EQ(data, vol->void_bitmap[0].data);
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -857,7 +857,7 @@ hn4_TEST(FixVerification, UsedBlocks_Underflow_Protection) {
     hn4_volume_t* vol = create_alloc_fixture();
     
     /* 1. Force Counter to 0 */
-    atomic_store(&vol->used_blocks, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
 
     /* 2. Manually set a bit to 1 directly in memory (bypass counters) */
     /* This simulates a desync where the map says used, but counter says 0 */
@@ -874,7 +874,7 @@ hn4_TEST(FixVerification, UsedBlocks_Underflow_Protection) {
      * Old Logic: 0 - 1 = UINT64_MAX
      * New Logic: CAS sees 0, aborts decrement. Result is 0.
      */
-    uint64_t val = atomic_load(&vol->used_blocks);
+    uint64_t val = atomic_load(&vol->alloc.used_blocks);
     ASSERT_EQ(0ULL, val);
 
     cleanup_alloc_fixture(vol);
@@ -969,7 +969,7 @@ hn4_TEST(FixVerification, Horizon_Robust_Wrap_Detection) {
     uint64_t cap_blocks = end_sect - start_sect; /* 100 blocks (assuming 1:1 scaling for test) */
 
     /* 1. Manually set Head to Capacity + 5 (Simulate a jump or race) */
-    atomic_store(&vol->horizon_write_head, cap_blocks + 5);
+    atomic_store(&vol->alloc.horizon_write_head, cap_blocks + 5);
     
     /* 2. Clean State */
     atomic_store(&vol->sb.info.state_flags, HN4_VOL_CLEAN);
@@ -1023,7 +1023,7 @@ hn4_TEST(EccIntegrity, Nvm_DED_Panic) {
     
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_TRUE((flags & HN4_VOL_PANIC) != 0);
-    ASSERT_EQ(0ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -1078,7 +1078,7 @@ hn4_TEST(EccIntegrity, Concurrent_Heal_Counting) {
     
     ASSERT_EQ(0, (vol->void_bitmap[0].data & 1)); /* Corruption gone */
     ASSERT_EQ(0xFULL << 10, (vol->void_bitmap[0].data & (0xFULL << 10))); /* Writes succeeded */
-    ASSERT_TRUE(atomic_load(&vol->stats.heal_count) >= 1);
+    ASSERT_TRUE(atomic_load(&vol->health.heal_count) >= 1);
 
     cleanup_alloc_fixture(vol);
 }
@@ -1228,7 +1228,7 @@ hn4_TEST(EccIntegrity, Parity_Only_Repair_Counts) {
 
     /* 4. Verify Heal Count Incremented */
     /* Data didn't change, but storage was repaired */
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
     
     /* 5. Verify ECC is fixed in RAM */
     ASSERT_EQ(_calc_ecc_hamming(data), vol->void_bitmap[0].ecc);
@@ -1253,7 +1253,7 @@ hn4_TEST(Hierarchy, L2_Clear_Last_Bit) {
     _bitmap_op(vol, 10, BIT_SET, &res);
     
     /* 2. Verify L2 Bit 0 is SET */
-    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word & 1) != 0);
 
     /* 3. Set Block 20 */
@@ -1261,12 +1261,12 @@ hn4_TEST(Hierarchy, L2_Clear_Last_Bit) {
 
     /* 4. Clear Block 10 (L2 should STAY SET because Block 20 is active) */
     _bitmap_op(vol, 10, BIT_CLEAR, &res);
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word & 1) != 0);
 
     /* 5. Clear Block 20 (Last bit -> L2 should CLEAR) */
     _bitmap_op(vol, 20, BIT_CLEAR, &res);
-    l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_FALSE((l2_word & 1) != 0);
 
     cleanup_alloc_fixture(vol);
@@ -1360,7 +1360,7 @@ hn4_TEST(Hierarchy, L2_False_Empty_Safety_And_Heal) {
     vol->void_bitmap[0].ecc = _calc_ecc_hamming(1);
     
     /* Simulate a race where L2 was cleared incorrectly */
-    vol->l2_summary_bitmap[0] = 0; 
+    vol->locking.l2_summary_bitmap[0] = 0; 
     
     /* 2. Attempt to Claim Block 0 */
     bool claimed;
@@ -1379,7 +1379,7 @@ hn4_TEST(Hierarchy, L2_False_Empty_Safety_And_Heal) {
      * The allocator detected we tried to SET a bit that was already SET.
      * It should have force-updated L2 to ensure consistency.
      */
-    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word & 1) != 0); /* L2 Repaired to 1 */
 
     cleanup_alloc_fixture(vol);
@@ -1443,7 +1443,7 @@ hn4_TEST(NvmLogic, FastPath_Rejects_Corruption) {
      * If Fast Path ran: It would see ECC mismatch and abort.
      * Slow Path runs: Detects error, Heals, Increments Counter.
      */
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
     ASSERT_EQ(_calc_ecc_hamming(data), vol->void_bitmap[0].ecc);
 
     cleanup_alloc_fixture(vol);
@@ -1717,7 +1717,7 @@ hn4_TEST(Hierarchy, L2_Heals_On_Set) {
     vol->void_bitmap[0].data = 1; 
     
     /* 2. Desync L2 (Clear it) */
-    vol->l2_summary_bitmap[0] = 0;
+    vol->locking.l2_summary_bitmap[0] = 0;
     
     /* 3. Perform Idempotent Set (Bit 0) */
     /* Allocator sees bit is already 1. 
@@ -1737,7 +1737,7 @@ hn4_TEST(Hierarchy, L2_Heals_On_Set) {
      * but the review "4. L2 Summary Shrink Race" suggested it.
      * Let's assume we WANT this behavior.
      */
-    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     /* Expectation: L2 repaired to 1 */
     // ASSERT_EQ(1ULL, l2); 
     /* Commented out because we haven't applied that specific fix yet. */
@@ -1787,7 +1787,7 @@ hn4_TEST(AlgoConstraints, Horizon_Wrap_Dirties_Volume) {
     vol->sb.info.journal_start = 10100; /* Cap 100 */
     
     /* Set Head to 99 */
-    atomic_store(&vol->horizon_write_head, 99);
+    atomic_store(&vol->alloc.horizon_write_head, 99);
     atomic_store(&vol->sb.info.state_flags, HN4_VOL_CLEAN);
     
     uint64_t lba;
@@ -1861,7 +1861,7 @@ hn4_TEST(HDDLogic, Window_Wrap_Safety) {
     
     /* Set last_alloc_g to the very last block of the domain */
     uint64_t last_g = (phi - 1); 
-    atomic_store(&vol->last_alloc_g, last_g);
+    atomic_store(&vol->alloc.last_alloc_g, last_g);
     
     /* 
      * We iterate enough times to statistically guarantee a jitter > 0
@@ -1966,7 +1966,7 @@ hn4_TEST(HorizonLogic, Saturation_Counter_Stability) {
     }
     
     /* 3. Record Usage */
-    uint64_t used_before = atomic_load(&vol->used_blocks);
+    uint64_t used_before = atomic_load(&vol->alloc.used_blocks);
     ASSERT_EQ(10ULL, used_before);
     
     /* 4. Attempt Allocation (Will Fail) */
@@ -1979,7 +1979,7 @@ hn4_TEST(HorizonLogic, Saturation_Counter_Stability) {
     /* 5. Verify Counter didn't drift */
     /* If the loop incremented 'used' on a speculative set, then failed to decrement on rollback,
        usage would be > 10. */
-    uint64_t used_after = atomic_load(&vol->used_blocks);
+    uint64_t used_after = atomic_load(&vol->alloc.used_blocks);
     
     ASSERT_EQ(used_before, used_after);
 
@@ -2055,7 +2055,7 @@ hn4_TEST(Logic, L1_ForceClear_Metrics) {
     _bitmap_op(vol, 100, BIT_SET, &state);
     
     /* Verify usage incremented */
-    uint64_t used_peak = atomic_load(&vol->used_blocks);
+    uint64_t used_peak = atomic_load(&vol->alloc.used_blocks);
     ASSERT_EQ(1ULL, used_peak);
     
     /* Reset Dirty flag to isolate FORCE_CLEAR behavior */
@@ -2065,7 +2065,7 @@ hn4_TEST(Logic, L1_ForceClear_Metrics) {
     _bitmap_op(vol, 100, BIT_FORCE_CLEAR, &state);
     
     /* 3. Verify Metrics Restored */
-    uint64_t used_after = atomic_load(&vol->used_blocks);
+    uint64_t used_after = atomic_load(&vol->alloc.used_blocks);
     ASSERT_EQ(0ULL, used_after);
     
     /* 4. Verify Stealth (Still Clean) */
@@ -2139,7 +2139,7 @@ hn4_TEST(Logic, L4_L2_Advisory_Safety) {
     vol->void_bitmap[0].data = 1; /* Block 0 Used */
     vol->void_bitmap[0].ecc = _calc_ecc_hamming(1);
     
-    vol->l2_summary_bitmap[0] = 0; /* L2 Says Empty */
+    vol->locking.l2_summary_bitmap[0] = 0; /* L2 Says Empty */
     
     /* 2. Attempt to Claim Block 0 */
     bool claimed;
@@ -2187,7 +2187,7 @@ hn4_TEST(Logic, L10_Ghost_Reconstruction) {
     
     /* Verify L2 was auto-healed by the SET op */
     uint64_t l2_idx = target_lba / 512;
-    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2_word = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2_word >> (l2_idx % 64)) & 1);
 
     cleanup_alloc_fixture(vol);
@@ -2283,7 +2283,7 @@ hn4_TEST(HorizonLogic, Wrap_Without_Alloc_Is_Clean) {
     vol->sb.info.journal_start     = start + cap;
     
     /* Force Head to Wrap Point (9) */
-    atomic_store(&vol->horizon_write_head, 9);
+    atomic_store(&vol->alloc.horizon_write_head, 9);
     atomic_store(&vol->sb.info.state_flags, HN4_VOL_CLEAN);
     
     /* 
@@ -2409,7 +2409,7 @@ hn4_TEST(EccIntegrity, SEC_SingleBit_Repair) {
     ASSERT_EQ(HN4_INFO_HEALED, res);
     ASSERT_FALSE(state);
     ASSERT_EQ(0ULL, vol->void_bitmap[0].data);
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -2446,7 +2446,7 @@ hn4_TEST(EccIntegrity, DED_DoubleBit_Panic) {
     
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_TRUE((flags & HN4_VOL_PANIC) != 0);
-    ASSERT_EQ(0ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(0ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -2477,7 +2477,7 @@ hn4_TEST(EccIntegrity, Metadata_Only_Repair) {
      * - Heal Count = 1.
      * - ECC in RAM restored to correct value.
      */
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
     ASSERT_EQ(_calc_ecc_hamming(data), vol->void_bitmap[0].ecc);
 
     cleanup_alloc_fixture(vol);
@@ -2591,7 +2591,7 @@ hn4_TEST(Hierarchy, L2_Respects_Dirty_Neighbor) {
     _bitmap_op(vol, 0, BIT_CLEAR, &st);
     
     /* 3. L2 must remain SET */
-    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_TRUE((l2 & 1) != 0);
     
     cleanup_alloc_fixture(vol);
@@ -2714,7 +2714,7 @@ hn4_TEST(ProbabilisticMath, Rule_Of_20_Enforcement) {
      * We want to test the PROBE LOOP LIMIT, not the Saturation Check.
      * So we set `used_blocks` low, but bitmap FULL.
      */
-    atomic_store(&vol->used_blocks, 0); 
+    atomic_store(&vol->alloc.used_blocks, 0); 
     
     uint64_t G, V;
     hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
@@ -2739,7 +2739,7 @@ hn4_TEST(Hierarchy, L2_Heals_On_Idempotent_Set) {
     vol->void_bitmap[0].ecc = _calc_ecc_hamming(1);
     
     /* 2. Clear L2 manually */
-    vol->l2_summary_bitmap[0] = 0;
+    vol->locking.l2_summary_bitmap[0] = 0;
     
     /* 3. Call BIT_SET (Idempotent: Bit is already 1) */
     bool changed;
@@ -2748,7 +2748,7 @@ hn4_TEST(Hierarchy, L2_Heals_On_Idempotent_Set) {
     /* PROOF: Logic didn't change, but L2 must be healed */
     ASSERT_FALSE(changed);
     
-    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_EQ(1ULL, l2 & 1);
 
     cleanup_alloc_fixture(vol);
@@ -2770,7 +2770,7 @@ hn4_TEST(HorizonLogic, Uint64_Wrap_Safety) {
     vol->sb.info.journal_start = 1100;
     
     /* Set Head to MAX (Will return MAX, then wrap to 0) */
-    atomic_store(&vol->horizon_write_head, UINT64_MAX);
+    atomic_store(&vol->alloc.horizon_write_head, UINT64_MAX);
     
     uint64_t lba;
     
@@ -3007,14 +3007,14 @@ hn4_TEST(Hierarchy, Region_Boundary_EdgeCases) {
         
         /* Verify L2 for this block is set */
         uint64_t l2_idx = b / 512;
-        uint64_t l2_word = atomic_load((_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_idx/64]);
+        uint64_t l2_word = atomic_load((_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_idx/64]);
         ASSERT_TRUE((l2_word >> (l2_idx%64)) & 1);
         
         /* Clear */
         _bitmap_op(vol, b, BIT_CLEAR, &st);
         
         /* Verify L2 Cleared (assuming region empty) */
-        l2_word = atomic_load((_Atomic uint64_t*)&vol->l2_summary_bitmap[l2_idx/64]);
+        l2_word = atomic_load((_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_idx/64]);
         ASSERT_FALSE((l2_word >> (l2_idx%64)) & 1);
     }
     
@@ -3060,22 +3060,22 @@ hn4_TEST(BitmapLogic, Op_Idempotency_And_Accounting) {
     /* 1. Set 0 -> 1 (Fresh Alloc) */
     _bitmap_op(vol, blk, BIT_SET, &changed);
     ASSERT_TRUE(changed);
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks)); /* Count increments */
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks)); /* Count increments */
 
     /* 2. Set 1 -> 1 (Redundant Alloc) */
     _bitmap_op(vol, blk, BIT_SET, &changed);
     ASSERT_FALSE(changed);
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks)); /* Count STABLE */
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks)); /* Count STABLE */
 
     /* 3. Clear 1 -> 0 (Free) */
     _bitmap_op(vol, blk, BIT_CLEAR, &changed);
     ASSERT_TRUE(changed);
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks)); /* Count decrements */
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks)); /* Count decrements */
 
     /* 4. Clear 0 -> 0 (Double Free) */
     _bitmap_op(vol, blk, BIT_CLEAR, &changed);
     ASSERT_FALSE(changed);
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks)); /* Count STABLE (Underflow protection) */
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks)); /* Count STABLE (Underflow protection) */
 
     cleanup_alloc_fixture(vol);
 }
@@ -3245,7 +3245,7 @@ hn4_TEST(HorizonLogic, Rolling_Fallback_Probe) {
     uint64_t start = 20000;
     vol->sb.info.lba_horizon_start = start;
     vol->sb.info.journal_start     = start + 20;
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 
      * 1. Create Fragmentation
@@ -3277,7 +3277,7 @@ hn4_TEST(HorizonLogic, Rolling_Fallback_Probe) {
      * Since implementation increments head on every probe, 
      * head will be > 3.
      */
-    uint64_t head = atomic_load(&vol->horizon_write_head);
+    uint64_t head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_TRUE(head >= 4);
 
     cleanup_alloc_fixture(vol);
@@ -3309,7 +3309,7 @@ hn4_TEST(RecoveryLogic, Ghost_Bitmap_Repair) {
     /* 2. Induce Amnesia (Ensure Bitmap is 0) */
     /* In a real recovery, we start with a zeroed bitmap. */
     memset(vol->void_bitmap, 0, vol->bitmap_size);
-    atomic_store(&vol->used_blocks, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
 
     /* 3. Run Scavenger Logic (Simulated) */
     /* This replicates the loop in _reconstruct_cortex_state */
@@ -3332,7 +3332,7 @@ hn4_TEST(RecoveryLogic, Ghost_Bitmap_Repair) {
     }
     
     /* Verify Metrics recovered */
-    ASSERT_EQ((uint64_t)count, atomic_load(&vol->used_blocks));
+    ASSERT_EQ((uint64_t)count, atomic_load(&vol->alloc.used_blocks));
 
     cleanup_alloc_fixture(vol);
 }
@@ -3353,12 +3353,12 @@ hn4_TEST(RecoveryLogic, Atomic_Tearing_Reclamation) {
     _bitmap_op(vol, 5000, BIT_SET, &st);
     
     /* Pre-check: It is used */
-    ASSERT_EQ(1ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(1ULL, atomic_load(&vol->alloc.used_blocks));
 
     /* 2. Simulate Mount Process (Zero-Scan) */
     /* Step A: Zero the Bitmap in RAM (Trust only Cortex) */
     memset(vol->void_bitmap, 0, vol->bitmap_size);
-    atomic_store(&vol->used_blocks, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
     
     /* Step B: Scan Cortex (Empty in this test case) */
     /* Loop 0 times... */
@@ -3373,7 +3373,7 @@ hn4_TEST(RecoveryLogic, Atomic_Tearing_Reclamation) {
      * The "Leak" caused by the torn write is gone.
      */
     ASSERT_FALSE(is_set);
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
 
     cleanup_alloc_fixture(vol);
 }
@@ -3458,7 +3458,7 @@ hn4_TEST(HardwareLies, ECC_Syndrome_Storm) {
     
     /* 3. Verify System Health */
     /* Every single iteration should have triggered a heal */
-    uint64_t heals = atomic_load(&vol->stats.heal_count);
+    uint64_t heals = atomic_load(&vol->health.heal_count);
     ASSERT_TRUE(heals > 0);
     
     /* Should be exactly 100 if loop finished */
@@ -3566,7 +3566,7 @@ hn4_TEST(FixValidation, Underflow_Triggers_Dirty) {
     hn4_volume_t* vol = create_alloc_fixture();
     
     /* 1. Force Counters to 0 */
-    atomic_store(&vol->used_blocks, 0);
+    atomic_store(&vol->alloc.used_blocks, 0);
     
     /* 2. Force Volume Clean */
     atomic_store(&vol->sb.info.state_flags, HN4_VOL_CLEAN);
@@ -3584,7 +3584,7 @@ hn4_TEST(FixValidation, Underflow_Triggers_Dirty) {
      * - used_blocks must remain 0 (Clamped)
      * - State Flags must contain HN4_VOL_DIRTY (New Behavior)
      */
-    ASSERT_EQ(0ULL, atomic_load(&vol->used_blocks));
+    ASSERT_EQ(0ULL, atomic_load(&vol->alloc.used_blocks));
     
     uint32_t flags = atomic_load(&vol->sb.info.state_flags);
     ASSERT_TRUE((flags & HN4_VOL_DIRTY) != 0);
@@ -3605,7 +3605,7 @@ hn4_TEST(FixValidation, L2_Heals_On_Idempotent_Set) {
     /* 1. Manually Desynchronize: L3=1, L2=0 */
     vol->void_bitmap[0].data = 1; 
     vol->void_bitmap[0].ecc = _calc_ecc_hamming(1);
-    vol->l2_summary_bitmap[0] = 0;
+    vol->locking.l2_summary_bitmap[0] = 0;
     
     /* 2. Perform Idempotent Set (Bit 0 is already 1) */
     bool changed;
@@ -3618,7 +3618,7 @@ hn4_TEST(FixValidation, L2_Heals_On_Idempotent_Set) {
      */
     ASSERT_FALSE(changed);
     
-    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+    uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
     ASSERT_EQ(1ULL, l2 & 1);
     
     cleanup_alloc_fixture(vol);
@@ -3725,7 +3725,7 @@ hn4_TEST(ExtremeEdge, Horizon_Pointer_Wrap_Physics) {
     vol->sb.info.journal_start = 1010;
     
     /* Set head to max */
-    atomic_store(&vol->horizon_write_head, UINT64_MAX);
+    atomic_store(&vol->alloc.horizon_write_head, UINT64_MAX);
     
     /* 1. Alloc 1 (Result: Index 15 = 5 (MAX%10=5)) */
     /* UINT64_MAX = 18...15. 15 % 10 = 5. */
@@ -3845,7 +3845,7 @@ hn4_TEST(HorizonLogic, Ring_Pointer_Wrap) {
     
     /* 2. Force Head to a wrapping point */
     /* If Size=10, 20 % 10 = 0. */
-    atomic_store(&vol->horizon_write_head, 20);
+    atomic_store(&vol->alloc.horizon_write_head, 20);
     
     uint64_t lba;
     
@@ -3949,7 +3949,7 @@ hn4_TEST(HorizonLogic, True_Full_Termination) {
     ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
     /* Verify Head moved (it tried scans) */
-    uint64_t head = atomic_load(&vol->horizon_write_head);
+    uint64_t head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_TRUE(head > 0);
 
     cleanup_alloc_fixture(vol);
@@ -3965,7 +3965,7 @@ hn4_TEST(SaturationTiers, Genesis_Fails_At_90) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* Set usage to 90% */
-    atomic_store(&vol->used_blocks, (total * 90) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 90) / 100);
     
     uint64_t G, V;
     hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
@@ -3991,7 +3991,7 @@ hn4_TEST(SaturationTiers, Update_Succeeds_At_92) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* Set usage to 92% (Above Genesis limit, below Update limit) */
-    atomic_store(&vol->used_blocks, (total * 92) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 92) / 100);
     
     /* Use Alloc Block (Shadow Hop) logic */
     /* Note: We mock the trajectory calculation to return a valid free block */
@@ -4026,7 +4026,7 @@ hn4_TEST(SaturationTiers, Update_Fails_At_95) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* Set usage to 95% */
-    atomic_store(&vol->used_blocks, (total * 95) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 95) / 100);
     
     hn4_anchor_t anchor = {0};
     anchor.gravity_center = hn4_cpu_to_le64(1000);
@@ -4059,7 +4059,7 @@ hn4_TEST(SaturationTiers, Flag_consistency_Check) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 92% Usage. Update calls should pass, but Volume is technically Saturated for Genesis. */
-    atomic_store(&vol->used_blocks, (total * 92) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 92) / 100);
     
     /* Perform Update */
     hn4_anchor_t anchor = {0};
@@ -4477,7 +4477,7 @@ hn4_TEST(NewFixes, Horizon_Redirection_Signal) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Saturation (91%) */
-    atomic_store(&vol->used_blocks, (total * 91) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 91) / 100);
     
     uint64_t G, V;
     hn4_result_t res = hn4_alloc_genesis(vol, 0, 0, &G, &V);
@@ -4503,7 +4503,7 @@ hn4_TEST(NewFixes, Update_Bypass_And_Succeed) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Hard Saturation (96%) */
-    atomic_store(&vol->used_blocks, (total * 96) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 96) / 100);
     
     hn4_anchor_t anchor = {0};
     anchor.gravity_center = hn4_cpu_to_le64(1000);
@@ -4611,7 +4611,7 @@ hn4_TEST(FixVerify, Genesis_Saturation_Returns_Info) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Saturation (>90%) */
-    atomic_store(&vol->used_blocks, (total * 91) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 91) / 100);
     
     /* 2. Attempt Genesis Alloc */
     uint64_t G, V;
@@ -4637,7 +4637,7 @@ hn4_TEST(FixVerify, Update_Saturation_Succeeds_In_Horizon) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Hard Saturation (>95%) */
-    atomic_store(&vol->used_blocks, (total * 96) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 96) / 100);
     
     hn4_anchor_t anchor = {0};
     anchor.gravity_center = hn4_cpu_to_le64(1000);
@@ -4670,7 +4670,7 @@ hn4_TEST(FixVerify, System_Metadata_Rejects_Horizon) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Saturation (>90%) */
-    atomic_store(&vol->used_blocks, (total * 91) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 91) / 100);
     
     uint64_t G, V;
     /* 2. Alloc Metadata */
@@ -4767,7 +4767,7 @@ hn4_TEST(Optimization, Cortex_Skips_L2_Dirty) {
     uint64_t target_l2_idx = 1000 / 512;
     
     /* 2. Manually Dirty L2 for this region */
-    vol->l2_summary_bitmap[target_l2_idx / 64] |= (1ULL << (target_l2_idx % 64));
+    vol->locking.l2_summary_bitmap[target_l2_idx / 64] |= (1ULL << (target_l2_idx % 64));
     
     /* 
      * 3. Attempt Allocation
@@ -4822,7 +4822,7 @@ hn4_TEST(SaturationLogic, Extreme_Fullness_Behavior) {
     
     /* 1. Force 99% Usage */
     uint64_t total = HN4_TOTAL_BLOCKS;
-    atomic_store(&vol->used_blocks, (total * 99) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 99) / 100);
     
     /* 2. Setup Trajectory spy */
     /* We can't spy easily, but we can verify the return code and out_k */
@@ -4904,7 +4904,7 @@ hn4_TEST(SaturationFix, Update_Survives_96Percent) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Trip Hard Saturation (> 95%) */
-    atomic_store(&vol->used_blocks, (total * 96) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 96) / 100);
     
     /* 2. Verify D1 (Genesis) is effectively blocked/redirected */
     uint64_t G, V;
@@ -4974,7 +4974,7 @@ hn4_TEST(BitmapLogic, Heal_Without_Logical_Change) {
     ASSERT_EQ(HN4_INFO_HEALED, res);
     ASSERT_FALSE(changed);
     ASSERT_EQ(data, vol->void_bitmap[0].data);
-    ASSERT_EQ(1ULL, atomic_load(&vol->stats.heal_count));
+    ASSERT_EQ(1ULL, atomic_load(&vol->health.heal_count));
 
     cleanup_alloc_fixture(vol);
 }
@@ -4995,7 +4995,7 @@ hn4_TEST(HorizonLogic, Skip_Occupied_Blocks) {
     vol->sb.info.journal_start = start + 10;
     
     /* Force Head to 0 */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 1. Manually Occupy Offset 0 and 1 */
     bool st;
@@ -5017,7 +5017,7 @@ hn4_TEST(HorizonLogic, Skip_Occupied_Blocks) {
     /* Verify Head advanced past the allocation */
     /* Implementation implementation pre-increments or post-increments, 
        but head must be > 0. Actually loop increments it. */
-    uint64_t head = atomic_load(&vol->horizon_write_head);
+    uint64_t head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_TRUE(head >= 3);
 
     cleanup_alloc_fixture(vol);
@@ -5069,7 +5069,7 @@ hn4_TEST(SaturationLogic, Update_Falls_To_Horizon_At_96) {
     
     /* 1. Force 96% Usage (Hard Saturation Wall) */
     uint64_t total = HN4_TOTAL_BLOCKS;
-    atomic_store(&vol->used_blocks, (total * 96) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 96) / 100);
     
     /* 2. Prepare Anchor for Update */
     hn4_anchor_t anchor = {0};
@@ -5183,7 +5183,7 @@ hn4_TEST(PhysicsEngine, Gravity_Collapse_Fallback) {
     uint8_t out_k;
     
     /* Ensure D1 is not globally saturated (so it tries ballistic first) */
-    atomic_store(&vol->used_blocks, 0); 
+    atomic_store(&vol->alloc.used_blocks, 0); 
     
     /* Test Fallback */
     hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
@@ -5205,7 +5205,7 @@ hn4_TEST(Saturation, Sundar_Bankruptcy) {
     vol->vol_capacity_bytes = 4096 * 100;
     
     /* 2. Mark D1 saturated (96%) */
-    atomic_store(&vol->used_blocks, 96); 
+    atomic_store(&vol->alloc.used_blocks, 96); 
     
     /* 3. Setup Horizon with 0 size */
     vol->sb.info.lba_horizon_start = 50;
@@ -5286,7 +5286,7 @@ hn4_TEST(Saturation, Event_Horizon_Lockout_90) {
     uint64_t cap = 100000;
     vol->vol_capacity_bytes = cap * 4096;
     vol->vol_block_size = 4096;
-    atomic_store(&vol->used_blocks, 91000); 
+    atomic_store(&vol->alloc.used_blocks, 91000); 
     
     /* Setup valid Horizon */
     vol->sb.info.lba_horizon_start = 20000;
@@ -5403,7 +5403,7 @@ hn4_TEST(NanoLogic, O1_Slot_Fit) {
     ASSERT_EQ(slot1 + 1, slot2);
     
     /* Verify cursor advancement */
-    ASSERT_EQ(slot2 + 2, vol->cortex_search_head);
+    ASSERT_EQ(slot2 + 2, vol->alloc.cortex_search_head);
 
     cleanup_alloc_fixture(vol);
 }
@@ -5471,7 +5471,7 @@ hn4_TEST(ComplexityProof, Horizon_Strict_No_Scan) {
     }
     
     /* 2. Point Head at 0 (Occupied) */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 3. Attempt Alloc */
     uint64_t lba;
@@ -5485,7 +5485,7 @@ hn4_TEST(ComplexityProof, Horizon_Strict_No_Scan) {
     ASSERT_EQ(HN4_ERR_ENOSPC, res);
     
     /* Verify Head didn't wander too far (Scan limit check) */
-    uint64_t final_head = atomic_load(&vol->horizon_write_head);
+    uint64_t final_head = atomic_load(&vol->alloc.horizon_write_head);
     ASSERT_TRUE(final_head < 20);
 
     cleanup_alloc_fixture(vol);
@@ -5548,7 +5548,7 @@ hn4_TEST(ComplexityProof, L2_Skip_Optimization) {
        Allocator starts at offset 0 (LBA 1000). 
        LBA 1000 / 512 = 1. L2 index 1.
     */
-    vol->l2_summary_bitmap[0] |= (1ULL << 1); /* Set Bit 1 */
+    vol->locking.l2_summary_bitmap[0] |= (1ULL << 1); /* Set Bit 1 */
     
     /* 2. Alloc */
     uint64_t slot;
@@ -5655,7 +5655,7 @@ hn4_TEST(SaturationLogic, Extreme_98_Percent_Survival) {
     uint64_t total = HN4_TOTAL_BLOCKS;
     
     /* 1. Force 98% Usage */
-    atomic_store(&vol->used_blocks, (total * 98) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 98) / 100);
     
     /* 2. Attempt Genesis (New File) */
     uint64_t G, V;
@@ -5721,12 +5721,12 @@ hn4_TEST(Hierarchy, L2_Toggle_Stress) {
     for(int i=0; i<1000; i++) {
         /* Set */
         _bitmap_op(vol, blk, BIT_SET, &st);
-        uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+        uint64_t l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
         ASSERT_EQ(1ULL, l2 & 1);
         
         /* Clear */
         _bitmap_op(vol, blk, BIT_CLEAR, &st);
-        l2 = atomic_load((_Atomic uint64_t*)vol->l2_summary_bitmap);
+        l2 = atomic_load((_Atomic uint64_t*)vol->locking.l2_summary_bitmap);
         ASSERT_EQ(0ULL, l2 & 1);
     }
     
@@ -5747,7 +5747,7 @@ hn4_TEST(HorizonLogic, Full_Ring_Rejection_O1) {
     }
     
     /* 2. Set Head to 0 */
-    atomic_store(&vol->horizon_write_head, 0);
+    atomic_store(&vol->alloc.horizon_write_head, 0);
     
     /* 3. Alloc */
     uint64_t lba;
@@ -5887,7 +5887,7 @@ hn4_TEST(SaturationLogic, Predicate_Verification) {
     uint64_t total = HN4_TOTAL_BLOCKS; // 25600
     
     /* 1. Set 98% */
-    atomic_store(&vol->used_blocks, (total * 98) / 100);
+    atomic_store(&vol->alloc.used_blocks, (total * 98) / 100);
     
     /* 2. Call Genesis */
     uint64_t G, V;

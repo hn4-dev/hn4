@@ -120,6 +120,7 @@ _Check_return_ hn4_result_t hn4_repair_block(
 
     if (vol->quality_mask) {
         uint32_t bs      = vol->vol_block_size;
+        
         uint64_t lba_val = hn4_addr_to_u64(bad_lba);
 
         /* Calculate containment block (Mask bits cover whole blocks) */
@@ -195,7 +196,7 @@ _Check_return_ hn4_result_t hn4_repair_block(
     if (res == HN4_OK) {
         HN4_LOG_WARN("[TRIAGE] HEALED LBA %llu. Downgraded to BRONZE.",
                      (unsigned long long)hn4_addr_to_u64(bad_lba));
-        atomic_fetch_add(&vol->stats.heal_count, 1);
+        atomic_fetch_add(&vol->health.heal_count, 1);
         return HN4_OK;
     } else {
         /* Filter logic errors that shouldn't mark media toxic */
@@ -208,7 +209,7 @@ _Check_return_ hn4_result_t hn4_repair_block(
 
         /* Only increment toxic counter if we actually transitioned state to avoid double-counting */
         if (transition_to_toxic) {
-            atomic_fetch_add(&vol->toxic_blocks, 1);
+            atomic_fetch_add(&vol->health.toxic_blocks, 1);
         }
 
         /* Always return TOXIC if the physical repair failed */

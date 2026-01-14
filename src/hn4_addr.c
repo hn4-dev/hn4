@@ -93,11 +93,12 @@ int hn4_u128_cmp(hn4_u128_t a, hn4_u128_t b) {
 hn4_u128_t hn4_u128_sub(hn4_u128_t a, hn4_u128_t b) {
     hn4_u128_t res;
     res.lo = a.lo - b.lo;
-    /* Borrow logic: if result > start, we wrapped around */
-    uint64_t borrow = (res.lo > a.lo) ? 1 : 0;
+    uint64_t borrow = (a.lo < b.lo) ? 1 : 0;
     res.hi = a.hi - b.hi - borrow;
+    
     return res;
 }
+
 
 hn4_u128_t hn4_u128_from_u64(uint64_t v) {
     hn4_u128_t r = { .lo = v, .hi = 0 }; 
@@ -124,7 +125,7 @@ hn4_u128_t hn4_u128_mul_u64(hn4_u128_t a, uint64_t b) {
     res.hi = (uint64_t)(r >> 64) + (a.hi * b);
 #else
     /* Manual 64x64->128 decomposition for lo*b, plus hi*b */
-    uint64_t a_lo = a.lo & 0xFFFFFFFF;
+     uint64_t a_lo = a.lo & 0xFFFFFFFFULL;
     uint64_t a_hi = a.lo >> 32;
     uint64_t b_lo = b & 0xFFFFFFFF;
     uint64_t b_hi = b >> 32;
@@ -135,7 +136,7 @@ hn4_u128_t hn4_u128_mul_u64(hn4_u128_t a, uint64_t b) {
     uint64_t p3 = a_hi * b_hi;
 
     uint64_t carry = (p1 & 0xFFFFFFFF) + (p0 >> 32);
-    carry += (p2 & 0xFFFFFFFF); // Lower 32 of p2
+   carry += (p2 & 0xFFFFFFFFULL); // Lower 32 of p2
     
     res.lo = a.lo * b; // CPU handles low part wrap correctly
     
@@ -220,19 +221,16 @@ hn4_u128_t hn4_u128_div_u64(hn4_u128_t a, uint64_t b) {
         /* Shift remainder left by 1, pulling in MSB of low */
         uint64_t msb_low = (low >> 63);
         
-        /* Check overflow of remainder before shift */
+        /* Capture MSB of remainder to detect overflow after shift */
         uint64_t rem_msb = (rem >> 63);
         
         rem = (rem << 1) | msb_low;
         low = (low << 1);
         
         quotient_lo = (quotient_lo << 1);
-        
-        /* If rem overflows or rem >= b, subtract b and set quotient bit */
-        /* Note: rem_msb check handles the case where shifting resulted in a value > 64bit max 
-           which conceptually wraps but we track logical value */
+
         if (rem_msb || rem >= b) {
-            rem -= b;
+            rem -= b; /* Wraps correctly for rem_msb case, standard sub for >= case */
             quotient_lo |= 1;
         }
     }

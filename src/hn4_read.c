@@ -105,7 +105,8 @@ static hn4_result_t _validate_block(
     HN4_IN const void*   buffer,
     HN4_IN uint32_t      len,
     HN4_IN hn4_u128_t    expected_well_id,
-    HN4_IN uint64_t      expected_gen
+    HN4_IN uint64_t      expected_gen,
+    HN4_IN uint64_t      anchor_dclass /* Added for Policy Check */
 )
 {
     const hn4_block_header_t* hdr = (const hn4_block_header_t*)buffer;
@@ -158,9 +159,6 @@ static hn4_result_t _validate_block(
 
     /*
      * 4. Freshness Check (STRICT ATOMICITY)
-     * Architectural wrap risk documented.
-     * We strictly enforce generation equality. Writer wraps at 32-bit boundary.
-     * Reader must follow suit.
      */
     uint64_t blk_gen_64 = hn4_le64_to_cpu(hdr->generation);
     uint32_t blk_gen_32 = (uint32_t)blk_gen_64;
@@ -170,10 +168,22 @@ static hn4_result_t _validate_block(
         return HN4_ERR_GENERATION_SKEW;
     }
 
-    /* 5. Data Integrity */
+    /* 5. Data Integrity & Policy Check */
     uint32_t payload_sz = HN4_BLOCK_PayloadSize(vol->vol_block_size);
     uint32_t comp_meta  = hn4_le32_to_cpu(hdr->comp_meta);
     uint32_t c_size     = comp_meta >> HN4_COMP_SIZE_SHIFT;
+    uint8_t  algo       = comp_meta & HN4_COMP_ALGO_MASK;
+
+    if (algo != HN4_COMP_NONE && algo != HN4_COMP_TCC) {
+        HN4_LOG_WARN("Block Validation: Unknown Algo %u", algo);
+        return HN4_ERR_ALGO_UNKNOWN;
+    }
+
+    if ((anchor_dclass & HN4_HINT_ENCRYPTED) && algo != HN4_COMP_NONE) {
+        /* Policy: Encrypted files MUST NOT use FS-layer compression */
+        HN4_LOG_CRIT("Security: Encrypted file contains compressed block. Tamper evidence.");
+        return HN4_ERR_TAMPERED;
+    }
 
     if (c_size > payload_sz) {
         HN4_LOG_WARN("Block Validation: Meta Corruption (CSize %u > Payload %u)", c_size, payload_sz);
@@ -330,12 +340,24 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             uint64_t lba = _calc_trajectory_lba(vol, effective_G, effective_V, block_idx, M, k);
 
             if (lba != HN4_LBA_INVALID && lba < max_blocks) {
-                bool is_allocated;
-                hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
+                /* Atomic Reservation / Existence Check */
+                bool is_allocated = false;
+                /* 
+                 * If we are Read-Only and the Bitmap failed to load (NULL), we cannot 
+                 * check allocation status. We MUST assume the block exists and let 
+                 * the Physical Validation (Magic/CRC) determine truth.
+                 */
+                if (vol->read_only && !vol->void_bitmap) {
+                    is_allocated = true; /* Optimistic probe */
+                } else {
+                    hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
+                    if (op_res != HN4_OK) {
+                        probe_error = _merge_error(probe_error, op_res);
+                        is_allocated = false;
+                    }
+                }
 
-                if (op_res != HN4_OK) {
-                    probe_error = _merge_error(probe_error, op_res);
-                } else if (is_allocated) {
+                if (is_allocated) {
                     candidates[valid_candidates++] = lba;
                 }
             }
@@ -344,7 +366,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     /* Trajectory Collapse Detection */
     if (depth_limit >= 2 && valid_candidates == 1) {
-        atomic_fetch_add(&vol->stats.trajectory_collapse_counter, 1);
+        atomic_fetch_add(&vol->health.trajectory_collapse_counter, 1);
         HN4_LOG_WARN("Trajectory Collapse: Only 1 candidate found (Limit %d)", depth_limit);
     }
 
@@ -399,7 +421,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_sector, io_buf, sectors);
 
             if (io_res == HN4_OK) {
-                hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen);
+                hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen, dclass);
 
                 if (val_res == HN4_OK) {
                     /* Bitmap Race Window Check */
@@ -508,7 +530,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
             /* Telemetry Split */
             if (io_res == HN4_ERR_HEADER_ROT || io_res == HN4_ERR_PAYLOAD_ROT || io_res == HN4_ERR_DATA_ROT) {
-                atomic_fetch_add(&vol->stats.crc_failures, 1);
+                atomic_fetch_add(&vol->health.crc_failures, 1);
             }
         }
     }

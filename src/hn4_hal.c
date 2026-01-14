@@ -297,11 +297,14 @@ void* hn4_hal_mem_alloc(size_t size)
     _assert_hal_init();
     if (size == 0) return NULL;
 
-    /*
-     * Pad for alignment + header space.
-     * We allocate enough to slide the pointer to a 128-byte boundary.
-     */
-    size_t total = size + HN4_HAL_ALIGNMENT + sizeof(alloc_header_t);
+    /* Check for integer overflow before calculation */
+    size_t overhead = HN4_HAL_ALIGNMENT + sizeof(alloc_header_t);
+    if (size > (SIZE_MAX - overhead)) {
+        hn4_hal_panic("HAL: Allocator Integer Overflow Detected");
+        return NULL;
+    }
+
+    size_t total = size + overhead;
     void*  raw   = malloc(total);
     if (!raw) return NULL;
 
@@ -416,8 +419,13 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
 
     /* SAFEGUARD #2: Max Chunk (2GB) must be aligned to block_size */
     const uint64_t MAX_RAW_CAP = 0x80000000ULL;
-    /* Round down to nearest block multiple */
-    const uint64_t SAFE_CHUNK_CAP = (MAX_RAW_CAP / block_size) * block_size;
+
+    uint64_t SAFE_CHUNK_CAP;
+    if (block_size >= MAX_RAW_CAP) {
+        SAFE_CHUNK_CAP = block_size; 
+    } else {
+        SAFE_CHUNK_CAP = (MAX_RAW_CAP / block_size) * block_size;
+    }
 
     hn4_size_t remaining   = len_bytes;
     hn4_addr_t current_lba = start_lba;
@@ -724,34 +732,44 @@ hn4_result_t hn4_hal_zns_append_sync(
 ) {
     if (!dev) return HN4_ERR_INVALID_ARGUMENT;
 
-    _hal_internal_ctx_t ctx = { .done = false, .res = HN4_OK };
-    hn4_io_req_t req = {0};
+    /* 
+     * FIX: Allocate context on Heap. 
+     * Stack allocation here is unsafe because a timeout would pop the stack,
+     * leaving the hardware writing to a dangling pointer later.
+     */
+    _hal_internal_ctx_t* ctx = hn4_hal_mem_alloc(sizeof(_hal_internal_ctx_t));
+    if (!ctx) return HN4_ERR_NOMEM;
 
+    ctx->done = false;
+    ctx->res = HN4_OK;
+
+    hn4_io_req_t req = {0};
     req.op_code  = HN4_IO_ZONE_APPEND;
-    req.lba      = zone_start_lba; /* The Zone Handle */
+    req.lba      = zone_start_lba; /* The Zone Handle (Start LBA) */
     req.buffer   = buffer;
     req.length   = len_blocks;
-    req.user_ctx = &ctx;
+    req.user_ctx = ctx;
 
     /* Submit to hardware queue */
     hn4_hal_submit_io(dev, &req, _hal_internal_cb);
 
     /* 
-     * THE POLLING LOOP (Moved from hn4_write.c)
-     * Keeps upper layers clean.
+     * THE POLLING LOOP
      */
     hn4_time_t start_ts = hn4_hal_get_time_ns();
 
-    /* Use atomic load for thread sanitizer safety */
-    while (!atomic_load_explicit((_Atomic bool*)&ctx.done, memory_order_acquire)) {
+    while (!atomic_load_explicit((_Atomic bool*)&ctx->done, memory_order_acquire)) {
         
         hn4_hal_poll(dev);
 
         if ((hn4_hal_get_time_ns() - start_ts) > HN4_HAL_DEFAULT_TIMEOUT_NS) {
             HN4_LOG_CRIT("HAL: ZNS Append Timeout. Device Stalled.");
+            
             /* 
-             * NOTE: In a real kernel driver, you must issue an Abort command here 
-             * or leak the stack frame. We return timeout. 
+             * CRITICAL SAFETY: 
+             * Do NOT free 'ctx'. The hardware/driver still holds a pointer to it.
+             * If we free it and return, the Late Callback will corrupt the heap.
+             * Leaking ~16 bytes is preferable to Kernel Panic / RCE.
              */
             return HN4_ERR_ATOMICS_TIMEOUT;
         }
@@ -759,10 +777,15 @@ hn4_result_t hn4_hal_zns_append_sync(
         HN4_YIELD(); /* Reduce CPU burn */
     }
 
-    /* Capture the resulting LBA provided by the drive */
-    if (ctx.res == HN4_OK && result_lba) {
+    /* Capture the resulting LBA provided by the drive (Post-Write) */
+    if (ctx->res == HN4_OK && result_lba) {
         *result_lba = req.result_lba;
     }
 
-    return ctx.res;
+    hn4_result_t final_res = ctx->res;
+
+    /* Operation complete, safe to free */
+    hn4_hal_mem_free(ctx);
+
+    return final_res;
 }
