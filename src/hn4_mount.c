@@ -48,14 +48,29 @@ static inline hn4_result_t _phys_lba_from_block(
     uint64_t sectors_per_block = block_size / sector_size;
 
 #ifdef HN4_USE_128BIT
-    /* Use 128-bit multiply to prevent overflow when converting Block Index -> Sector LBA */
+    /* 1. Calculate physical byte offset to verify capacity */
     hn4_u128_t blk = hn4_u128_from_u64(block_idx);
+    hn4_u128_t byte_offset = hn4_u128_mul_u64(blk, block_size);
+    
+    /* 2. Check bounds against volume capacity */
+    /* Note: hn4_size_t adapts to u128/u64 based on config */
+    hn4_u128_t cap_128; 
+    #if defined(HN4_USE_128BIT)
+        cap_128 = (hn4_u128_t)total_capacity_bytes;
+    #else
+        cap_128 = hn4_u128_from_u64(total_capacity_bytes);
+    #endif
+
+    if (hn4_u128_cmp(byte_offset, cap_128) >= 0) {
+        return HN4_ERR_GEOMETRY;
+    }
+
+    /* 3. Convert to Sector LBA */
     *out_addr = hn4_u128_mul_u64(blk, sectors_per_block);
 #else
     /* Standard check */
     uint64_t total_logical_blocks = total_capacity_bytes / block_size;
     
-    /* FIX: Validate Logical Index first */
     if (block_idx >= total_logical_blocks) return HN4_ERR_GEOMETRY;
 
     /* Now safe to multiply */
@@ -109,11 +124,9 @@ static hn4_result_t _validate_sb_integrity(HN4_IN const void* buffer)
     uint32_t raw32[4];
     memcpy(raw32, buffer, sizeof(raw32));
 
-    /* FIX: Reconstruct Magic from safe copy */
-    uint64_t magic_lo = raw32[0];
-    uint64_t magic_hi = raw32[1];
-    /* Combine (Assumes Disk is LE) */
-    uint64_t safe_magic = hn4_le64_to_cpu(magic_lo | (magic_hi << 32));
+    uint64_t raw_magic;
+    memcpy(&raw_magic, buffer, sizeof(uint64_t));
+    uint64_t safe_magic = hn4_le64_to_cpu(raw_magic);
 
     /* 1. Magic Check */
     if (HN4_UNLIKELY(safe_magic != HN4_MAGIC_SB)) {
@@ -166,6 +179,7 @@ static hn4_result_t _read_sb_at_lba(
     HN4_IN hn4_addr_t lba,
     HN4_IN uint32_t dev_sector_size,
     HN4_IN uint32_t known_block_size,
+    HN4_IN uint32_t buf_cap, 
     HN4_INOUT void* io_buf,
     HN4_OUT hn4_superblock_t* out_sb
 )
@@ -195,6 +209,13 @@ static hn4_result_t _read_sb_at_lba(
     if (safe_bs > 0) {
         read_bytes = HN4_MAX(min_bytes, HN4_ALIGN_UP(safe_bs, dev_sector_size));
     }
+
+    if (read_bytes > buf_cap) {
+        read_bytes = buf_cap;
+        /* Ensure we didn't clamp below necessary alignment */
+        read_bytes = HN4_ALIGN_DOWN(read_bytes, dev_sector_size);
+    }
+
     uint32_t sectors = read_bytes / dev_sector_size;
 
     memset(io_buf, 0, read_bytes);
@@ -230,7 +251,7 @@ static uint64_t _calc_south_offset(uint64_t capacity, uint32_t bs) {
     uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
     
     /* 
-     * Heuristic: Capacity must be at least 16x SB Size.
+     * Heuristic: Capacity must be at least 16x SB Size to justify South Mirror.
      */
     if (capacity < (sb_space * 16)) return HN4_OFFSET_INVALID;
     
@@ -242,21 +263,25 @@ static uint64_t _calc_south_offset(uint64_t capacity, uint32_t bs) {
     return HN4_ALIGN_DOWN(capacity - sb_space, bs);
 }
 
-
 static hn4_result_t _execute_cardinal_vote(
     HN4_IN hn4_hal_device_t* dev,
     HN4_IN bool allow_repair,
     HN4_OUT hn4_superblock_t* out_sb
 )
 {
+    
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
     if (!caps) return HN4_ERR_INTERNAL_FAULT;
 
     uint32_t sector_sz = caps->logical_block_size;
     uint64_t cap_bytes;
+    
+    /* Safe downcast for geometry calculations (assuming internal logic handles high bits if needed) */
     if (!_addr_to_u64_checked(caps->total_capacity_bytes, &cap_bytes)) return HN4_ERR_GEOMETRY;
+    
     if (sector_sz == 0 || cap_bytes == 0) return HN4_ERR_GEOMETRY;
 
+    /* Buffer Management: Start with 64KB, grow if Block Size demands it */
     size_t current_buf_sz = 65536;
     void* probe_buf = hn4_hal_mem_alloc(current_buf_sz);
     void* heal_buf  = hn4_hal_mem_alloc(current_buf_sz);
@@ -269,11 +294,14 @@ static hn4_result_t _execute_cardinal_vote(
 
     hn4_superblock_t best_sb;
     memset(&best_sb, 0, sizeof(best_sb));
+    
     bool found_valid = false;
     uint64_t max_gen = 0;
     uint64_t max_ts = 0;
+    
     hn4_result_t final_res = HN4_ERR_BAD_SUPERBLOCK;
     
+    /* Probe Strategy: Check common sizes, then dynamically check discovered size */
     uint32_t probe_sizes[] = { sector_sz, 4096, 16384, 65536, 0, 0 };
     hn4_superblock_t cand;
 
@@ -283,38 +311,40 @@ static hn4_result_t _execute_cardinal_vote(
     hn4_addr_t lba0 = 0;
 #endif
 
-    /* 1. North Probe */
-
-    hn4_result_t res_north = _read_sb_at_lba(dev, lba0, sector_sz, 0, probe_buf, &cand);
+    /* ---------------------------------------------------------------------
+     * STEP 1: NORTH PROBE (LBA 0)
+     * --------------------------------------------------------------------- */
+    hn4_result_t res_north = _read_sb_at_lba(dev, lba0, sector_sz, 0, (uint32_t)current_buf_sz, probe_buf, &cand);
 
     /* Capture Poison/Wipe Error immediately */
     if (res_north == HN4_ERR_WIPE_PENDING) {
-        hn4_hal_mem_free(probe_buf);
-        hn4_hal_mem_free(heal_buf);
-        return HN4_ERR_WIPE_PENDING;
+        final_res = HN4_ERR_WIPE_PENDING;
+        goto cleanup;
     }
 
-    /* Reuse the result from the first read */
     if (res_north == HN4_OK) {
         memcpy(&best_sb, &cand, sizeof(cand));
         found_valid = true;
         max_gen = cand.info.copy_generation;
         max_ts = cand.info.last_mount_time;
+        
+        /* Optimization: Insert the discovered block size into the probe list */
         probe_sizes[4] = best_sb.info.block_size; 
     }
 
-    /* 2. Mirror Probe */
+    /* ---------------------------------------------------------------------
+     * STEP 2: MIRROR PROBE LOOP
+     * --------------------------------------------------------------------- */
     for (int p = 0; probe_sizes[p] != 0; p++) {
         uint32_t current_bs = probe_sizes[p];
+        
+        /* Geometry sanity checks */
         if (current_bs < sector_sz || current_bs % sector_sz != 0) continue;
-        if (p > 0 && current_bs == probe_sizes[p-1]) continue;
+        if (p > 0 && current_bs == probe_sizes[p-1]) continue; /* Dedupe */
 
+        /* Resize buffers if needed */
         uint32_t required_sz = HN4_ALIGN_UP(HN4_SB_SIZE, current_bs);
         if (required_sz > current_buf_sz) {
-            /* 
-             * Set pointers to NULL after free to prevent double-free 
-             * in cleanup label if subsequent allocation fails.
-             */
             hn4_hal_mem_free(probe_buf); probe_buf = NULL;
             hn4_hal_mem_free(heal_buf);  heal_buf = NULL;
             
@@ -328,17 +358,17 @@ static hn4_result_t _execute_cardinal_vote(
             }
         }
 
+        /* Calculate Cardinal Offsets */
         uint64_t block_indices[3];
 
 #ifdef HN4_USE_128BIT
-       
         hn4_u128_t real_cap = caps->total_capacity_bytes;
         
         hn4_u128_t one_percent = hn4_u128_div_u64(real_cap, 100);
         hn4_u128_t east_bytes  = hn4_u128_mul_u64(one_percent, 33);
         hn4_u128_t west_bytes  = hn4_u128_mul_u64(one_percent, 66);
         
-        /* Convert to Blocks */
+        /* Convert Bytes -> Block Indices */
         hn4_u128_t east_blk = hn4_u128_div_u64(east_bytes, current_bs);
         hn4_u128_t west_blk = hn4_u128_div_u64(west_bytes, current_bs);
         
@@ -349,59 +379,71 @@ static hn4_result_t _execute_cardinal_vote(
         if (west_blk.hi > 0) block_indices[1] = HN4_OFFSET_INVALID;
         else block_indices[1] = west_blk.lo;
         
-        /* South Offset */
-        /* s_off = cap - sb_space */
-        /* We need a 128-bit version of _calc_south_offset logic */
+        /* South Offset Logic */
         uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, current_bs);
+        hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
         
-        hn4_u128_t min_req = hn4_u128_from_u64(sb_space * 16);
-        
-        if (hn4_u128_cmp(real_cap, min_req) < 0) {
-            block_indices[2] = HN4_OFFSET_INVALID;
-        } else {
-            hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
-            hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
-            if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
-            else block_indices[2] = south_blk.lo;
-        }
+        /* Heuristic check via high/low parts */
+        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
         if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
         else block_indices[2] = south_blk.lo;
-
 #else
         /* Standard 64-bit Logic */
-        block_indices[0] = HN4_ALIGN_UP((cap_bytes / 100) * 33, current_bs) / current_bs;
-        block_indices[1] = HN4_ALIGN_UP((cap_bytes / 100) * 66, current_bs) / current_bs;
+        uint64_t target_e, target_w;
+
+        #if defined(__SIZEOF_INT128__)
+            target_e = (uint64_t)(((unsigned __int128)cap_bytes * 33) / 100);
+            target_w = (uint64_t)(((unsigned __int128)cap_bytes * 66) / 100);
+        #else
+            /* Fallback: Divide first to prevent overflow on Exabyte drives */
+            target_e = (cap_bytes / 100) * 33;
+            target_w = (cap_bytes / 100) * 66;
+        #endif
+
+        block_indices[0] = HN4_ALIGN_UP(target_e, current_bs) / current_bs;
+        block_indices[1] = HN4_ALIGN_UP(target_w, current_bs) / current_bs;
+        
         uint64_t s_off = _calc_south_offset(cap_bytes, current_bs);
         block_indices[2] = (s_off == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_off / current_bs);
 #endif
 
+        /* Scan Cardinal Points */
         for (int i = 0; i < 3; i++) {
             if (block_indices[i] == HN4_OFFSET_INVALID) continue;
 
             hn4_addr_t lba;
             if (_phys_lba_from_block(block_indices[i], current_bs, sector_sz, cap_bytes, &lba) != HN4_OK) continue;
 
-            if (_read_sb_at_lba(dev, lba, sector_sz, current_bs, probe_buf, &cand) == HN4_OK) {
+            if (_read_sb_at_lba(dev, lba, sector_sz, current_bs, (uint32_t)current_buf_sz, probe_buf, &cand) == HN4_OK) {
                 
+                /* Strict Geometry Match */
                 if (cand.info.block_size != current_bs) continue; 
 
-                /* --- CRITICAL: SPLIT BRAIN & TAMPER CHECK --- */
-               if (found_valid) {
+                /* -------------------------------------------------------------
+                 * CRITICAL: SPLIT BRAIN & TAMPER CHECK
+                 * ------------------------------------------------------------- */
+                if (found_valid) {
                     /* Check 1: UUID Mismatch (Alien Invasion) */
                     if (!hn4_uuid_equal(best_sb.info.volume_uuid, cand.info.volume_uuid)) {
+                        /* 
+                         * If UUIDs differ but Generations are identical, we have a fatal
+                         * identity collision or malicious tampering.
+                         */
                         if (best_sb.info.copy_generation == cand.info.copy_generation) {
                             HN4_LOG_CRIT("Tamper: Different UUIDs with same Generation");
                             final_res = HN4_ERR_TAMPERED;
                             found_valid = false;
                             goto cleanup;
                         }
+                        /* Else: Likely a previous format remnant. Ignore. */
+                        continue;
                     } 
-                    /* Check 2: Same UUID, Same Generation, Different Reality */
-                    else if (best_sb.info.copy_generation == cand.info.copy_generation) {
+                    
+                    /* Check 2: Same UUID, Same Generation, Different Metadata */
+                    if (best_sb.info.copy_generation == cand.info.copy_generation) {
                         /* 
                          * Strict Consistency Check.
-                         * If Generations are equal, Block Size and State/Time logic should align.
-                         * Allow small time jitter (<1s) for clock skew, but state divergence is fatal.
+                         * If Generations are equal, Block Size must match.
                          */
                         if (best_sb.info.block_size != cand.info.block_size) {
                             HN4_LOG_CRIT("Tamper: Same Gen, Different Block Size");
@@ -409,62 +451,66 @@ static hn4_result_t _execute_cardinal_vote(
                             found_valid = false;
                             goto cleanup;
                         }
-                        
-                        /* Check for Clean/Dirty Split Brain */
-                        bool best_clean = (best_sb.info.state_flags & HN4_VOL_CLEAN);
-                        bool cand_clean = (cand.info.state_flags & HN4_VOL_CLEAN);
-                        if (best_clean != cand_clean) {
-                            HN4_LOG_WARN("Split-Brain: Interrupted Unmount detected. Forcing DIRTY state.");
-                            // Clear CLEAN, set DIRTY on the "best" candidate to ensure recovery runs
-                            best_sb.info.state_flags &= ~HN4_VOL_CLEAN;
-                            best_sb.info.state_flags |= HN4_VOL_DIRTY;
-                        }
                     }
                 }
 
-                bool newer = false;
+                /* -------------------------------------------------------------
+                 * STATE MACHINE: BEST CANDIDATE SELECTION
+                 * ------------------------------------------------------------- */
+                bool is_better = false;
+                int64_t gen_diff = 0;
+                int64_t time_diff = 0;
+
                 if (!found_valid) {
-                    newer = true;
-                } 
-                /* 
-                 * Sequence Wrapping.
-                 * Use signed distance to handle u64 rollover correctly.
-                 * (int64_t)(A - B) > 0 implies A is newer than B.
-                 */
-                else if ((int64_t)(cand.info.copy_generation - max_gen) > 0) {
-                    /* 
-                    * Use Signed Difference.
-                    * Check if (Candidate - Max) < -Window.
-                    * This correctly handles cases where Max is skewed forward.
-                    */
-                    int64_t time_diff = (int64_t)(cand.info.last_mount_time - max_ts);
-                
-                if (time_diff < -(int64_t)HN4_REPLAY_WINDOW_NS) {
-                    
-                    /* Active Replay Protection */
-                    HN4_LOG_CRIT("SECURITY: Replay Attack Detected! Candidate is too old (%lld ns).", (long long)time_diff);
-                    continue; /* Reject this mirror */
+                    is_better = true;
                 } else {
-                    newer = true;
-                }
-            } else if (cand.info.copy_generation == max_gen) {
-    
-                /* Same generation: Check time divergence safely */
-                uint64_t t_cand = cand.info.last_mount_time;
-                uint64_t t_max  = max_ts;
-                uint64_t diff_abs = (t_cand > t_max) ? (t_cand - t_max) : (t_max - t_cand);
+                    gen_diff = (int64_t)(cand.info.copy_generation - max_gen);
+                    time_diff = (int64_t)(cand.info.last_mount_time - max_ts);
 
-                if (diff_abs > HN4_REPLAY_WINDOW_NS) {
-                    HN4_LOG_CRIT("Tamper: Same Gen, Time Divergence (%llu) > Window", (unsigned long long)diff_abs);
-                    final_res = HN4_ERR_TAMPERED;
-                    found_valid = false;
-                    goto cleanup;
+                    if (gen_diff > 0) {
+                        /* 
+                         * CASE A: NEWER GENERATION
+                         * SECURITY: Coherence Check.
+                         * A newer generation cannot travel back in time beyond the skew window.
+                         * Check: if (CandTime < MaxTime - Window) -> Replay/Attack
+                         */
+                        if (time_diff < -(int64_t)HN4_REPLAY_WINDOW_NS) {
+                            HN4_LOG_CRIT("SECURITY: Replay Attack! Gen %llu is > %llu, but Time is ancient.",
+                                (unsigned long long)cand.info.copy_generation, (unsigned long long)max_gen);
+                            continue; /* Reject this mirror */
+                        }
+                        is_better = true;
+                    } 
+                    else if (gen_diff == 0) {
+                        /* 
+                         * CASE B: SAME GENERATION
+                         * Consistency Check:
+                         * If generations match, timestamps must be reasonably close.
+                         * Large drift implies Split-Brain or Tampering.
+                         */
+                        if (time_diff > (int64_t)HN4_REPLAY_WINDOW_NS || 
+                            time_diff < -(int64_t)HN4_REPLAY_WINDOW_NS) 
+                        {
+                            HN4_LOG_CRIT("Tamper: Same Gen, Time Divergence (%lld) > Window", (long long)time_diff);
+                            final_res = HN4_ERR_TAMPERED;
+                            found_valid = false;
+                            goto cleanup;
+                        }
+
+                        /* If consistent, prefer the one with the later timestamp */
+                        if (time_diff > 0) is_better = true;
+                        
+                        /* Split-Brain Logic (Clean vs Dirty) */
+                        bool best_clean = (best_sb.info.state_flags & HN4_VOL_CLEAN);
+                        bool cand_clean = (cand.info.state_flags & HN4_VOL_CLEAN);
+                        
+                        /* If timestamps are close, prefer the DIRTY one (implies more recent activity) */
+                        if (!is_better && !cand_clean && best_clean) is_better = true;
+                    }
+                    /* Else (gen_diff < 0): Older generation, ignore. */
                 }
 
-                    if (cand.info.last_mount_time > max_ts) newer = true;
-                }
-
-                if (newer) {
+                if (is_better) {
                     memcpy(&best_sb, &cand, sizeof(cand));
                     max_gen = cand.info.copy_generation;
                     max_ts = cand.info.last_mount_time;
@@ -474,7 +520,9 @@ static hn4_result_t _execute_cardinal_vote(
         }
     }
 
-    /* 3. Healing Phase */
+    /* ---------------------------------------------------------------------
+     * STEP 3: HEALING PHASE (OPTIONAL)
+     * --------------------------------------------------------------------- */
     if (found_valid) {
         memcpy(out_sb, &best_sb, sizeof(best_sb));
         final_res = HN4_OK;
@@ -491,7 +539,7 @@ static hn4_result_t _execute_cardinal_vote(
             
             hn4_superblock_t* dsb = (hn4_superblock_t*)heal_buf;
             dsb->raw.sb_crc = 0; 
-            uint32_t crc = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
+            uint32_t crc = hn4_crc32(0, heal_buf, HN4_SB_SIZE - 4);
             dsb->raw.sb_crc = hn4_cpu_to_le32(crc);
 
             uint64_t targets[4];
@@ -502,6 +550,8 @@ static hn4_result_t _execute_cardinal_vote(
             targets[3] = (s_off == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_off / bs);
 
             for (int i = 0; i < 4; i++) {
+
+                if ((caps->hw_flags & HN4_HW_ZNS_NATIVE) && i > 0) continue;
                 if (i > 0 && targets[i] == HN4_OFFSET_INVALID) continue;
 
                 hn4_addr_t lba;
@@ -509,20 +559,21 @@ static hn4_result_t _execute_cardinal_vote(
 
                 bool needs_heal = false;
                 hn4_superblock_t check;
-                if (_read_sb_at_lba(dev, lba, sector_sz, bs, probe_buf, &check) != HN4_OK) {
+                if (_read_sb_at_lba(dev, lba, sector_sz, bs, (uint32_t)current_buf_sz, probe_buf, &check) != HN4_OK) {
                     needs_heal = true; 
                 } else {
-                    uint64_t t1 = (uint64_t)check.info.last_mount_time;
-                    uint64_t t2 = (uint64_t)best_sb.info.last_mount_time;
-                    uint64_t diff_abs;
-
-                    if (t1 > t2) diff_abs = t1 - t2;
-                    else diff_abs = t2 - t1;
-
+                    /* Compare Generational Distance */
                     if (check.info.copy_generation != best_sb.info.copy_generation) {
                         needs_heal = true;
-                    } else if (diff_abs > (HN4_REPLAY_WINDOW_NS * 10)) {
-                        needs_heal = true;
+                    } else {
+                        /* Compare Time Distance */
+                        uint64_t t1 = (uint64_t)check.info.last_mount_time;
+                        uint64_t t2 = (uint64_t)best_sb.info.last_mount_time;
+                        uint64_t diff_abs = (t1 > t2) ? (t1 - t2) : (t2 - t1);
+
+                        if (diff_abs > (HN4_REPLAY_WINDOW_NS * 10)) {
+                            needs_heal = true;
+                        }
                     }
                 }
 
@@ -537,20 +588,16 @@ static hn4_result_t _execute_cardinal_vote(
                         void* verify_buf = hn4_hal_mem_alloc(io_sz);
                         if (verify_buf) {
                             if (hn4_hal_sync_io(dev, HN4_IO_READ, lba, verify_buf, secs) == HN4_OK) {
-                                if (memcmp(heal_buf, verify_buf, HN4_SB_SIZE) != 0) {
-                                    HN4_LOG_CRIT("SB Heal Verification Failed @ LBA %llu", (unsigned long long)lba);
+                                if (memcmp(heal_buf, verify_buf, io_sz) != 0) {
+                                    HN4_LOG_CRIT("SB Heal Verification Failed @ LBA %llu", (unsigned long long)hn4_addr_to_u64(lba));
                                     heal_failures++;
                                 }
                             } else {
                                 heal_failures++;
                             }
-                            /* 
-                             * Memory is freed immediately in this scope. 
-                             * No 'goto' or 'return' exists inside this block to cause leaks.
-                             */
                             hn4_hal_mem_free(verify_buf);
                         } else {
-                            /* Allocation failed during heal verify - log but don't fail mount */
+                            /* Non-fatal allocation failure */
                             HN4_LOG_WARN("Could not allocate verify buffer. Skipping read-back.");
                         }
                     }
@@ -565,6 +612,7 @@ cleanup:
     if (heal_buf) hn4_hal_mem_free(heal_buf);
     return final_res;
 }
+
 
 
 
@@ -634,10 +682,17 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     
     /* South */
     uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
-    hn4_u128_t s_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
-    hn4_u128_t s_blk = hn4_u128_div_u64(s_sub, bs);
     
-    target_blocks[3] = (s_blk.hi > 0) ? HN4_OFFSET_INVALID : s_blk.lo;
+    hn4_u128_t min_req = hn4_u128_from_u64(sb_space * 16);
+    
+    if (hn4_u128_cmp(real_cap, min_req) < 0) {
+        target_blocks[3] = HN4_OFFSET_INVALID;
+    } else {
+        hn4_u128_t s_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
+        hn4_u128_t s_blk = hn4_u128_div_u64(s_sub, bs);
+        
+        target_blocks[3] = (s_blk.hi > 0) ? HN4_OFFSET_INVALID : s_blk.lo;
+    }
 
 #else
     target_blocks[1] = HN4_ALIGN_UP((cap / 100) * 33, bs) / bs;
@@ -739,12 +794,7 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
         return HN4_ERR_HW_IO;
     }
 
-    hn4_hal_mem_free(io_buf);
-
-    /* Update RAM struct on success */
-    if (vol->sb.info.state_flags & HN4_VOL_CLEAN) {
-        if (vol->health.taint_counter > 0) vol->health.taint_counter /= 2;
-    }
+     hn4_hal_mem_free(io_buf);
 
     vol->sb = dirty_sb;
     return HN4_OK;
@@ -790,14 +840,7 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     size_t armor_words = (size_t)armor_words_u64;
     size_t alloc_bytes = armor_words * struct_size;
 
-    /* Double check against heuristic limits */
-    if (alloc_bytes > (SIZE_MAX / 4)) {
-        HN4_LOG_CRIT("Mount Fail: Bitmap requires >25%% kernel RAM.");
-        return HN4_ERR_NOMEM;
-    }
-
-    /* If the bitmap takes > 25% of theoretical address space (e.g. 1GB on 32-bit), reject */
-    if (alloc_bytes > (SIZE_MAX / 4)) {
+     if (alloc_bytes > (SIZE_MAX / 4)) {
         HN4_LOG_CRIT("Mount Fail: Bitmap requires excessive kernel RAM (%zu bytes).", alloc_bytes);
         return HN4_ERR_NOMEM;
     }
@@ -809,8 +852,12 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     uint32_t chunk_blocks = (2 * 1024 * 1024) / bs; 
     if (chunk_blocks == 0) chunk_blocks = 1;
 
-    void* io_buf = hn4_hal_mem_alloc(chunk_blocks * bs);
+    if (chunk_blocks > (SIZE_MAX / bs)) {
+        hn4_hal_mem_free(vol->void_bitmap);
+        return HN4_ERR_NOMEM;
+    }
 
+    void* io_buf = hn4_hal_mem_alloc((size_t)chunk_blocks * bs);
     if (!io_buf) {
         hn4_hal_mem_free(vol->void_bitmap);
         vol->void_bitmap = NULL;
@@ -968,17 +1015,33 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
         region_bytes.hi = (uint64_t)(res >> 64) + (regions[i].hi * ss_64);
 #else
         /* Fallback: 64-bit split multiplication for systems without __int128 */
+        /* Formula: (A_hi<<32 + A_lo) * B = (A_hi*B)<<32 + (A_lo*B) */
+        
         uint64_t lo_val = regions[i].lo;
         uint64_t lo_lo = (lo_val & 0xFFFFFFFF);
         uint64_t lo_hi = (lo_val >> 32);
         
-        uint64_t p0 = lo_lo * ss_64;
-        uint64_t p1 = lo_hi * ss_64;
+        uint64_t p0 = lo_lo * ss_64; /* Low * B */
+        uint64_t p1 = lo_hi * ss_64; /* High * B */
         
+        /* 
+         * p1 contributes to both LO (via its lower 32 bits shifted up)
+         * and HI (via its upper 32 bits, and the shift overflow).
+         */
         region_bytes.lo = p0 + (p1 << 32);
-        /* Carry logic: High part of p1 + Existing High + Carry from Lo addition */
-        region_bytes.hi = (regions[i].hi * ss_64) + (p1 >> 32) + 
-                          ((region_bytes.lo < p0) ? 1 : 0);
+        
+        /* 
+         * High Part Summation:
+         * 1. regions[i].hi * ss (The full 128-bit high part expansion)
+         * 2. p1 >> 32 (The overflow from the Low-High multiplication)
+         * 3. Carry from the p0 + (p1<<32) addition
+         */
+        region_bytes.hi = (regions[i].hi * ss_64) + (p1 >> 32);
+        
+        /* Add carry if the Low addition wrapped */
+        if (region_bytes.lo < p0) {
+            region_bytes.hi++;
+        }
 #endif
 
         if (hn4_u128_cmp(region_bytes, cap_bytes) >= 0) return HN4_ERR_GEOMETRY;
@@ -1074,7 +1137,7 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
      * 0x55 indicates "Unknown/Suspicious", forcing careful handling 
      * without immediately bricking access like TOXIC would.
      */
-    memset(vol->quality_mask, 0x55, alloc_sz);
+    memset(vol->quality_mask, 0xAA, alloc_sz);
 
     /* 2. Calculate Disk Extents */
    uint64_t start_sect, end_sect;
@@ -1252,6 +1315,11 @@ static hn4_result_t _load_topology_resources(
             goto Fail;
         }
 
+        if ((UINT64_MAX - start) < len) {
+            HN4_LOG_WARN("AI Topo: Region %u length overflows 64-bit space", i);
+            goto Fail;
+        }
+
         watermark_end = start + len;
     }
     
@@ -1304,9 +1372,12 @@ static hn4_result_t _verify_and_heal_root_anchor(
     /* 2. Read Root Anchor Candidate */
 
     /* 
-     * In ZNS mode, bs is ~1.7GB. We only need the first sector to check the Root Anchor.
+     * In ZNS mode, bs might be huge (e.g. Zone Size). 
+     * We only need the first sector to check the Root Anchor.
+     * Optimization: Clamp allocation to 64KB max, or block size if smaller.
      */
     uint32_t alloc_sz = (bs > 65536) ? 65536 : bs;
+    
     // Ensure we allocate at least one sector
     if (alloc_sz < ss) alloc_sz = ss;
 
@@ -1326,18 +1397,13 @@ static hn4_result_t _verify_and_heal_root_anchor(
     
     /* 3. Validation Logic */
     
-    /* Step A: Check CRC first (Integrity) */
-    uint32_t stored_crc = hn4_le32_to_cpu(root->checksum);
+     uint32_t stored_crc = hn4_le32_to_cpu(root->checksum);
     
-    /* 
-     * Explicitly zero for calculation, then restore from the 
-     * endian-normalized value converted back to LE.
-     */
-    root->checksum = 0;
+    hn4_anchor_t shadow;
+    memcpy(&shadow, root, sizeof(hn4_anchor_t));
+    shadow.checksum = 0;
     
-    uint32_t calc_crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
-    
-    root->checksum = hn4_cpu_to_le32(stored_crc); /* Restore */
+    uint32_t calc_crc = hn4_crc32(0, &shadow, sizeof(hn4_anchor_t));
     
     bool crc_ok = (calc_crc == stored_crc);
     
@@ -1350,6 +1416,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
         }
         
         uint64_t dclass = hn4_le64_to_cpu(root->data_class);
+        
         /* Check for VALID flag AND STATIC class */
         if (!(dclass & HN4_FLAG_VALID) || ((dclass & HN4_CLASS_VOL_MASK) != HN4_VOL_STATIC)) {
             semantics_ok = false;
@@ -1358,7 +1425,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
         if (!semantics_ok) {
             /* 
              * Integrity OK, but Semantics Bad -> Intentional Tombstone or Config Mismatch.
-             * DO NOT HEAL.
+             * DO NOT HEAL. This implies the volume was formatted but the root was deleted or overwritten.
              */
             HN4_LOG_CRIT("Root Anchor Semantically Invalid (CRC OK). Mount Denied.");
             hn4_hal_mem_free(io_buf);
@@ -1379,9 +1446,11 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     HN4_LOG_WARN("Healing Root Anchor (Genesis Repair)...");
 
-    memset(io_buf, 0, sizeof(hn4_anchor_t));
+    /* Re-initialize buffer with clean state */
+    memset(io_buf, 0, alloc_sz);
     root = (hn4_anchor_t*)io_buf;
 
+    /* Restore Standard Root Values */
     root->seed_id.lo = 0xFFFFFFFFFFFFFFFFULL;
     root->seed_id.hi = 0xFFFFFFFFFFFFFFFFULL;
     root->public_id  = root->seed_id;
@@ -1402,10 +1471,10 @@ static hn4_result_t _verify_and_heal_root_anchor(
     strncpy((char*)root->inline_buffer, "ROOT", sizeof(root->inline_buffer)-1);
 
     /* Recalculate CRC (Standard Mode: Header + Inline Buffer) */
-        root->checksum = 0;
-        uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
-        
-        root->checksum = hn4_cpu_to_le32(crc);
+    root->checksum = 0;
+    uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
+    
+    root->checksum = hn4_cpu_to_le32(crc);
 
     /* Commit Repair */
     res = hn4_hal_sync_io(dev, HN4_IO_WRITE, cortex_lba, io_buf, sector_count);
@@ -1421,6 +1490,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
                     HN4_LOG_CRIT("Root Anchor Repair Failed: Verification Mismatch");
                     res = HN4_ERR_HW_IO;
                 } else {
+                     /* Mark Volume Degraded to indicate repair occurred */
                      vol->sb.info.state_flags |= HN4_VOL_DEGRADED; 
                 }
             } else {
@@ -1671,7 +1741,15 @@ static hn4_result_t _load_cortex_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     vol->cortex_size = size_bytes;
 
     /* Bulk Read */
-    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, end_sect - start_sect);
+     uint64_t sect_cnt_64 = end_sect - start_sect;
+    if (sect_cnt_64 > UINT32_MAX) {
+        HN4_LOG_WARN("Cortex too large for single IO. Synapse VFS disabled.");
+        hn4_hal_mem_free(vol->nano_cortex);
+        vol->nano_cortex = NULL;
+        return HN4_OK;
+    }
+
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, (uint32_t)sect_cnt_64);
     
     if (res != HN4_OK) {
         hn4_hal_mem_free(vol->nano_cortex);

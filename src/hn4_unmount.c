@@ -24,15 +24,6 @@
  * INTERNAL HELPERS
  * ========================================================================= */
 
-/* IO wrapper */
-static inline hn4_addr_t _addr_from_sector(uint64_t sect_idx) {
-#ifdef HN4_USE_128BIT
-    hn4_addr_t a = { .lo = sect_idx, .hi = 0 }; return a;
-#else
-    return sect_idx;
-#endif
-}
-
 /* 
  * Helper to safely free and nullify pointers during teardown.
  * Performs secure zeroing if requested (for bitmaps/keys).
@@ -301,7 +292,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     if (!vol->read_only) {
         
         /* 1.1 Data Flush (FUA) */
-        tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, _addr_from_sector(0), NULL, 0);
+        tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_lba_from_sectors(0), NULL, 0);
         if (tmp_res != HN4_OK) {
             HN4_LOG_ERR("Data Flush Failed: %d", tmp_res);
             persistence_ok = false;
@@ -382,6 +373,13 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                 }
 
                 /* B. Quality Mask Persistence */
+
+                if (persistence_ok && vol->void_bitmap) {
+                    if (hn4_hal_barrier(dev) != HN4_OK) {
+                        persistence_ok = false;
+                        final_res = HN4_ERR_HW_IO;
+                    }
+                }
                 if (persistence_ok && vol->quality_mask) {
                     uint64_t start_lba_val = hn4_addr_to_u64(vol->sb.info.lba_qmask_start);
                     size_t total_bytes = vol->qmask_size;
@@ -462,7 +460,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         
         /* 1.4 Final Barrier & Revert Logic */
         if (persistence_ok) {
-            tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, _addr_from_sector(0), NULL, 0);
+            tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_lba_from_sectors(0), NULL, 0);
             
             if (tmp_res != HN4_OK) {
                 HN4_LOG_CRIT("Final Flush Failed! Reverting to DEGRADED.");
