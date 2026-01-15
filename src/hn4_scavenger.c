@@ -29,6 +29,11 @@
 #include <string.h>
 #include <stdatomic.h>
 
+/* =========================================================================
+ * AUDIT STATE (FILE SCOPE)
+ * ========================================================================= */
+static uint64_t _audit_region_cursor = 0;
+#define HN4_AUDIT_REGION_SIZE (1ULL * 1024 * 1024 * 1024) /* 1 GB */
 
 /* =========================================================================
  * CONFIGURATION & THRESHOLDS
@@ -40,6 +45,9 @@
 #define HN4_BONE_DENSITY_CRITICAL   8                                 /* K-depth considered "Brittle" */
 #define HN4_STREAM_SKIP_DIST        1024                              /* Hyper-Stream Interval */
 #define HN4_ZNS_VICTIM_THRESHOLD    80                                /* % Invalid before Zone Reset */
+#define HN4_DELTA_TABLE_SIZE 1024 
+#define HN4_DELTA_PROBE_LIMIT 32 /* Limit linear probing */
+
 
 /* =========================================================================
  * DELTA TABLE (ZERO-LOCK MIGRATION)
@@ -51,13 +59,13 @@
  */
 #define HN4_DELTA_TABLE_SIZE 1024 
 
-typedef struct {
-    _Atomic uint64_t old_lba; /* Key */
-    _Atomic uint64_t new_lba; /* Value */
-    _Atomic uint32_t version;
-} hn4_delta_entry_t;
 
-static hn4_delta_entry_t _delta_table[HN4_DELTA_TABLE_SIZE];
+static inline uint64_t _delta_hash(uint64_t key) {
+    key ^= (key >> 33);
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= (key >> 33);
+    return key;
+}
 
 void hn4_scavenger_init_delta_table(void) {
     for (int i = 0; i < HN4_DELTA_TABLE_SIZE; i++) {
@@ -68,56 +76,78 @@ void hn4_scavenger_init_delta_table(void) {
 }
 
 /* Called by Reader (Hot Path) */
-uint64_t hn4_scavenger_lookup_delta(uint64_t logical_lba, uint32_t req_version) {
-    uint64_t idx = logical_lba & (HN4_DELTA_TABLE_SIZE - 1);
+uint64_t hn4_scavenger_lookup_delta(hn4_volume_t* vol, uint64_t logical_lba, uint32_t req_version, uint64_t req_seed_hash) {
+    uint64_t start_idx = _delta_hash(logical_lba) & (HN4_DELTA_TABLE_SIZE - 1);
 
-    /* Load Key first (Acquire) */
-    uint64_t key = atomic_load_explicit(&_delta_table[idx].old_lba, memory_order_acquire);
+    for (int i = 0; i < HN4_DELTA_PROBE_LIMIT; i++) {
+        uint64_t idx = (start_idx + (i * i)) & (HN4_DELTA_TABLE_SIZE - 1);
 
-    if (key == logical_lba) {
-        /* Check Version */
-        uint32_t ver = atomic_load_explicit(&_delta_table[idx].version, memory_order_relaxed);
-        if (ver == req_version) {
-            return atomic_load_explicit(&_delta_table[idx].new_lba, memory_order_relaxed);
+        uint64_t key = atomic_load_explicit(&vol->redirect.delta_table[idx].old_lba, memory_order_acquire);
+
+        if (key == logical_lba) {
+            uint64_t seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
+            
+            if (seed == req_seed_hash) {
+                uint32_t ver = atomic_load_explicit(&vol->redirect.delta_table[idx].version, memory_order_relaxed);
+                
+                if (ver == req_version) {
+                    /* Payload */
+                    return atomic_load_explicit(&vol->redirect.delta_table[idx].new_lba, memory_order_relaxed);
+                }
+            }
+            return 0;
         }
+        
+        if (key == 0) return 0;
     }
     return 0;
 }
 
-/* Called by Scavenger */
-static void _register_delta(uint64_t old_lba, uint64_t new_lba, uint32_t version) {
-    uint64_t idx = old_lba & (HN4_DELTA_TABLE_SIZE - 1);
 
-    uint64_t existing = atomic_load_explicit(&_delta_table[idx].old_lba, memory_order_acquire);
-    if (existing != 0 && existing != old_lba) return;
 
-    /* Store Value & Version */
-    atomic_store_explicit(&_delta_table[idx].new_lba, new_lba, memory_order_release);
-    atomic_store_explicit(&_delta_table[idx].version, version, memory_order_release);
+static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba, uint32_t version, uint64_t seed_hash) {
+    uint64_t start_idx = _delta_hash(old_lba) & (HN4_DELTA_TABLE_SIZE - 1);
 
-    /* Publish Key */
-    atomic_store_explicit(&_delta_table[idx].old_lba, old_lba, memory_order_release);
+    for (int i = 0; i < HN4_DELTA_PROBE_LIMIT; i++) {
+        uint64_t idx = (start_idx + (i * i)) & (HN4_DELTA_TABLE_SIZE - 1);
+        
+        uint64_t existing_key = atomic_load_explicit(&vol->redirect.delta_table[idx].old_lba, memory_order_acquire);
+        uint64_t existing_seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
+        
+        if (existing_key == 0 || (existing_key == old_lba && existing_seed == seed_hash)) {
+            
+            atomic_store_explicit(&vol->redirect.delta_table[idx].new_lba, new_lba, memory_order_relaxed);
+            atomic_store_explicit(&vol->redirect.delta_table[idx].version, version, memory_order_relaxed);
+            atomic_store_explicit(&vol->redirect.delta_table[idx].seed_hash, seed_hash, memory_order_relaxed);
+            atomic_fetch_add_explicit(&vol->redirect.delta_table[idx].slot_epoch, 1, memory_order_relaxed);
+            atomic_thread_fence(memory_order_release);
+            atomic_store_explicit(&vol->redirect.delta_table[idx].old_lba, old_lba, memory_order_release);
+            return 0; 
+        }
+    }
+    return -1; 
 }
 
-static void _clear_delta(uint64_t old_lba) {
-    uint64_t idx = old_lba & (HN4_DELTA_TABLE_SIZE - 1);
 
-    /* Check if the slot actually belongs to us before wiping */
-    uint64_t key = atomic_load(&_delta_table[idx].old_lba);
 
-    if (key == old_lba) {
-        /* 
-         * ORDERING:
-         * 1. Clear Key (old_lba) with RELEASE. 
-         *    This immediately invalidates the lookup for readers.
-         * 2. Clear Payload (new_lba, version) with RELAXED.
-         *    Once the key is gone, these are unreachable garbage.
-         */
-        atomic_store_explicit(&_delta_table[idx].old_lba, 0, memory_order_release);
+static void _clear_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t seed_hash) {
+    uint64_t start_idx = _delta_hash(old_lba) & (HN4_DELTA_TABLE_SIZE - 1);
 
-        /* Wipe payload to prevent ABA/Ghost leaks on reuse */
-        atomic_store_explicit(&_delta_table[idx].new_lba, 0, memory_order_relaxed);
-        atomic_store_explicit(&_delta_table[idx].version, 0, memory_order_relaxed);
+    for (int i = 0; i < HN4_DELTA_PROBE_LIMIT; i++) {
+        uint64_t idx = (start_idx + (i * i)) & (HN4_DELTA_TABLE_SIZE - 1);
+        uint64_t key = atomic_load(&vol->redirect.delta_table[idx].old_lba);
+
+        if (key == old_lba) {
+            uint64_t seed = atomic_load(&vol->redirect.delta_table[idx].seed_hash);
+            if (seed == seed_hash) {
+                atomic_store_explicit(&vol->redirect.delta_table[idx].old_lba, 0, memory_order_release);
+                atomic_store_explicit(&vol->redirect.delta_table[idx].new_lba, 0, memory_order_relaxed);
+                atomic_store_explicit(&vol->redirect.delta_table[idx].version, 0, memory_order_relaxed);
+                atomic_store_explicit(&vol->redirect.delta_table[idx].seed_hash, 0, memory_order_relaxed);
+                return;
+            }
+        }
+        if (key == 0) return;
     }
 }
 
@@ -257,129 +287,68 @@ static hn4_result_t _reap_tombstone(
     HN4_IN hn4_volume_t* vol,
     HN4_INOUT hn4_anchor_t* anchor,
     HN4_IN hn4_time_t now,
-    HN4_INOUT _reaper_batch_t* batch
+    HN4_INOUT _reaper_batch_t* unused_batch 
 )
 {
-    /* 1. Validation & Grace Period Check */
+    _reaper_batch_t local_batch;
+    local_batch.count = 0;
+    local_batch.block_size = vol->vol_block_size;
+    void* vbuf = NULL;
+    hn4_result_t res = HN4_OK;
+
+    uint32_t start_gen = hn4_le32_to_cpu(anchor->write_gen);
     uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
     
     if (!(dclass & HN4_FLAG_TOMBSTONE) || !(dclass & HN4_FLAG_VALID)) return HN4_OK; 
 
+    if (dclass & HN4_FLAG_PINNED) return HN4_OK;
+
     hn4_time_t death_time = (hn4_time_t)hn4_le64_to_cpu(anchor->mod_clock);
-    
-    /* Ignore if not yet decayed */
     if ((now - death_time) < HN4_REAPER_GRACE_NS) return HN4_OK; 
 
-    /* 
-     * 2. Batch Policy Enforcement
-     * Check if the current file requires Secure Shredding.
-     * If the batch already contains items with a DIFFERENT policy, flush it now.
-     * We cannot mix TRIM and OVERWRITE in the same batch context.
-     */
-    bool needs_shred = (dclass & HN4_FLAG_SHRED) ? true : false;
-
-    if (batch->count > 0 && batch->secure_shred != needs_shred) {
-        _reaper_flush(vol->target_device, batch, vol);
-    }
-    batch->secure_shred = needs_shred;
-
-    /* 
-     * 3. Resource Allocation (Fail-Safe)
-     * We need a buffer to verify block ownership before freeing.
-     * If we can't allocate this, we must abort BEFORE destroying the anchor
-     * to prevent block leaks (Orphaned blocks with no Anchor).
-     */
+    local_batch.secure_shred = (dclass & HN4_FLAG_SHRED) ? true : false;
     uint32_t bs = vol->vol_block_size;
-    void* vbuf = hn4_hal_mem_alloc(bs);
+    vbuf = hn4_hal_mem_alloc(bs);
     if (!vbuf) return HN4_ERR_NOMEM;
 
-    /* 
-     * 4. Snapshot Metadata (The "Will")
-     * Save the geometry parameters to the stack so we can calculate
-     * block locations after the Anchor is destroyed.
-     */
+    /* Snapshot Metadata */
     hn4_anchor_t saved_anchor;
     memcpy(&saved_anchor, anchor, sizeof(hn4_anchor_t));
 
-    /* 
-     * 5. ATOMIC DESTRUCTION (The Commit)
-     */
+    /* 5. ATOMIC DESTRUCTION */
+    hn4_anchor_t dead_anchor;
+    memset(&dead_anchor, 0, sizeof(hn4_anchor_t));
+    dead_anchor.seed_id = saved_anchor.seed_id; 
 
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size;
-
-    uintptr_t base_addr = (uintptr_t)vol->nano_cortex;
-    uintptr_t curr_addr = (uintptr_t)anchor;
+    dead_anchor.write_gen = anchor->write_gen; 
     
-    if (curr_addr < base_addr || curr_addr >= base_addr + vol->cortex_size) {
-        hn4_hal_mem_free(vbuf);
-        return HN4_ERR_INTERNAL_FAULT;
-    }
+    res = hn4_write_anchor_atomic(vol, &dead_anchor);
 
-    uint64_t offset_bytes = (uint64_t)(curr_addr - base_addr);
-    
-    /* Calculate physical LBA for the sector containing this anchor */
-    hn4_addr_t write_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, offset_bytes / ss);
-    uint32_t offset_in_sector = offset_bytes % ss;
-
-    /* 
-     * Read-Modify-Write the sector to zero out ONLY this anchor.
-     * We cannot use hn4_write_anchor_atomic because we are zeroing the ID,
-     * which would hash to the wrong slot if we used the standard API.
-     */
-    void* sector_buf = hn4_hal_mem_alloc(ss);
-    if (!sector_buf) {
-        hn4_hal_mem_free(vbuf);
-        return HN4_ERR_NOMEM;
-    }
-
-    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, sector_buf, 1) != HN4_OK) {
-        hn4_hal_mem_free(vbuf);
-        hn4_hal_mem_free(sector_buf);
-        return HN4_ERR_HW_IO;
-    }
-
-    /* Zero the anchor in the sector buffer */
-    memset((uint8_t*)sector_buf + offset_in_sector, 0, sizeof(hn4_anchor_t));
-
-    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, sector_buf, 1);
-
-   if (res == HN4_OK) {
-
-    hn4_result_t b_res = hn4_hal_barrier(vol->target_device);
-    if (b_res != HN4_OK) {
-        res = b_res;
-        } else {
-            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+    if (res == HN4_OK) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        /* Guard against resurrection race */
+        if (hn4_le32_to_cpu(anchor->write_gen) == start_gen) {
             _secure_zero(anchor, sizeof(hn4_anchor_t));
-            hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        } else {
+            res = HN4_ERR_GENERATION_SKEW;
         }
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
     }
-
-    hn4_hal_mem_free(sector_buf);
 
     if (res != HN4_OK) {
         hn4_hal_mem_free(vbuf);
         return res;
     }
 
-    /* 6. EXECUTE SCAVENGING (The Cleanup) */
-    /* Safe to proceed: Anchor is dead on NAND. */
+    /* 6. EXECUTE SCAVENGING */
     uint64_t saved_dclass = hn4_le64_to_cpu(saved_anchor.data_class);
-
-    /* Nano Object Handling */
     if (saved_dclass & HN4_FLAG_NANO) {
-        /* 
-         * Nano objects reside in Cortex slots or inline buffers.
-         * By zeroing the anchor (Step 5), we have effectively freed the storage.
-         * The Cortex Allocator treats zeroed slots as free space.
-         * No bitmap manipulation required.
-         */
         hn4_hal_mem_free(vbuf);
         return HN4_OK;
     } 
     
-    /* Standard / Horizon Object Handling */
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
     uint32_t sectors_per_blk = bs / ss;
     uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
     
@@ -390,54 +359,49 @@ static hn4_result_t _reap_tombstone(
     uint64_t V = 0; 
     memcpy(&V, saved_anchor.orbit_vector, 6); 
     V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
-    
     uint16_t M = hn4_le16_to_cpu(saved_anchor.fractal_scale);
     hn4_u128_t target_id = hn4_le128_to_cpu(saved_anchor.seed_id);
-    
-    bool is_horizon = (saved_dclass & HN4_HINT_HORIZON);
+    uint64_t target_gen  = (uint64_t)start_gen; 
+    uint64_t seed_hash = target_id.lo ^ target_id.hi; 
 
-    /* Re-run the trajectory logic using the SNAPSHOT */
     for (uint64_t n = 0; n < blocks_needed; n++) {
         uint64_t found_lba = UINT64_MAX;
 
-        if (is_horizon) {
-            /* D1.5 Linear Scan */
-            uint64_t stride = (1ULL << M);
-            found_lba = G + (n * stride); 
-            
-            /* Verify ownership before freeing (Safety against corruption) */
+        if (saved_dclass & HN4_HINT_HORIZON) {
+            found_lba = G + n; 
             bool is_set;
+
             if (_bitmap_op(vol, found_lba, BIT_TEST, &is_set) != HN4_OK || !is_set) {
                 found_lba = UINT64_MAX;
             } else {
+
                 hn4_addr_t phys = hn4_lba_from_blocks(found_lba * sectors_per_blk);
                 if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, vbuf, sectors_per_blk) == HN4_OK) {
                     hn4_block_header_t* h = (hn4_block_header_t*)vbuf;
                     hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
-                    if (disk_id.lo != target_id.lo || disk_id.hi != target_id.hi) {
-                        found_lba = UINT64_MAX; /* ID Mismatch - Do not free */
+                    uint64_t disk_gen = hn4_le64_to_cpu(h->generation);
+                    if (disk_id.lo != target_id.lo || disk_id.hi != target_id.hi || disk_gen != target_gen) {
+                        found_lba = UINT64_MAX; 
                     }
                 } else {
-                    found_lba = UINT64_MAX; /* Read Error */
+                    found_lba = UINT64_MAX; 
                 }
             }
         } else {
-            /* D1 Ballistic Scan (k=0..12) */
+            /* Ballistic Scan */
             for (uint8_t k=0; k<12; k++) {
                 uint64_t candidate = _calc_trajectory_lba(vol, G, V, n, M, k);
                 if (candidate == UINT64_MAX) continue;
-                
                 bool is_set;
-                _bitmap_op(vol, candidate, BIT_TEST, &is_set);
-                if (is_set) {
-                    /* Ownership Verify */
+                if (_bitmap_op(vol, candidate, BIT_TEST, &is_set) == HN4_OK && is_set) {
                     hn4_addr_t phys = hn4_lba_from_blocks(candidate * sectors_per_blk);
                     if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, vbuf, sectors_per_blk) == HN4_OK) {
                         hn4_block_header_t* h = (hn4_block_header_t*)vbuf;
                         hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
-                        if (disk_id.lo == target_id.lo && disk_id.hi == target_id.hi) {
+                        uint64_t disk_gen = hn4_le64_to_cpu(h->generation);
+                        if (disk_id.lo == target_id.lo && disk_id.hi == target_id.hi && disk_gen == target_gen) {
                             found_lba = candidate;
-                            break; /* Found the block for 'n', stop searching k */
+                            break; 
                         }
                     }
                 }
@@ -445,20 +409,32 @@ static hn4_result_t _reap_tombstone(
         }
 
         if (found_lba != UINT64_MAX) {
-            #ifdef HN4_USE_128BIT
-                hn4_u128_t f_blk = hn4_u128_from_u64(found_lba);
-                hn4_addr_t p_sec = hn4_u128_mul_u64(f_blk, sectors_per_blk);
-                _reaper_add(vol, batch, p_sec); 
-            #else
-                _reaper_add(vol, batch, found_lba * sectors_per_blk);
-            #endif
-            }
+
+            if (hn4_scavenger_lookup_delta(vol, found_lba, start_gen, seed_hash) != 0) continue; 
+            
+            _reaper_add(vol, &local_batch, hn4_lba_from_blocks(found_lba * sectors_per_blk));
+        }
+    }
+
+    bool safe_to_flush = false;
+    
+    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+    /* Anchor should be zeroed (data_class == 0) if Step 5 succeeded. */
+    if (hn4_le64_to_cpu(anchor->data_class) == 0) {
+        safe_to_flush = true;
+    }
+    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+    if (safe_to_flush) {
+        _reaper_flush(vol->target_device, &local_batch, vol);
+    } else {
+        local_batch.count = 0; 
+        res = HN4_ERR_GENERATION_SKEW;
     }
 
     hn4_hal_mem_free(vbuf);
-    return HN4_OK;
+    return res;
 }
-
 
 /* =========================================================================
  * TASK 2: THE EVACUATOR (ZNS ZONE PACKING)
@@ -480,7 +456,6 @@ static void _evacuate_zns_victim(
     HN4_IN uint64_t zone_len_bytes
 )
 {
-    /* 1. Geometry Setup */
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t ss = caps->logical_block_size;
     uint32_t bs = vol->vol_block_size;
@@ -490,12 +465,6 @@ static void _evacuate_zns_victim(
     void* io_buf = hn4_hal_mem_alloc(bs);
     if (!io_buf) return;
 
-    /* 
-     * COUNTER REFACTOR (Issue 4):
-     * 'valid_count' tracks blocks that MUST be moved.
-     * 'evacuated_count' tracks blocks successfully moved.
-     * We increment valid_count ONLY when we are committed to moving.
-     */
     uint64_t valid_count = 0;
     uint64_t evacuated_count = 0;
 
@@ -507,14 +476,10 @@ static void _evacuate_zns_victim(
         uint64_t global_blk_idx = phys_sector / sectors_per_blk;
 
         bool is_set;
-        if (_bitmap_op(vol, global_blk_idx, BIT_TEST, &is_set) != HN4_OK || !is_set) {
-            continue;
-        }
+        if (_bitmap_op(vol, global_blk_idx, BIT_TEST, &is_set) != HN4_OK || !is_set) continue;
 
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, hn4_lba_from_sectors(phys_sector), io_buf, sectors_per_blk) != HN4_OK) {
-            HN4_LOG_CRIT("ZNS Evacuator: Read Error @ %llu. Aborting.", (unsigned long long)phys_sector);
-            hn4_hal_mem_free(io_buf);
-            return;
+            continue; 
         }
 
         hn4_block_header_t* hdr = (hn4_block_header_t*)io_buf;
@@ -522,114 +487,82 @@ static void _evacuate_zns_victim(
 
         hn4_u128_t block_id = hn4_le128_to_cpu(hdr->well_id);
         uint64_t block_gen = hn4_le64_to_cpu(hdr->generation);
-        hn4_anchor_t* owner_anchor = NULL;
+        
+        hn4_anchor_t owner_copy; 
+        hn4_anchor_t* owner_ptr = NULL; 
+        bool found = false;
 
         if (vol->nano_cortex) {
+            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
             size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
             hn4_anchor_t* arr = (hn4_anchor_t*)vol->nano_cortex;
             for (size_t k = 0; k < count; k++) {
                 hn4_u128_t seed = hn4_le128_to_cpu(arr[k].seed_id);
                 if (seed.lo == block_id.lo && seed.hi == block_id.hi) {
-                    owner_anchor = &arr[k];
+                    memcpy(&owner_copy, &arr[k], sizeof(hn4_anchor_t));
+                    owner_ptr = &arr[k];
+                    found = true;
                     break;
                 }
             }
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
         }
 
-        if (owner_anchor) {
-            uint32_t anchor_gen = hn4_le32_to_cpu(owner_anchor->write_gen);
-
-            if ((uint32_t)block_gen != anchor_gen) continue; /* Stale */
+        if (found) {
+            uint32_t anchor_gen = hn4_le32_to_cpu(owner_copy.write_gen);
+            if ((uint32_t)block_gen != anchor_gen) continue; 
 
             uint64_t logic_seq = hn4_le64_to_cpu(hdr->seq_index);
-            uint64_t mass = hn4_le64_to_cpu(owner_anchor->mass);
+            uint64_t mass = hn4_le64_to_cpu(owner_copy.mass);
             uint32_t max_payload = HN4_BLOCK_PayloadSize(bs);
-            uint64_t file_offset = logic_seq * max_payload;
             uint32_t move_len = max_payload;
+            uint64_t file_offset = logic_seq * max_payload;
 
-            if (file_offset >= mass) continue; /* EOF Ghost */
+            if (file_offset >= mass) continue;
+            if (file_offset + max_payload > mass) move_len = (uint32_t)(mass - file_offset);
 
-            if (file_offset + max_payload > mass) {
-                move_len = (uint32_t)(mass - file_offset);
-            }
-
-            /* 
-             * COMMIT POINT:
-             * Only now do we increment the requirement counter.
-             */
             valid_count++;
 
-            uint64_t dclass = hn4_le64_to_cpu(owner_anchor->data_class);
-            
+            uint64_t dclass = hn4_le64_to_cpu(owner_copy.data_class);
             hn4_anchor_t shadow_anchor;
-            memcpy(&shadow_anchor, owner_anchor, sizeof(hn4_anchor_t));
+            memcpy(&shadow_anchor, &owner_copy, sizeof(hn4_anchor_t));
 
-            /* Prepare shadow for Horizon destination (D1.5) */
             if (!(dclass & HN4_HINT_HORIZON)) {
                 dclass |= HN4_HINT_HORIZON;
                 shadow_anchor.gravity_center = 0; 
                 shadow_anchor.data_class = hn4_cpu_to_le64(dclass);
             }
 
-            /* Perform write using the SHADOW anchor so live physics remain valid */
             if (hn4_write_block_atomic(vol, &shadow_anchor, logic_seq, hdr->payload, move_len) == HN4_OK) {
-    
-                /* Persist to disk first */
-                hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, &shadow_anchor);
-        
-                if (anchor_res == HN4_OK) {
-                    /* ATOMIC VERIFICATION */
+                if (hn4_write_anchor_atomic(vol, &shadow_anchor) == HN4_OK) {
                     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-                    
-                    /* Check if user updated the file while we were moving blocks */
-                    uint32_t current_gen = hn4_le32_to_cpu(owner_anchor->write_gen);
-                    if (current_gen == anchor_gen) {
-                        /* Safe to commit */
-                        memcpy(owner_anchor, &shadow_anchor, sizeof(hn4_anchor_t));
+
+                    if (owner_ptr && hn4_le32_to_cpu(owner_ptr->write_gen) == anchor_gen && 
+                        owner_ptr->seed_id.lo == block_id.lo && 
+                        owner_ptr->seed_id.hi == block_id.hi) {
+                        memcpy(owner_ptr, &shadow_anchor, sizeof(hn4_anchor_t));
                         evacuated_count++;
                     } else {
-                        /* Race detected: User wrote to file. Abort this move. */
-                        HN4_LOG_WARN("ZNS Evacuator: Race detected on Anchor. Aborting move.");
-                        /* Note: We leak the space written to the new zone, but data safety is preserved */
+                        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
                     }
-                    
                     hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                } else {
-                HN4_LOG_CRIT("ZNS Evacuator: Anchor persistence failed. Abort.");
-                hn4_hal_mem_free(io_buf);
-                return;
-            }
-        }else {
-                HN4_LOG_ERR("ZNS Evacuator: Move failed for block %llu.", (unsigned long long)logic_seq);
-                hn4_hal_mem_free(io_buf);
-                return; /* Hard abort on write failure */
-            }
-        } else {
-            HN4_LOG_WARN("ZNS Evacuator: Orphan Block %llu. Skipping Zone.", (unsigned long long)global_blk_idx);
-            continue; /* Skip to next block, do not abort */
+                } 
+            } 
         }
     }
 
     hn4_hal_mem_free(io_buf);
 
-    if (evacuated_count == valid_count) {
-
-        HN4_LOG_VAL("ZNS Evacuation Complete. Resetting Zone LBA", zone_start_lba);
-
-        uint32_t zone_sectors = zone_len_bytes / ss;
+    if (evacuated_count == valid_count && valid_count > 0) {
         hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_ZONE_RESET,
-                                           hn4_lba_from_sectors(zone_start_lba),
-                                           NULL,
-                                           zone_sectors);
-
+                                           hn4_lba_from_sectors(zone_start_lba), NULL, 0);
         if (res == HN4_OK) {
             if (hn4_hal_barrier(vol->target_device) == HN4_OK) {
                 for (uint64_t i = 0; i < blocks_in_zone; i++) {
                     uint64_t global_blk = (zone_start_lba / sectors_per_blk) + i;
-                    _bitmap_op(vol, global_blk, BIT_FORCE_CLEAR, NULL);
+                    _bitmap_op(vol, global_blk, BIT_CLEAR, NULL);
                 }
             } else {
-                HN4_LOG_CRIT("ZNS Evacuator: Barrier failed after Reset!");
                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
             }
         }
@@ -706,6 +639,24 @@ static void _medic_queue_push(hn4_volume_t* vol, uint32_t anchor_idx, uint32_t s
     hn4_hal_spinlock_release(&q->lock);
 }
 
+static void _rollback_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t seed_hash) {
+    uint64_t start_idx = _delta_hash(old_lba) & (HN4_DELTA_TABLE_SIZE - 1);
+
+    for (int i = 0; i < HN4_DELTA_PROBE_LIMIT; i++) {
+        uint64_t idx = (start_idx + (i * i)) & (HN4_DELTA_TABLE_SIZE - 1);
+        uint64_t key = atomic_load(&vol->redirect.delta_table[idx].old_lba);
+
+        if (key == old_lba) {
+            uint64_t seed = atomic_load(&vol->redirect.delta_table[idx].seed_hash);
+            if (seed == seed_hash) {
+                atomic_store_explicit(&vol->redirect.delta_table[idx].old_lba, 0, memory_order_release);
+                return;
+            }
+        }
+    }
+}
+
+
 /* 
  * SYSTEM INVARIANT NOTE:
  * This function updates the File's Orbit Vector (V).
@@ -724,12 +675,10 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
     void* buf = hn4_hal_mem_alloc(bs);
     if (!buf) return;
 
-    /* RE-FETCH CAPS: Device state may change */
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    if (caps->queue_count > 1) hn4_hal_micro_sleep(500); 
-
-    /* Snapshot Generation for OCC */
+    /* Snapshot Generation */
     uint32_t start_gen_native = hn4_le32_to_cpu(anchor->write_gen);
+    hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
+    uint64_t seed_hash = seed.lo ^ seed.hi;
     
     /* Calculate New Vector */
     uint64_t V = 0; 
@@ -746,40 +695,35 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
     uint64_t v_le = hn4_cpu_to_le64(new_V);
     memcpy(new_anchor.orbit_vector, &v_le, 6);
 
-    /* Calculate Block Count */
     uint64_t mass = hn4_le64_to_cpu(anchor->mass);
     uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
     uint64_t total_blocks = (mass + payload_sz - 1) / payload_sz;
 
     /* 
      * MIGRATION LOOP (O(N))
-     * We must move every block. If any read fails, we abort.
-     * If any write fails, we abort. The old file remains valid until the atomic anchor swap.
      */
     bool migration_success = true;
-
-    /* Keep a copy of original anchor state for Delta Cleanup later */
     hn4_anchor_t original_anchor_state;
     memcpy(&original_anchor_state, anchor, sizeof(hn4_anchor_t));
+    uint64_t n_processed = 0;
 
     for (uint64_t n = 0; n < total_blocks; n++) {
+        n_processed = n;
+        
         /* 1. Read from OLD Trajectory */
         if (hn4_read_block_atomic(vol, anchor, n, buf, bs) != HN4_OK) {
-            HN4_LOG_WARN("Osteoplasty: Read failed at block %llu. Aborting.", (unsigned long long)n);
             migration_success = false;
             break;
         }
 
-        /* Check for concurrent modification during the long loop */
+        /* Check for concurrent modification */
         if (hn4_le32_to_cpu(anchor->write_gen) != start_gen_native) {
-            HN4_LOG_WARN("Osteoplasty: User write detected during migration. Aborting.");
             migration_success = false;
             break;
         }
 
         /* 
          * 2. Write to NEW Trajectory
-         * We must calculate the payload length correctly for the tail block.
          */
         uint32_t write_len = payload_sz;
         if (n == total_blocks - 1) {
@@ -787,88 +731,76 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
             if (remainder != 0) write_len = (uint32_t)remainder;
         }
 
-        /* 
-         * Note: hn4_write_block_atomic updates new_anchor in RAM (mass/clock).
-         * This is desirable as we want the new anchor to reflect the new state.
-         */
+        /* Note: hn4_write_block_atomic updates new_anchor in RAM */
         if (hn4_write_block_atomic(vol, &new_anchor, n, buf, write_len) != HN4_OK) {
-            HN4_LOG_WARN("Osteoplasty: Write failed at block %llu. Aborting.", (unsigned long long)n);
             migration_success = false;
             break;
         }
 
         /* 
-         * 3. ZERO-LOCK MIGRATION: Register Delta
-         * We must calculate the physical locations to inform readers of the new data.
+         * 3. ZERO-LOCK MIGRATION: Register Delta 
          */
-        uint64_t old_lba_phys = 0;
-        uint64_t new_lba_phys = 0;
-        uint8_t k_dummy;
-
-        /* Resolve addresses. 
-           Note: We use the local 'original_anchor_state' to ensure we calculate the OLD position correctly,
-           even if 'anchor' (passed ptr) was mutated by another thread (though gen check guards this). */
-        if (hn4_alloc_block(vol, &original_anchor_state, n, &old_lba_phys, &k_dummy) == HN4_OK &&
-            hn4_alloc_block(vol, &new_anchor, n, &new_lba_phys, &k_dummy) == HN4_OK) 
-        {
-            _register_delta(hn4_addr_to_u64(old_lba_phys), 
-                            hn4_addr_to_u64(new_lba_phys), 
-                            start_gen_native);
+        uint64_t old_lba_phys = _resolve_residency_verified(vol, &original_anchor_state, n);
+        uint64_t new_lba_phys = _resolve_residency_verified(vol, &new_anchor, n);
+        
+        if (old_lba_phys != HN4_LBA_INVALID && new_lba_phys != HN4_LBA_INVALID) {
+             if (_register_delta(vol, hn4_addr_to_u64(old_lba_phys), hn4_addr_to_u64(new_lba_phys), start_gen_native, seed_hash) != 0) {
+                 migration_success = false;
+                 break;
+             }
         }
     }
 
     /* ATOMIC COMMIT */
-     if (migration_success) {
+    if (migration_success) {
         /* Re-check Generation one last time */
-        if (hn4_le32_to_cpu(anchor->write_gen) != start_gen_native) goto cleanup_deltas;
-
-        /* FIX: Persist to Disk FIRST using the new_anchor struct */
-        if (hn4_write_anchor_atomic(vol, &new_anchor) != HN4_OK) {
-            HN4_LOG_WARN("Osteoplasty: Disk Commit Failed. Aborting RAM update.");
+        if (hn4_le32_to_cpu(anchor->write_gen) != start_gen_native) {
             goto cleanup_deltas;
         }
 
-        /* Disk is safe. Now update RAM via CAS to make it visible to readers */
-        uint32_t expected_raw = anchor->write_gen;
+        if (hn4_write_anchor_atomic(vol, &new_anchor) != HN4_OK) {
+            goto cleanup_deltas;
+        }
+
+        /* Disk is safe. Now update RAM atomically via Lock + Store Fence */
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
         
-        if (atomic_compare_exchange_strong((_Atomic uint32_t*)&anchor->write_gen, 
-                                           &expected_raw, 
-                                           new_anchor.write_gen)) 
-        {
-            /* Sync remaining fields to live pointer */
-            memcpy(anchor->orbit_vector, new_anchor.orbit_vector, 6);
-            anchor->gravity_center = new_anchor.gravity_center;
-            anchor->mass = new_anchor.mass; 
-            anchor->mod_clock = new_anchor.mod_clock;
+        if (anchor->write_gen == hn4_cpu_to_le32(start_gen_native)) {
+            memcpy(anchor, &new_anchor, sizeof(hn4_anchor_t));
             
-            HN4_LOG_CRIT("Osteoplasty Complete. Full file migrated.");
+            atomic_thread_fence(memory_order_release);
             
-            /* Persist to Disk */
-            hn4_write_anchor_atomic(vol, anchor);
-            
-            HN4_LOG_CRIT("Osteoplasty Complete. Full file (%llu blocks) migrated.", (unsigned long long)total_blocks);
-            
+            /* Telemetry update */
             if (vol->health.trajectory_collapse_counter > 0)
                 atomic_fetch_sub(&vol->health.trajectory_collapse_counter, 1);
-        } else {
-            HN4_LOG_WARN("Osteoplasty CAS Failed: Writer Intervened at final commit.");
         }
-    }
-
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        
+    } else {
 cleanup_deltas:
-    for (uint64_t n = 0; n < total_blocks; n++) {
-         uint64_t old_lba_phys = 0;
-         uint8_t k_dummy;
-         
-         /* Re-resolve using the original state to find the keys we registered */
-         if (hn4_alloc_block(vol, &original_anchor_state, n, &old_lba_phys, &k_dummy) == HN4_OK) {
-             _clear_delta(hn4_addr_to_u64(old_lba_phys));
-         }
+        
+        /* We must iterate up to n_processed to rollback delta registration */
+        for (uint64_t n = 0; n <= n_processed && n < total_blocks; n++) {
+             
+             /* Calculate where we *tried* to put data */
+             uint64_t new_lba_phys = _resolve_residency_verified(vol, &new_anchor, n);
+             
+             if (new_lba_phys != HN4_LBA_INVALID) {
+                 /* Free the orphaned block */
+                 hn4_free_block(vol, hn4_addr_to_u64(new_lba_phys));
+             }
+             
+             /* Calculate where data *was* (to clear delta key) */
+             uint64_t old_lba_phys = _resolve_residency_verified(vol, &original_anchor_state, n);
+             
+             if (old_lba_phys != HN4_LBA_INVALID) {
+                 _rollback_delta(vol, hn4_addr_to_u64(old_lba_phys), seed_hash);
+             }
+        }
     }
 
     hn4_hal_mem_free(buf);
 }
-
 
 
 /* =========================================================================
@@ -931,7 +863,14 @@ static hn4_result_t _stitch_stream(
                     if (integrity_ok &&
                         hn4_le32_to_cpu(base_strm->magic) == HN4_MAGIC_STREAM &&
                         base_strm->hyper_strm == 0) {
+                        
                         uint64_t current_blk_idx = hn4_addr_to_u64(current_lba) / sectors;
+                        
+                        /* Since D2/Stream is append-only and immutable payload, only header metadata changes.
+                           We update in-place but rely on CRC.
+                           To be fully safe against concurrent reads seeing torn writes, 
+                           we rely on Sector Atomicity (Header fits in 512B). 
+                        */
                         base_strm->hyper_strm = hn4_cpu_to_le64(current_blk_idx);
 
                         /* Re-sign valid data */
@@ -979,52 +918,233 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
 
     /* Only valid for files currently in Horizon but NOT Pinned to it */
     if (!(dclass & HN4_HINT_HORIZON)) return;
-    if (dclass & HN4_FLAG_PINNED) return; /* User requested pinning */
+    if (dclass & HN4_FLAG_PINNED) return; 
 
-    /* 
-     * STRATEGY:
-     * Try to rewrite block 0 using standard Ballistic Allocation.
-     * If successful, clear the HORIZON hint bit.
-     */
     uint32_t bs = vol->vol_block_size;
     void* buf = hn4_hal_mem_alloc(bs);
     if (!buf) return;
 
+    /* 1. Read existing data (Block 0) */
     if (hn4_read_block_atomic(vol, anchor, 0, buf, bs) == HN4_OK) {
 
+        /* 2. Resolve Old Physical Location (D1.5) for later freeing */
+        uint64_t old_lba_phys = _resolve_residency_verified(vol, anchor, 0);
+
+        /* 3. Prepare New State */
         hn4_anchor_t upgraded_anchor;
         memcpy(&upgraded_anchor, anchor, sizeof(hn4_anchor_t));
 
-        /* Clear Horizon Hint */
+        /* Clear Horizon Hint -> Forces Allocator to use D1 Ballistic */
         uint64_t new_dc = dclass & ~HN4_HINT_HORIZON;
         upgraded_anchor.data_class = hn4_cpu_to_le64(new_dc);
 
-        /* 
-         * Attempt Atomic Write. 
-         * This will trigger the standard Ballistic Allocator because the hint is gone.
-         * If D1 is full, it will fail back to Horizon (no harm done).
-         */
-       hn4_addr_t old_phys_lba = 0;
-    uint8_t k_dummy;
+        /* 4. Atomic Write (Allocates NEW ballistic block) */
+        hn4_result_t res = hn4_write_block_atomic(vol, &upgraded_anchor, 0, buf, bs);
     
-    /* Using the ORIGINAL anchor state */
-    hn4_alloc_block(vol, anchor, 0, &old_phys_lba, &k_dummy);
+        if (res == HN4_OK) {
+            /* 5. Commit Anchor to Disk */
+            if (hn4_write_anchor_atomic(vol, &upgraded_anchor) == HN4_OK) {
+            
+                /* 6. Sync RAM state under lock */
+                hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+                memcpy(anchor, &upgraded_anchor, sizeof(hn4_anchor_t));
+                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+            
+                /* 7. Free Old Block (D1.5) with Safety Checks */
+                if (old_lba_phys != HN4_LBA_INVALID) {
+                    /* Calculate ID Hash and Gen from the *original* anchor state logic */
+                    hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
+                    uint64_t seed_hash = seed.lo ^ seed.hi;
+                    uint32_t current_gen = hn4_le32_to_cpu(anchor->write_gen);
 
-    /* Attempt Atomic Write (Allocates NEW ballistic block) */
-    hn4_result_t res = hn4_write_block_atomic(vol, &upgraded_anchor, 0, buf, bs);
-    
-    if (res == HN4_OK) {
-        hn4_write_anchor_atomic(vol, &upgraded_anchor);
-        
-        if (hn4_addr_to_u64(old_phys_lba) != 0) {
-            hn4_free_block(vol, hn4_addr_to_u64(old_phys_lba));
+                    /* Only free if no active readers are redirected via delta table */
+                    if (hn4_scavenger_lookup_delta(vol, hn4_addr_to_u64(old_lba_phys), current_gen, seed_hash) == 0) {
+                        hn4_free_block(vol, hn4_addr_to_u64(old_lba_phys));
+                    }
+                }
+                HN4_LOG_VAL("Scavenger: Up-Tiered Horizon File", 0);
+            }
         }
-        
-        HN4_LOG_VAL("Scavenger: Up-Tiered Horizon File", 0);
-    }
     }
 
     hn4_hal_mem_free(buf);
+}
+
+
+
+/* Audit State Tracking */
+static uint64_t _audit_cursor_byte = 0;
+#define HN4_AUDIT_WINDOW_SIZE (1ULL * 1024 * 1024 * 1024) /* 1 GB Window */
+
+static void _perform_leak_audit(hn4_volume_t* vol) {
+    /* Safety: Cannot audit if bitmaps/cortex aren't loaded */
+    if (!vol->nano_cortex || !vol->void_bitmap) return;
+
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+    uint32_t bs = vol->vol_block_size;
+    uint32_t sectors_per_blk = bs / ss;
+
+    /* 1. Define Window */
+    uint64_t start_lba = _audit_region_cursor / bs;
+    uint64_t end_lba   = (_audit_region_cursor + HN4_AUDIT_REGION_SIZE) / bs;
+    
+    /* Clamp to capacity */
+    uint64_t max_blocks = vol->vol_capacity_bytes / bs;
+    if (start_lba >= max_blocks) {
+        _audit_region_cursor = 0; /* Reset for next pass */
+        return;
+    }
+    if (end_lba > max_blocks) end_lba = max_blocks;
+
+    uint64_t window_blocks = end_lba - start_lba;
+    
+    /* 2. Shadow Bitmap Allocation (1 bit per block in window) */
+    size_t shadow_sz = (window_blocks + 7) / 8;
+    uint8_t* shadow_map = hn4_hal_mem_alloc(shadow_sz);
+    if (!shadow_map) return; /* Skip audit on OOM */
+    memset(shadow_map, 0, shadow_sz);
+
+    /* 3. Cortex Walk (The Heavy Lift) */
+    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+    size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
+
+    for (size_t i = 0; i < count; i++) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        hn4_anchor_t a = anchors[i]; 
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+        uint64_t dclass = hn4_le64_to_cpu(a.data_class);
+        
+        /* Skip invalid/deleted files */
+        if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) continue;
+
+        /* Extract Physics */
+        uint64_t G = hn4_le64_to_cpu(a.gravity_center);
+        uint64_t mass = hn4_le64_to_cpu(a.mass);
+        uint16_t M = hn4_le16_to_cpu(a.fractal_scale);
+        
+        uint64_t V = 0;
+        memcpy(&V, a.orbit_vector, 6);
+        V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
+
+        uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
+        uint64_t total_blocks = (mass + payload_sz - 1) / payload_sz;
+
+        /* RE-PROJECT TRAJECTORY */
+        for (uint64_t n = 0; n < total_blocks; n++) {
+            uint64_t lba = HN4_LBA_INVALID;
+
+            if (dclass & HN4_HINT_HORIZON) {
+                lba = G + n;
+            } else {
+                /* Ballistic File: Compute shells */
+                for (uint8_t k = 0; k < 12; k++) {
+                    uint64_t cand = _calc_trajectory_lba(vol, G, V, n, M, k);
+                    if (cand != HN4_LBA_INVALID) {
+                        /* Check if specific shell allocated in real bitmap */
+                        /* If so, assume this is the active shell for this block */
+                        bool is_set;
+                        /* Note: Calling bitmap_op here is expensive inside double loop. 
+                           Optimization: Bounds check against window FIRST. */
+                        if (cand >= start_lba && cand < end_lba) {
+                            if (_bitmap_op(vol, cand, BIT_TEST, &is_set) == HN4_OK && is_set) {
+                                lba = cand;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (lba != HN4_LBA_INVALID && lba >= start_lba && lba < end_lba) {
+                uint64_t rel = lba - start_lba;
+                
+                if (shadow_map[rel / 8] & (1 << (rel % 8))) {
+                    HN4_LOG_WARN("Audit: Duplicate Ownership detected at LBA %llu", (unsigned long long)lba);
+                    /* Log only. Do not free. Logic ambiguous. */
+                }
+                
+                shadow_map[rel / 8] |= (1 << (rel % 8));
+            }
+            
+            /* Anti-Stall */
+            if ((n & 1023) == 0) hn4_hal_poll(vol->target_device);
+        }
+    }
+
+    /* 4. XOR Comparison & Safety Verification */
+    void* io_buf = hn4_hal_mem_alloc(bs);
+    
+    if (io_buf) {
+        for (uint64_t j = 0; j < window_blocks; j++) {
+            uint64_t abs_lba = start_lba + j;
+            
+            bool real_alloc;
+            _bitmap_op(vol, abs_lba, BIT_TEST, &real_alloc);
+            
+            bool shadow_alloc = (shadow_map[j / 8] >> (j % 8)) & 1;
+
+            if (real_alloc && !shadow_alloc) {
+                /* 
+                 * CANDIDATE LEAK: 
+                 * Real bitmap says USED. No scanned anchor claimed it.
+                 */
+                bool safe_to_free = false;
+                
+                hn4_addr_t phys_lba = hn4_lba_from_blocks(abs_lba * sectors_per_blk);
+                
+                if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_lba, io_buf, sectors_per_blk) == HN4_OK) {
+                    hn4_block_header_t* h = (hn4_block_header_t*)io_buf;
+                    
+                    /* Check Magic */
+                    if (hn4_le32_to_cpu(h->magic) != HN4_BLOCK_MAGIC) {
+                        /* Garbage data in marked block -> Safe to free */
+                        safe_to_free = true;
+                    } else {
+                        /* Valid Header. Find Owner. */
+                        hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
+                        hn4_anchor_t owner;
+                        
+                        /* We use the public ID lookup which handles hash probing */
+                        if (hn4_ns_get_anchor_by_id(vol, disk_id, &owner) == HN4_OK) {
+                            /* Owner Exists. Check Generation. */
+                            uint64_t disk_gen = hn4_le64_to_cpu(h->generation);
+                            uint32_t anchor_gen = hn4_le32_to_cpu(owner.write_gen);
+                            
+                            /* If DiskGen >= AnchorGen, pending write. DO NOT FREE. */
+                            if (disk_gen < anchor_gen) {
+                                safe_to_free = true;
+                            }
+
+                            hn4_u128_t seed = hn4_le128_to_cpu(owner.seed_id);
+                            uint64_t seed_hash = seed.lo ^ seed.hi;
+                            
+                            if (hn4_scavenger_lookup_delta(vol, abs_lba, anchor_gen, seed_hash) != 0) {
+                                safe_to_free = false;
+                            }
+
+                        } else {
+                            /* Owner not found (Deleted file). Safe to free. */
+                            safe_to_free = true;
+                        }
+                    }
+                } else {
+                    /* Read Error. Do not touch. */
+                    safe_to_free = false; 
+                }
+
+                if (safe_to_free) {
+                    HN4_LOG_WARN("Audit: Reclaiming leaked block LBA %llu", (unsigned long long)abs_lba);
+                    _bitmap_op(vol, abs_lba, BIT_CLEAR, NULL);
+                }
+            }
+        }
+        hn4_hal_mem_free(io_buf);
+    }
+
+    hn4_hal_mem_free(shadow_map);
+    _audit_region_cursor += HN4_AUDIT_REGION_SIZE;
 }
 
 
@@ -1034,37 +1154,43 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
 
 void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
 {
+    /* 1. Pre-flight Checks */
     if (!vol || vol->read_only) return;
+    if (vol->sb.info.state_flags & HN4_VOL_PANIC) return;
 
     hn4_time_t now = hn4_hal_get_time_ns();
 
-    /* 1. Vital Signs */
+    /* 2. Vital Signs & Mode Detection */
     uint32_t collapse_cnt = atomic_load(&vol->health.trajectory_collapse_counter);
     bool medic_mode = (collapse_cnt > HN4_OSTEOPOROSIS_THRESHOLD);
-
-    /* 2. ZNS Mode Check */
     bool is_zns = (vol->sb.info.device_type_tag == HN4_DEV_ZNS);
 
-    /* 3. Setup Reaper Batch (Local Stack) */
+      static uint32_t audit_ticker = 0;
+    if (++audit_ticker % 100 == 0) {
+        _perform_leak_audit(vol);
+    }
+
+    /* 3. Setup Reaper Batch (Stack Allocated) */
     _reaper_batch_t batch;
     batch.count = 0;
     batch.block_size = vol->vol_block_size;
+    batch.secure_shred = false; /* Default */
 
+    /* Requires Nano-Cortex (RAM) to operate effectively */
     if (vol->nano_cortex) {
         hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
         size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
 
         /* 
-         * PHASE 1: MEDIC PRIORITY QUEUE DRAIN (High Priority Surgery)
-         * We process the triage list before doing routine scans.
+         * PHASE 1: MEDIC PRIORITY QUEUE (High Priority Surgery)
+         * We drain the triage list before scanning for garbage.
+         * Limit: 4 surgeries per pulse to prevent IO starvation.
          */
         hn4_hal_spinlock_acquire(&vol->medic_queue.lock);
 
-        /* Process up to 4 critical items per pulse to avoid starving IO */
-        int surgeries_performed = 0;
-
-        while (vol->medic_queue.count > 0 && surgeries_performed < 4) {
-
+        int surgeries = 0;
+        while (vol->medic_queue.count > 0 && surgeries < 4) {
+            /* Find highest priority target */
             uint32_t best_i = 0;
             uint32_t max_score = 0;
 
@@ -1077,18 +1203,22 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
 
             uint32_t idx = vol->medic_queue.entries[best_i].anchor_idx;
 
+            /* Remove from queue (unordered remove for speed) */
             vol->medic_queue.count--;
             if (best_i < vol->medic_queue.count) {
                 vol->medic_queue.entries[best_i] = vol->medic_queue.entries[vol->medic_queue.count];
             }
 
+            /* Release Lock during IO-heavy surgery */
+            hn4_hal_spinlock_release(&vol->medic_queue.lock);
+
             if (idx < count) {
-                /* Perform Osteoplasty (Data Migration) */
+                /* Perform Osteoplasty (Migration to new vector V') */
                 _perform_osteoplasty(vol, &anchors[idx], false);
-                surgeries_performed++;
+                surgeries++;
             }
 
-            /* Re-acquire for next loop iteration */
+            /* Re-acquire for next iteration */
             hn4_hal_spinlock_acquire(&vol->medic_queue.lock);
         }
         hn4_hal_spinlock_release(&vol->medic_queue.lock);
@@ -1096,53 +1226,68 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
 
         /* 
          * PHASE 2: ROUTINE PATROL (Time Sliced)
-         * Scan 64 anchors. If we find problems, push to queue or reap immediately.
+         * We scan a window of 64 anchors per pulse to distribute CPU load.
          */
-
         size_t start_idx = vol->alloc.scavenger_cursor;
         vol->alloc.scavenger_cursor = (start_idx + 64) % count;
 
+        /* Scan Window */
         for (size_t i = 0; i < 64; i++) {
             size_t idx = (start_idx + i) % count;
             hn4_anchor_t* a = &anchors[idx];
-            uint64_t dc = hn4_le64_to_cpu(a->data_class);
+            uint64_t dclass = hn4_le64_to_cpu(a->data_class);
 
-            /* A. REAPER: Tombstones are deleted immediately */
-            if (dc & HN4_FLAG_TOMBSTONE) {
+            /* Skip Empty/Invalid Slots */
+            if (dclass == 0) continue;
+
+            /* 
+             * A. THE REAPER (Entropy Protocol)
+             * Checks if Tombstone grace period has expired.
+             * If yes -> Zeros Anchor -> Frees Blocks -> Making Undelete Impossible.
+             */
+            if (dclass & HN4_FLAG_TOMBSTONE) {
                 _reap_tombstone(vol, a, now, &batch);
             }
-            /* B. MEDIC: Check Bone Density */
-            else if (medic_mode && (dc & HN4_FLAG_VALID)) {
-
-                /* Standard Files (D1 Flux) */
-                if (!(dc & HN4_HINT_HORIZON)) {
+            
+            /* 
+             * B. THE MEDIC (Bone Density Check)
+             * Only runs if the system is seeing collisions (medic_mode).
+             */
+            else if (medic_mode && (dclass & HN4_FLAG_VALID)) {
+                if (!(dclass & HN4_HINT_HORIZON)) {
+                    /* Check D1 Flux Density */
                     uint32_t density = _analyze_bone_density(vol, a);
                     if (density >= HN4_BONE_DENSITY_CRITICAL) {
-                        /* Push to Priority Queue */
                         _medic_queue_push(vol, (uint32_t)idx, density);
                     }
-                }
-                /* Horizon Files (D1.5) -> Up-Tiering Opportunity */
+                } 
                 else {
-                    /* Probabilistic check (~ every 1024 pulses) */
-                    if ((now & 1023) == 0) {
+                    /* Horizon (D1.5) Up-Tiering Opportunity */
+                    /* Probabilistic: Try to move back to D1 occasionally */
+                    if ((now & 1023) == 0) { 
                         _uptier_horizon_data(vol, a);
                     }
                 }
             }
 
-            if ((dc & HN4_HINT_STREAM) && (dc & HN4_FLAG_VALID)) {
-                /* Stitch every 128th pulse to save IO */
+            /* 
+             * C. THE STITCHER (Stream Optimization)
+             * Adds skip-list pointers to long D2 streams.
+             * 128:1 Sampling Ratio.
+             */
+            if ((dclass & HN4_HINT_STREAM) && (dclass & HN4_FLAG_VALID)) {
                 if ((idx & 127) == 0) _stitch_stream(vol, a);
             }
         }
     }
 
-    /* 4. Flush any pending TRIMs collected during Reap */
-     _reaper_flush(vol->target_device, &batch, vol);
+    /* 4. Flush Pending TRIMs (The Reaper's Scythe) */
+    /* This physically sends DISCARD commands for blocks collected in _reap_tombstone */
+    _reaper_flush(vol->target_device, &batch, vol);
 
     /* 
      * 5. ZNS EVACUATOR (Zone Compaction)
+     * Moves valid data out of fragmented zones so they can be reset.
      */
     if (is_zns) {
         static uint64_t zns_pulse_ticker = 0;
@@ -1158,7 +1303,7 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
                 uint32_t ss = caps->logical_block_size;
                 uint64_t zone_sectors = caps->zone_size_bytes / ss;
 
-                /* Calculate Safe Zone Start (Skip Metadata) */
+                /* Calculate Safe Zone Start (Skip Metadata Regions) */
                 uint64_t flux_start_sector = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
                 uint64_t first_safe_zone = (flux_start_sector + zone_sectors - 1) / zone_sectors;
 
@@ -1171,6 +1316,7 @@ void hn4_scavenger_pulse(HN4_IN hn4_volume_t* vol)
                 uint64_t victim_start_lba = zone_cursor * zone_sectors;
                 uint64_t victim_len_bytes = caps->zone_size_bytes;
 
+                /* Moves valid data to Horizon, then Resets Zone */
                 _evacuate_zns_victim(vol, victim_start_lba, victim_len_bytes);
 
                 zone_cursor++;
