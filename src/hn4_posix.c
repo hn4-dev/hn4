@@ -162,13 +162,15 @@ static bool _imp_safe_add_signed(int64_t base, int64_t offset, int64_t* res) {
 #define HN4_MAX_PATH        256
 #define HN4_INLINE_NAME_MAX 28
 #define HN4_FLAG_IS_DIRECTORY  (1ULL << 63)
+#define HN4_EXT_TYPE_TETHER     0x03 
 
 typedef struct {
     hn4_anchor_t    cached_anchor;
     uint64_t        current_offset;
     uint64_t        anchor_idx;
-    uint32_t        cached_gen; /* Generation Tracking */
+    uint32_t        cached_gen;
     int             open_flags;
+    uint32_t        session_perms; 
     bool            dirty;
     bool            is_directory;
     bool            unlinked;

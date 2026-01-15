@@ -291,7 +291,8 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     HN4_INOUT hn4_anchor_t* anchor,
     HN4_IN uint64_t block_idx,
     HN4_IN const void* data,
-    HN4_IN uint32_t len
+    HN4_IN uint32_t len,
+    HN4_IN uint32_t session_perms /* Delegated rights */
 )
 {
     HN4_LOG_CRIT("WRITE_ATOMIC: Enter. Vol=%p Block=%llu Len=%u", vol, (unsigned long long)block_idx, len);
@@ -335,24 +336,28 @@ retry_transaction:;
         return HN4_ERR_IMMUTABLE;
     }
 
+    /* Calculate Effective Permissions */
+    uint32_t effective_perms = perms | session_perms;
+
     /* Append-Only Check (Spec 9.2 Bit 3) */
-    if ((perms & HN4_PERM_APPEND) && !(perms & HN4_PERM_WRITE)) {
-        /* Calculate current logical bounds */
+    if ((effective_perms & HN4_PERM_APPEND) && !(effective_perms & HN4_PERM_WRITE)) {
+    /* Calculate current logical bounds */
         uint64_t mass       = hn4_le64_to_cpu(anchor->mass);
         uint32_t payload_sz = HN4_BLOCK_PayloadSize(vol->vol_block_size);
         uint64_t max_idx    = (mass + payload_sz - 1) / payload_sz;
 
+        /* Reject overwrite of existing blocks */
         if (block_idx < max_idx) {
-            HN4_LOG_CRIT("WRITE_ATOMIC: Violation of Append-Only Constraint");
+            HN4_LOG_CRIT("WRITE_ATOMIC: Violation of Append-Only Constraint (Blk %llu < Max %llu)", 
+                         (unsigned long long)block_idx, (unsigned long long)max_idx);
             return HN4_ERR_ACCESS_DENIED;
         }
     }
 
     /* Basic Write Check */
-    if (!(perms & (HN4_PERM_WRITE | HN4_PERM_APPEND | HN4_PERM_SOVEREIGN))) {
+    if (!(effective_perms & (HN4_PERM_WRITE | HN4_PERM_APPEND | HN4_PERM_SOVEREIGN))) {
         return HN4_ERR_ACCESS_DENIED;
     }
-
     /* 2. Geometry Setup */
     uint32_t bs          = vol->vol_block_size;
     uint32_t payload_cap = HN4_BLOCK_PayloadSize(bs);

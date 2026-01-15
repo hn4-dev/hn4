@@ -218,7 +218,8 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     HN4_IN  hn4_anchor_t* anchor_ptr,
     HN4_IN  uint64_t      block_idx,
     HN4_OUT void*         out_buffer,
-    HN4_IN  uint32_t      buffer_len
+    HN4_IN  uint32_t      buffer_len,
+    HN4_IN uint32_t session_perms /* Delegated rights */
 )
 {
     if (HN4_UNLIKELY(!vol || !anchor_ptr || !out_buffer)) return HN4_ERR_INVALID_ARGUMENT;
@@ -240,7 +241,9 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     uint32_t perms  = hn4_le32_to_cpu(anchor.permissions);
     uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
 
-    if (!(perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))) return HN4_ERR_ACCESS_DENIED;
+    uint32_t effective_perms = perms | session_perms;
+
+    if (!(effective_perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))) return HN4_ERR_ACCESS_DENIED;
     if ((perms & HN4_PERM_ENCRYPTED) || (dclass & HN4_HINT_ENCRYPTED)) return HN4_ERR_ACCESS_DENIED;
 
     /* 2. Physics & Geometry Extraction */

@@ -414,7 +414,7 @@ typedef struct HN4_PACKED {
     uint64_t    expiry_ts;          /* 0x08 - Naturally Aligned */
     hn4_u128_t  target_value;       /* 0x10 - 16-byte Aligned (Critical) */
     uint8_t     signature[64];      /* 0x20 - Cache Line Aligned */
-    uint8_t     padding[32];        /* 0x60 - Pad to 128 */
+    uint8_t     signer_key[32];     /* 0x60 - Pad to 128 */
 } hn4_tether_t;
 
 /* 8.6 Extension Blocks */

@@ -1229,7 +1229,14 @@ _alloc_cortex_run(
                     
                     /* Populate Pending Marker in claim_buf */
                     claim_hdr->magic = hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING);
-                    claim_hdr->payload_len = 0; /* Zero length indicates specialized marker */
+                    
+                    /* Calculate total bytes reserved so scanners can skip the tail */
+                    uint64_t total_reserved_bytes = (uint64_t)slots_needed * HN4_CORTEX_SLOT_SIZE;
+                    /* Payload len is Total - Header */
+                    uint64_t effective_payload = total_reserved_bytes - sizeof(hn4_nano_header_t);
+                    
+                    claim_hdr->payload_len = hn4_cpu_to_le64(effective_payload);
+                    
                     claim_hdr->version = hn4_cpu_to_le64(hn4_hal_get_time_ns());
                     claim_hdr->flags = 0;
 

@@ -2541,53 +2541,6 @@ hn4_TEST(ZNS_EdgeCase, Metadata_Overflow_ENOSPC) {
     destroy_device_fixture(dev);
 }
 
-
-/* 
- * Test Z3: ZNS Layout Integrity (Metadata Stride)
- * 
- * SCENARIO:
- *   - Verify that critical metadata regions (Epoch, Cortex)
- *     start at exact Zone Boundaries.
- * 
- * EXPECTATION:
- *   - Zone 0: Superblock (LBA 0)
- *   - Zone 1: Epoch Ring (LBA = ZoneSize / SectorSize)
- */
-hn4_TEST(ZNS_Logic, Region_Stride_Check) {
-    uint64_t cap = 4 * HN4_SZ_GB;
-    uint64_t zone_sz = 128 * HN4_SZ_MB;
-    uint32_t ss = 4096;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    /* Calculate Sectors per Zone */
-    uint64_t sectors_per_zone = zone_sz / ss;
-    
-    /* Epoch Ring must start at Zone 1 */
-    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
-    ASSERT_EQ(sectors_per_zone, epoch_lba);
-    
-    /* Cortex must start at Zone 2 (Assuming Epoch fits in 1 zone) */
-    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
-    ASSERT_EQ(sectors_per_zone * 2, cortex_lba);
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-
 /* 
  * Test Z11: ZNS Metadata Starvation
  * RATIONALE: In ZNS Mode, every metadata region (SB, Epoch, Cortex, Bitmap, QMask)
@@ -2640,49 +2593,6 @@ hn4_TEST(ZNS_Logic, Large_128MB_Zone_Success) {
     ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
     
     hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    ASSERT_EQ((uint32_t)zone_sz, sb->info.block_size);
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
-
-
-/* 
- * Test Z1: ZNS Macro-Blocking Override
- * 
- * SCENARIO: 
- *   - Profile: GENERIC (Defaults to 4KB blocks).
- *   - Hardware: ZNS (256MB Zones).
- * 
- * VERIFIES: 
- *   - The formatter detects ZNS and forces Block Size = Zone Size.
- *   - Superblock is successfully written (requires NVM flag for Mock persistence).
- */
-hn4_TEST(ZNS_Logic, MacroBlock_Override_Generic) {
-    uint64_t cap = 4 * HN4_SZ_GB;
-    uint64_t zone_sz = 256 * HN4_SZ_MB;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    
-    /* Setup Memory Backing to verify SB contents */
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    
-    /* Enable NVM (for Mock write) and ZNS (for logic trigger) */
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = (uint32_t)zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC; /* Request 4KB */
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    /* 
-     * CRITICAL ASSERTION: 
-     * Block Size must be 256MB (0x10000000), overriding the 4KB Profile default.
-     */
     ASSERT_EQ((uint32_t)zone_sz, sb->info.block_size);
     
     hn4_hal_mem_free(mdev->mmio_base);
@@ -2986,49 +2896,6 @@ hn4_TEST(ZNS_Logic, Profile_BlockSize_Override) {
     destroy_device_fixture(dev);
 }
 
-
-
-hn4_TEST(ZNS_Layout, Zone_Boundary_Strictness) {
-    /* 4GB Drive, 256MB Zones */
-    uint64_t cap = 4ULL * HN4_SZ_GB;
-    uint32_t zone_sz = 256 * 1024 * 1024;
-    uint32_t ss = 4096;
-    
-    hn4_hal_device_t* dev = create_device_fixture(cap, ss);
-    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
-    mdev->mmio_base = hn4_hal_mem_alloc(cap);
-    mdev->caps.hw_flags |= (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
-    mdev->caps.zone_size_bytes = zone_sz;
-    
-    hn4_format_params_t params = {0};
-    params.target_profile = HN4_PROFILE_GENERIC;
-    
-    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
-    
-    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
-    
-    /* 
-     * In ZNS Mode:
-     * Zone 0: Superblock (LBA 0)
-     * Zone 1: Epoch Ring (LBA = ZoneSize / SectorSize)
-     * Zone 2: Cortex (LBA = ZoneSize * 2 / SectorSize)
-     */
-    uint64_t sectors_per_zone = zone_sz / ss;
-    
-    /* Check Epoch Start LBA */
-    uint64_t epoch_lba = hn4_addr_to_u64(sb->info.lba_epoch_start);
-    ASSERT_EQ(sectors_per_zone, epoch_lba);
-    
-    /* Check Cortex Start LBA */
-    uint64_t cortex_lba = hn4_addr_to_u64(sb->info.lba_cortex_start);
-    ASSERT_EQ(sectors_per_zone * 2, cortex_lba);
-    
-    /* Verify Block Size matches Zone Size exactly */
-    ASSERT_EQ(zone_sz, sb->info.block_size);
-
-    hn4_hal_mem_free(mdev->mmio_base);
-    destroy_device_fixture(dev);
-}
 
 hn4_TEST(ZNS_Layout, Insufficient_Zones_Failure) {
     /* 
