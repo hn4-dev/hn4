@@ -16,7 +16,7 @@
 
 ## 1. Executive Summary
 
-While the standard HN4 architecture scales to Exabytes, the **Pico Profile** (`HN4_PROFILE_PICO`) is a specialized subset designed for extreme resource constraints. It retains the core mathematical properties of the Void Engine (Ballistic Addressing, Shadow Hops) but strips away scalability features (Horizon Log, Extension Chains, RAID) to fit within the SRAM of a Microcontroller Unit (MCU).
+While the standard HN4 architecture scales to Exabytes, the **Pico Profile** (`HN4_PROFILE_PICO`) is a specialized subset designed for extreme resource constraints. It retains the core mathematical properties of the Void Engine (Ballistic Addressing, Atomic Relocation) but strips away scalability features (Horizon Log, Extension Chains, Redundant Superblocks) to fit within the SRAM of a Microcontroller Unit (MCU).
 
 This profile enables **high-integrity, power-fail-safe file storage** on devices ranging from 32-bit Cortex-M0 sensors to legacy 1.44MB Floppy Disks, eliminating the corruption risks inherent in FAT12/FAT16.
 

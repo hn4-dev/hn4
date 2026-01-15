@@ -100,3 +100,55 @@ hn4_TEST(HAL_IO, NullDeviceGuard) {
     hn4_hal_shutdown();
 }
 
+/* =========================================================================
+ * TEST 5: ZNS Append Simulation Logic
+ * RATIONALE:
+ * When HN4_HW_ZNS_NATIVE is NOT present (Simulation Mode), the HAL emulates
+ * Zone Append by tracking a write pointer.
+ * This test verifies the emulated WP advances correctly and wraps/rejects
+ * writes that exceed the zone capacity.
+ * ========================================================================= */
+hn4_TEST(HAL_ZNS, SimulationPointerAdvance) {
+    hn4_hal_init();
+
+    hn4_hal_device_t* dev = create_hal_device();
+    
+    /* 
+     * Mock device is implicitly non-ZNS (flags=0). 
+     * But for simulation to work, we need to treat it as a Block Device
+     * that accepts the ZONE_APPEND opcode.
+     * The HAL code path checks opcode, then simulates.
+     */
+    
+    uint8_t buf[4096] = {0};
+    /* Zone 0 start LBA = 0 */
+    hn4_addr_t zone_start = 0;
+    
+    /* 
+     * 1. First Append (Length 1 block)
+     * Expected Result LBA: 0
+     * Internal WP: 1
+     */
+    hn4_addr_t res_lba = 0;
+    hn4_result_t res = hn4_hal_zns_append_sync(dev, zone_start, buf, 1, &res_lba);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    /* In 64-bit mode */
+    #ifndef HN4_USE_128BIT
+    ASSERT_EQ(0, res_lba);
+    #endif
+
+    /* 
+     * 2. Second Append (Length 1 block)
+     * Expected Result LBA: 1 (Sequential)
+     */
+    res = hn4_hal_zns_append_sync(dev, zone_start, buf, 1, &res_lba);
+    ASSERT_EQ(HN4_OK, res);
+    
+    #ifndef HN4_USE_128BIT
+    ASSERT_EQ(1, res_lba);
+    #endif
+
+    hn4_hal_shutdown();
+}

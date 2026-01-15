@@ -206,3 +206,206 @@ hn4_TEST(EpochAdvance, BlockSizeTooSmall) {
     
     cleanup_epoch_fixture(vol);
 }
+
+
+
+/* =========================================================================
+ * TEST 8: Ring Integrity Failure (Bad CRC)
+ * Rationale:
+ * If the Epoch Header at the ring pointer has an invalid CRC, we have lost
+ * temporal tracking. The driver must return HN4_ERR_EPOCH_LOST.
+ * ========================================================================= */
+hn4_TEST(EpochCheck, BadCRC) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
+
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = vol->sb.info.current_epoch_id;
+    ep.epoch_crc = 0xDEADBEEF; /* Invalid CRC */
+
+    uint64_t ptr_lba = vol->sb.info.epoch_ring_block_idx * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    
+    void* io_buf = hn4_hal_mem_alloc(TEST_BLOCK_SIZE);
+    memcpy(io_buf, &ep, sizeof(ep));
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, ptr_lba, io_buf, TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    hn4_hal_mem_free(io_buf);
+
+    hn4_result_t res = hn4_epoch_check_ring(
+        vol->target_device, 
+        &vol->sb, 
+        mdev->caps.total_capacity_bytes
+    );
+
+    ASSERT_EQ(HN4_ERR_EPOCH_LOST, res);
+
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 9: Generation Exhaustion
+ * Rationale:
+ * hn4_epoch_advance checks the Superblock `copy_generation`. If it nears
+ * the 64-bit limit (Safety buffer 0xF0), it must reject the advance to
+ * prevent overflow/rollover.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, GenerationCap) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    /* Set Generation to Limit */
+    vol->sb.info.copy_generation = 0xFFFFFFFFFFFFFFF0ULL;
+
+    uint64_t out_id;
+    hn4_addr_t out_ptr;
+
+    hn4_result_t res = hn4_epoch_advance(
+        vol->target_device,
+        &vol->sb,
+        false,
+        &out_id,
+        &out_ptr
+    );
+
+    ASSERT_EQ(HN4_ERR_EEXIST, res);
+
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 10: PICO Profile Tiny Ring
+ * Rationale:
+ * HN4_PROFILE_PICO uses a tiny 2-block ring instead of the standard 1MB ring.
+ * Verify that the wrapping logic respects the PICO constraint (wrap after 2 blocks).
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, PicoRingTopology) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    /* 1. Switch to PICO Profile */
+    vol->sb.info.format_profile = HN4_PROFILE_PICO;
+    
+    /* 
+     * 2. Setup Ring Geometry
+     * Start at Block 100.
+     * PICO Ring Size = 2 Blocks.
+     * Valid Blocks: 100, 101.
+     */
+    uint64_t start_blk = 100;
+    vol->sb.info.lba_epoch_start = start_blk * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    
+    /* Set current pointer to LAST block (101) */
+    vol->sb.info.epoch_ring_block_idx = 101;
+
+    uint64_t out_id;
+    hn4_addr_t out_ptr;
+
+    hn4_result_t res = hn4_epoch_advance(
+        vol->target_device,
+        &vol->sb,
+        false,
+        &out_id,
+        &out_ptr
+    );
+
+    ASSERT_EQ(HN4_OK, res);
+
+    /* 
+     * Expectation: Wrap around to Start Block (100)
+     * (101 - 100 + 1) % 2 = 0 -> Start + 0 = 100.
+     */
+#ifdef HN4_USE_128BIT
+    ASSERT_EQ(start_blk, out_ptr.lo);
+#else
+    ASSERT_EQ(start_blk, out_ptr);
+#endif
+
+    cleanup_epoch_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 6: Toxic Media Guard
+ * Rationale:
+ * If the Superblock state flags indicate HN4_VOL_TOXIC, the epoch ring MUST NOT
+ * be advanced. This prevents pushing new state onto a dying drive.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, ToxicGuard) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    vol->sb.info.state_flags |= HN4_VOL_TOXIC;
+
+    uint64_t new_id = 0;
+    hn4_addr_t new_ptr = 0;
+
+    hn4_result_t res = hn4_epoch_advance(
+        vol->target_device,
+        &vol->sb,
+        false,
+        &new_id,
+        &new_ptr
+    );
+
+    ASSERT_EQ(HN4_ERR_MEDIA_TOXIC, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 14: Ring Start Block Alignment Failure
+ * RATIONALE:
+ * hn4_epoch_advance checks if the Ring Start LBA (in SB) is aligned to the
+ * Block Size. If not, it cannot calculate block indices correctly.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, StartAlignmentFail) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    /* 
+     * Valid LBA must be multiple of SPB (8).
+     * Set to 17.
+     */
+    vol->sb.info.lba_epoch_start = 17;
+
+    uint64_t out_id;
+    hn4_addr_t out_ptr;
+
+    hn4_result_t res = hn4_epoch_advance(
+        vol->target_device,
+        &vol->sb,
+        false,
+        &out_id,
+        &out_ptr
+    );
+
+    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
+
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 15: Ring Pointer Regression Guard
+ * RATIONALE:
+ * The current ring pointer must be >= the start of the ring.
+ * If corruption causes the pointer to point *before* the ring start,
+ * the advance logic would calculate a huge negative offset (underflow).
+ * This must be caught as HN4_ERR_DATA_ROT.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, PointerRegression) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    /* Ring starts at Block 256. Set Pointer to 100. */
+    uint64_t start_blk = 256;
+    vol->sb.info.lba_epoch_start = start_blk * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    vol->sb.info.epoch_ring_block_idx = 100; 
+
+    uint64_t out_id;
+    hn4_addr_t out_ptr;
+
+    hn4_result_t res = hn4_epoch_advance(
+        vol->target_device,
+        &vol->sb,
+        false,
+        &out_id,
+        &out_ptr
+    );
+
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    cleanup_epoch_fixture(vol);
+}

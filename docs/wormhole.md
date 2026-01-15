@@ -9,13 +9,13 @@
 
 ## 1. Operational Theory
 
-In standard filesystem architectures (ext4, XFS), a Volume UUID is a random 128-bit integer generated at format time to ensure global uniqueness. Operating System kernels rely on this uniqueness to multiplex block devices; detecting two mounted volumes with identical UUIDs typically triggers a collision error or kernel panic to prevent data corruption.
+In standard filesystem architectures (e.g., Ext4, XFS, NTFS), a Volume UUID is a random 128-bit integer generated at format time to ensure global uniqueness. Operating System kernels rely on this uniqueness to multiplex block devices; detecting two mounted volumes with identical UUIDs typically triggers a collision error or kernel panic to prevent data corruption.
 
 **HN4 decouples Identity from Physical Instantiation.**
 
 The **Wormhole Protocol** is a format-time directive that forces a new volume to inherit the specific **UUID**, **Generation Count**, and **Geometry Parameters** of an existing volume.
 
-Because HN4 utilizes algebraic addressing (where physical placement is a function of the Volume UUID and File Seed), two volumes formatted with identical parameters possess **Binary Isomorphism**. Writing a specific logical block to File $A$ will calculate the exact same physical LBA on both drives, regardless of their underlying hardware differences.
+Because HN4 utilizes algebraic addressing (where physical placement is a deterministic function of the Volume UUID and File Seed), two volumes formatted with identical parameters possess **Binary Isomorphism**. Writing a specific logical block to File $A$ will calculate the exact same physical LBA on both drives, regardless of their underlying hardware differences.
 
 This enables stateless synchronization, hierarchy-free RAM caching, and temporal snapshotting without virtualization overhead.
 
@@ -26,7 +26,7 @@ This enables stateless synchronization, hierarchy-free RAM caching, and temporal
 The protocol is invoked during the `hn4_format` routine. Instead of seeding the Pseudo-Random Number Generator (PRNG) for a new identity, the caller injects a specific state vector.
 
 ### 2.1 The Format Injection
-The `hn4_format_params_t` structure (in `hn4.h`) exposes specific fields to bypass standard initialization:
+The `hn4_format_params_t` structure (defined in `hn4.h`) exposes specific fields to bypass standard initialization:
 
 ```c
 typedef struct {
@@ -41,7 +41,7 @@ typedef struct {
     hn4_size_t  override_capacity_bytes; // Force logical geometry (Virtual Size)
     
     /* SECURITY OVERRIDES */
-    uint32_t    root_perms_or;           // Inject permission masks (e.g., Force RO)
+    uint32_t    root_perms_or;           // Inject permission masks (e.g., Force Read-Only)
 } hn4_format_params_t;
 ```
 
@@ -50,14 +50,14 @@ The core addressing equation depends on the volume identity:
 $$ LBA = f(\text{UUID}_{vol}, \text{Seed}_{file}, \text{Block}_{index}) $$
 
 If $\text{UUID}_{vol}$ is identical between Drive A and Drive B, the function $f$ returns identical coordinates for any given file.
-*   **Result:** Data locality is deterministic across physical boundaries. No lookup table or translation layer is required to map data between the two volumes.
+*   **Result:** Data locality is deterministic across physical boundaries. No lookup table or translation layer is required to map data between the two volumes; the mapping is inherent in the math.
 
 ---
 
 ## 3. Engineering Use Cases
 
 ### 3.1 Hardware-Accelerated Overlays (L1 Physical Cache)
-**Problem:** Accelerating a slow, large capacity tier (HDD/Tape) with a small, fast tier (RAM/Optane) usually requires a block-level caching driver (e.g., dm-cache, bcache).
+**Problem:** Accelerating a slow, large capacity tier (HDD/Tape) with a small, fast tier (RAM/Optane) usually requires a block-level caching driver (e.g., dm-cache, bcache) which adds latency and complexity.
 
 **Solution:** Format a RAM block device as a Wormhole of the HDD.
 1.  **Format:** Use `override_capacity_bytes` to make the 64GB RAM drive report the same logical capacity (e.g., 10TB) as the HDD source.
@@ -67,7 +67,7 @@ If $\text{UUID}_{vol}$ is identical between Drive A and Drive B, the function $f
     *   **Flush:** Dirty blocks from RAM are written to the *exact same LBA* on the HDD. No translation map is needed because the LBAs are mathematically identical.
 
 ### 3.2 Stateless Delta Synchronization
-**Problem:** syncing petabyte-scale datasets between nodes usually requires traversing directory trees (rsync) to identify changes.
+**Problem:** Syncing petabyte-scale datasets between nodes usually requires traversing directory trees (rsync) to identify changes, which is $O(N)$ and slow.
 
 **Solution:** If Node A and Node B share Wormhole volumes (Same UUID):
 1.  **Logic:** The physical layout is identical.
@@ -106,7 +106,7 @@ Wormhole volumes operating as overlays often act as write-back caches.
 
 Cloning a UUID does not bypass Data-at-Rest Encryption (DARE).
 
-*   **Key Independence:** The Volume UUID is a cleartext identifier. The Master Key used to decrypt payload data is wrapped in the **Cortex**.
+*   **Key Independence:** The Volume UUID is a cleartext identifier. The Master Key used to decrypt payload data is wrapped in the **Cortex** (Metadata Region).
 *   **Behavior:** If an attacker creates a Wormhole of an encrypted drive, they replicate the encrypted ciphertext. Without the specific cryptographic key for that volume instance, the Wormhole contains only high-entropy noise.
 *   **Audit:** Wormhole creation is a logged event. The `hn4_format` routine writes a genesis entry to the Chronicle (Audit Log), cryptographically chaining the fork event to the parent volume's history.
 
@@ -114,4 +114,4 @@ Cloning a UUID does not bypass Data-at-Rest Encryption (DARE).
 
 ## 6. Summary
 
-The Wormhole Protocol treats storage not as a container, but as a function. By injecting initial conditions, we force distinct physical substrates to evaluate the same storage equation, enabling seamless data mobility and layering without the performance cost of virtualization tables.
+The Wormhole Protocol treats storage not as a container, but as a function. By injecting initial conditions, we force distinct physical substrates to evaluate the same storage equation, enabling seamless data mobility and layering without the performance cost of virtualization or translation layers.

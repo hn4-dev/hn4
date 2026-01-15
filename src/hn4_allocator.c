@@ -1884,8 +1884,16 @@ hn4_alloc_genesis(
         uint32_t sec_per_blk = (bs / ss) ? (bs / ss) : 1;
 
         uint64_t S = 1ULL << fractal_scale;
-        
-        uint64_t total_blocks = vol->vol_capacity_bytes / bs;
+        uint64_t total_blocks;
+    #ifdef HN4_USE_128BIT
+        hn4_u128_t cap = vol->vol_capacity_bytes;
+        hn4_u128_t res = hn4_u128_div_u64(cap, bs);
+        /* Safety: If blocks exceed 64-bit count (~18 Exabytes of 4KB blocks), we clamp/fail */
+        if (res.hi > 0) return HN4_ERR_GEOMETRY; 
+        total_blocks = res.lo;
+    #else
+        total_blocks = vol->vol_capacity_bytes / bs;
+    #endif
         uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
         uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
 

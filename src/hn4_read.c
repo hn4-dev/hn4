@@ -544,45 +544,43 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 6. Auto-Medic */
+    /* 6. Auto-Medic */
     if (HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0) {
 
         hn4_block_header_t* w_hdr = (hn4_block_header_t*)io_buf;
-        uint32_t w_meta = hn4_le32_to_cpu(w_hdr->comp_meta);
-        uint8_t algo    = w_meta & HN4_COMP_ALGO_MASK;
+        /* FIX: Removed algo check. Valid data (Compressed or Raw) in io_buf is authoritative. */
 
-        if (algo == HN4_COMP_NONE) {
-            if (vol->read_only) {
-                HN4_LOG_WARN("READ_ATOMIC: Skipping Auto-Medic (RO).");
-            } else {
-                for (int i = 0; i < valid_candidates; i++) {
-                    if (i == winner_idx) continue;
+        if (vol->read_only) {
+            HN4_LOG_WARN("READ_ATOMIC: Skipping Auto-Medic (RO).");
+        } else {
+            for (int i = 0; i < valid_candidates; i++) {
+                if (i == winner_idx) continue;
 
-                    if (failed_mask & (1U << i)) {
-                        hn4_result_t err = candidate_errors[i];
-                        if (err == HN4_ERR_GENERATION_SKEW || err == HN4_ERR_ID_MISMATCH) continue;
+                if (failed_mask & (1U << i)) {
+                    hn4_result_t err = candidate_errors[i];
+                    if (err == HN4_ERR_GENERATION_SKEW || err == HN4_ERR_ID_MISMATCH) continue;
 
-                        uint64_t   bad_lba_idx = candidates[i];
-                        hn4_addr_t bad_phys    = hn4_lba_from_blocks(bad_lba_idx * sectors);
+                    uint64_t   bad_lba_idx = candidates[i];
+                    hn4_addr_t bad_phys    = hn4_lba_from_blocks(bad_lba_idx * sectors);
 
-                        /* Re-verify CRC before writing back to disk */
-                        size_t h_bound = offsetof(hn4_block_header_t, header_crc);
+                    /* 
+                     * Re-verify CRC before writing back to disk.
+                     * We calculate based on the RAW payload in the buffer (compressed or not).
+                     */
+                    size_t h_bound = offsetof(hn4_block_header_t, header_crc);
+                    uint32_t saved_crc = w_hdr->header_crc;
 
-                        /* Polish: Save original CRC to restore state after write attempt */
-                        uint32_t saved_crc = w_hdr->header_crc;
+                    /* Use payload_cap which matches the on-disk size */
+                    uint32_t d_len = HN4_BLOCK_PayloadSize(vol->vol_block_size);
+                    w_hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, w_hdr->payload, d_len));
+                    w_hdr->header_crc = 0;
+                    w_hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, w_hdr, h_bound));
 
-                        uint32_t d_len = HN4_BLOCK_PayloadSize(vol->vol_block_size);
-                        w_hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, w_hdr->payload, d_len));
-                        w_hdr->header_crc = 0;
-                        w_hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, w_hdr, h_bound));
-                        /* Data CRC assumed valid from previous read pass */
-
-                        if (hn4_repair_block(vol, bad_phys, io_buf, bs) != HN4_OK) {
-                            HN4_LOG_WARN("READ_ATOMIC: Auto-Medic failed for candidate %d", i);
-                        }
-
-                        /* Restore buffer state */
-                        w_hdr->header_crc = saved_crc;
+                    if (hn4_repair_block(vol, bad_phys, io_buf, bs) != HN4_OK) {
+                        HN4_LOG_WARN("READ_ATOMIC: Auto-Medic failed for candidate %d", i);
                     }
+
+                    w_hdr->header_crc = saved_crc;
                 }
             }
         }

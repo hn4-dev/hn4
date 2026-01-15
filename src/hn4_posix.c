@@ -456,9 +456,10 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
 
                 /* Slot Free & Name Unique: RESERVE SLOT */
                 /* Mark as Valid but Empty to hold the lock logic */
+                slot_ptr->seed_id = new_anc.seed_id; /* Set the UUID immediately */
                 slot_ptr->data_class = hn4_cpu_to_le64(HN4_FLAG_VALID); 
                 slot_reserved = true;
-                
+
                 hn4_hal_spinlock_release(&vol->locking.l2_lock);
                 break; /* Success */
             }

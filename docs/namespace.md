@@ -1,16 +1,16 @@
-# HN4 Architecture: The Namespace Manifold
+# HN4 Architecture: Namespace & Metadata Subsystem
 **Status:** Implementation Standard v6.0
-**Module:** Cortex (D0) & Semantic Layer
+**Module:** Metadata Region (D0) & Semantic Layer
 **Source:** `hn4_namespace.c`
-**Scope:** Identity, Resolution, Semantics, and Workload Adaptation
+**Scope:** Object Identity, Hash Resolution, and Workload Adaptation
 
 ---
 
-## 1. Executive Summary: The Post-POSIX Paradigm
+## 1. Executive Summary: Flat Addressing Model
 
-The **HN4 Namespace Manifold** rejects the hierarchical directory tree (`/usr/bin/file`) used by traditional file systems. Instead, it utilizes a **Flat, Mathematical Address Space**.
+The **HN4 Namespace Subsystem** replaces the hierarchical directory tree (B-Tree/Extents) used by traditional filesystems with a **Flat, Mathematical Address Space**.
 
-Every object is identified by a **128-bit Cryptographic Seed**. Location is not defined by a path string, but by the mathematical hash of its identity. This architecture allows HN4 to behave as a **Chameleon**, altering its resolution logic based on the workload (AI Tensor vs. Game Asset).
+Every object is identified by a **128-bit Cryptographic Seed** (UUID). Location is not defined by a directory path string, but by the mathematical hash of this identity mapping to a slot in a linear metadata table. This architecture allows HN4 to adapt its resolution logic based on the workload type (e.g., AI Tensor vs. Sequential Stream).
 
 ### Visual Hierarchy
 ```text
@@ -21,14 +21,14 @@ Every object is identified by a **128-bit Cryptographic Seed**. Location is not 
                                     |
                                     v
 +-----------------------------------------------------------------------+
-|                        THE NAMESPACE MANIFOLD                         |
-|  [ URI Parser ] -> [ ID Hasher ] -> [ Bloom Filter ] -> [ Resolver ]  |
+|                        NAMESPACE RESOLVER                             |
+|  [ URI Parser ] -> [ ID Hasher ] -> [ Bloom Filter ] -> [ Linear Scan ]|
 +-----------------------------------------------------------------------+
                                     |
                                     v
 +-----------------------------------------------------------------------+
-|                           THE CORTEX (D0)                             |
-|        Physical Region on Disk acting as a Hash Table                 |
+|                        ANCHOR TABLE (D0 Region)                       |
+|        Contiguous Physical Region acting as an On-Disk Hash Table     |
 |  +-------------+  +-------------+  +-------------+  +-------------+   |
 |  | Anchor #0   |  | Anchor #1   |  | Anchor #2   |  | Anchor #N   |   |
 |  +-------------+  +-------------+  +-------------+  +-------------+   |
@@ -37,9 +37,9 @@ Every object is identified by a **128-bit Cryptographic Seed**. Location is not 
 
 ---
 
-## 2. The Cortex (D0 Region)
+## 2. The Anchor Table (D0 Region)
 
-The Cortex is the physical region of the disk allocated for Metadata. Unlike ext4 inodes which are scattered, or NTFS MFT which fragments, the Cortex is a contiguous, pre-allocated **Linear Array**.
+The Anchor Table (formerly "Cortex") is the physical region allocated for Metadata. Unlike ext4 inodes which are scattered, the Anchor Table is a pre-allocated, contiguous **Linear Array**.
 
 ### 2.1 Physical Layout
 *   **Anchor Size:** 128 Bytes (Fixed).
@@ -47,7 +47,7 @@ The Cortex is the physical region of the disk allocated for Metadata. Unlike ext
 *   **Density:** A 4KB physical page contains exactly **32 Anchors**.
 
 ```text
-LBA 0       LBA 8KB     LBA 1MB         LBA 2MB (Cortex Start)
+LBA 0       LBA 8KB     LBA 1MB         LBA 2MB (Table Start)
 +-----------+-----------+---------------+----------------------------------+
 | SB_NORTH  | EPOCH LOG |   RESERVED    | [ Anchor 0 ] [ Anchor 1 ] ...    |
 +-----------+-----------+---------------+----------------------------------+
@@ -55,204 +55,184 @@ LBA 0       LBA 8KB     LBA 1MB         LBA 2MB (Cortex Start)
 ```
 
 ### 2.2 The Anchor Structure
-The Anchor is the "Atom" of the file system.
+The Anchor is the fundamental metadata record (Inode).
 
 ```c
-// 128 Bytes Packed
+// 128 Bytes Packed (hn4_anchor_t)
 struct Anchor {
-    u128 seed_id;        // 0x00: Immutable Identity (Key)
+    u128 seed_id;        // 0x00: Immutable Identity (Hash Key)
     u128 public_id;      // 0x10: Mutable UUID (Renaming)
-    u64  gravity_center; // 0x20: Physical LBA of Data (G)
-    u64  mass;           // 0x28: Logical Size
-    u64  data_class;     // 0x30: Flags (AI/Game/Text)
+    u64  gravity_center; // 0x20: Physical Start LBA (G)
+    u64  mass;           // 0x28: Logical File Size (Bytes)
+    u64  data_class;     // 0x30: Flags (Type, Hints, State)
     u64  tag_filter;     // 0x38: 64-bit Bloom Filter
-    u8   orbit_vector[6];// 0x40: Ballistic Stride (V)
-    u16  fractal_scale;  // 0x46: Block Size (2^M)
-    u32  permissions;    // 0x48: Capability Bitmask
+    u8   orbit_vector[6];// 0x40: Stride Vector (V)
+    u16  fractal_scale;  // 0x46: Block Scale (2^M)
+    u32  permissions;    // 0x48: Access Control Bitmask
     u32  sovereign_id;   // 0x4C: Owner Hash
-    u64  mod_clock;      // 0x50: Timestamp (ns)
-    u32  write_gen;      // 0x58: Anti-Phantom Counter
-    u32  create_clock;   // 0x5C: Creation Time
-    u32  checksum;       // 0x60: Anchor Integrity CRC
+    u64  mod_clock;      // 0x50: Modification Time (ns)
+    u32  write_gen;      // 0x58: Consistency Counter
+    u32  create_clock;   // 0x5C: Creation Time (Sec)
+    u32  checksum;       // 0x60: Anchor Integrity CRC32C
     u8   inline[28];     // 0x64: Short Name or Tiny Data
 };
 ```
 
 ---
 
-## 3. The Resolution Pipeline (The $O(1)$ Guarantee)
+## 3. The Resolution Pipeline
 
-How does HN4 find a file without a B-Tree? It uses **Hash Placement Logic**.
+HN4 uses **Open Addressing Hash Table** logic directly on the storage media to locate files.
 
 ### 3.1 The Hash Function
-We map the 128-bit ID to a Slot Index using a hardware-optimized "Folded Multiply" hash (implemented in `_ns_hash_id`).
+The 128-bit Seed ID is mapped to a Slot Index using a hardware-optimized "Folded Multiply" hash (refer to `_ns_hash_uuid` in `hn4_namespace.c`).
 
-```text
-ID (128-bit)  -->  [ XOR Fold ] --> [ Multiply Constant ] --> [ Slot Index ]
-                                           |
-                                    0xff51afd7ed558ccd
+```c
+/* Implementation Logic */
+uint64_t h = id.lo ^ id.hi;       // XOR Fold
+h ^= (h >> 33);                   // Mixer 1
+h *= 0xff51afd7ed558ccdULL;       // Prime Multiplier
+h ^= (h >> 33);                   // Mixer 2
+Slot_Index = h % Total_Slots;
 ```
 
-### 3.2 Insertion Logic (Linear Probe)
-The current implementation uses **Linear Probing** from the hashed slot index.
+### 3.2 Insertion Logic (Linear Probing)
+The implementation uses **Linear Probing** to resolve hash collisions.
 
-**Algorithm Visual:**
-```text
-INSERT ID "A" (Hash = 10)
-1. Check Slot 10.
-   [ Slot 10: Empty ] -> WRITE "A" to Slot 10. DONE.
-
-INSERT ID "B" (Hash = 10)
-1. Check Slot 10.
-   [ Slot 10: Occupied by "A" ] -> COLLISION.
-2. Probe Slot 11.
-   [ Slot 11: Empty ] -> WRITE "B" to Slot 11. DONE.
-```
-*Result:* Items are clustered near their mathematical ideal location, maximizing cache locality.
+**Algorithm:**
+1.  Calculate `Target_Slot = Hash(ID) % Capacity`.
+2.  Check `Anchor[Target_Slot]`.
+3.  If occupied (ID mismatch), increment slot index (`Target_Slot + 1`).
+4.  Repeat until an Empty Slot (`ID == 0`) or a Tombstone is found.
 
 ### 3.3 Lookup Logic
-Because deletions create "Tombstones" that might interrupt probe chains, the reader checks the Primary Slot, then scans linearly for a bounded distance (e.g., 1024 slots) to handle local clusters.
+The reader checks the Primary Slot, then scans linearly for a bounded distance (defined by `HN4_NS_MAX_PROBES = 1024`) to locate the record.
 
-```text
-LOOKUP ID "X"
-1. Calculate Slot S = Hash(X) % Capacity.
-2. Read 4KB Page at S (contains 32 anchors).
-3. CPU Scan (SIMD):
-   Compare(Anchor[0].ID, X)
-   Compare(Anchor[1].ID, X)
-   ...
-   Compare(Anchor[31].ID, X)
-4. Match Found? -> Return Anchor.
-5. Else -> Fetch Next Page (Linear Probe).
-```
-**Latency:** 1 Disk Read (Best Case). Average $O(1)$ due to low load factor.
+**Logic Flow (`_ns_scan_cortex_slot`):**
+1.  Calculate Start Slot.
+2.  Iterate up to 1024 slots.
+3.  For each slot:
+    *   Check `HN4_FLAG_VALID` and `HN4_FLAG_TOMBSTONE`.
+    *   Compare `seed_id` with requested ID.
+    *   Verify CRC32C integrity.
+    *   If valid match found, return Anchor.
+4.  If an empty slot (ID=0) is encountered, terminate search (Not Found).
 
 ---
 
-## 4. Workload Adaptation (The Chameleon)
+## 4. Adaptive Workload Profiles
 
-HN4 changes its namespace behavior based on the `Data_Class` flag in the Anchor.
+HN4 alters its I/O strategy based on the `Data_Class` flags stored in the Anchor.
 
-### 4.1 AI Mode (`TYPE_MATRIX`)
-**Goal:** Maximum Throughput, Zero CPU Overhead.
-**Scenario:** Training an LLM on 1TB of weights.
+### 4.1 AI Mode (`HN4_ALLOC_TENSOR`)
+**Goal:** High-Throughput, Direct Access.
+**Logic:**
+1.  **Resolution:** `hn4_ns_gather_tensor_shards` scans the table for all Anchors matching a Model Tag.
+2.  **Mapping:** Instead of reading data, it calculates the physical address ranges ($G, V, M$) for all shards.
+3.  **Direct I/O:** The driver constructs a Scatter-Gather List (SGL) for Peer-to-Peer (P2P) DMA, allowing transfer directly to GPU memory (bypassing CPU buffers).
 
-1.  **Resolution:** The Namespace resolves the ID to a **Ballistic Formula** ($G, V, M$).
-2.  **The Tensor Tunnel:** Instead of reading data into Kernel RAM, the driver generates a **Scatter-Gather List (SGL)** of physical addresses based on the formula.
-3.  **P2P DMA:** The NVMe controller is programmed to DMA these physical blocks **directly into GPU VRAM** via PCIe Peer-to-Peer (using `hn4_hal_map_p2p`).
-4.  **CPU Action:** The CPU is bypassed completely after the initial metadata lookup.
+### 4.2 Gaming Mode (`HN4_ALLOC_LUDIC`)
+**Goal:** Low Latency, Texture Streaming.
+**Logic:**
+1.  **Predictive Prefetch:** When a request for Block $N$ is received, the driver calculates the physical location of Block $N+1$ (the next LOD or asset chunk).
+2.  **Deterministic Calc:** Because location is math-based ($LBA = G + N \times V$), prefetching requires zero metadata lookups.
+3.  **Execution:** `hn4_hal_prefetch` is called to load data into the controller cache before the application requests it.
 
-### 4.2 Gaming Mode (`TYPE_LUDIC`)
-**Goal:** Minimum Latency, Texture Streaming.
-**Scenario:** Loading an Open World zone.
-
-1.  **Ballistic Prefetch:** The Namespace sees the request for Texture LOD 0 (Low Res).
-2.  **Logic:** Because the location of LOD 1 and LOD 2 is mathematically deterministic (Orbit $k=1, k=2$), the driver issues **Speculative Reads** for the high-res textures before the game engine asks for them.
-3.  **Result:** Negative Latency. Data is in RAM before the request is made.
-
-### 4.3 General/Human Mode (`TYPE_UNSTRUCT`)
-**Goal:** Ease of use, Searchability.
-**Scenario:** User searching for "Vacation Photos".
-
-1.  **Bloom Filter:** The driver uses the **Semantic Tagging** engine (see below) to filter 100,000 files in microseconds.
-2.  **Virtual Hierarchy:** The driver synthesizes a "Folder" view based on the tags, presenting a familiar interface to the OS Explorer via the POSIX Shim.
+### 4.3 General Mode (`HN4_TYPE_UNSTRUCT`)
+**Goal:** Search and Organization.
+**Logic:**
+1.  **Bloom Filter:** Uses the 64-bit `tag_filter` field to rapidly filter files (e.g., "Find all logs").
+2.  **Virtualization:** The driver synthesizes a directory listing based on tag matches rather than physical folder structures.
 
 ---
 
-## 5. Semantic Tagging (The Bloom Filter)
+## 5. Semantic Tagging (Bloom Filter)
 
-HN4 replaces `mkdir` with `tag_add`.
+HN4 supports O(1) attribute filtering using a bitwise Bloom Filter.
 
-### 5.1 The Bitmask Logic
+### 5.1 Bitmask Logic
 Every Anchor contains a 64-bit `tag_filter`.
-*   To tag a file "Finance":
-    1.  Hash "Finance" -> 3 bit positions (e.g., 2, 19, 44).
-    2.  Set bits in `tag_filter`.
+*   To tag a file (e.g., "Finance"):
+    1.  Hash string "Finance" (FNV-1a).
+    2.  Map hash to **3 distinct bit positions** ($0 \dots 63$).
+    3.  Set bits in `tag_filter` (`_ns_generate_tag_mask`).
 
-### 5.2 The Query Engine
+### 5.2 Query Engine
 **Query:** `tag:Finance` AND `tag:2024`.
 
-```text
-Query "Finance": [0010...1000...10] (Mask A)
-Query "2024":    [0000...1010...00] (Mask B)
-Combined Mask:   (Mask A | Mask B)
+```c
+/* Pseudocode */
+uint64_t mask_finance = Hash("Finance"); // e.g. bits 2, 19, 44
+uint64_t mask_2024    = Hash("2024");    // e.g. bits 5, 22, 60
+uint64_t required     = mask_finance | mask_2024;
 
-SCAN LOOP (CPU SIMD):
-   Load Anchor.tag_filter
-   Result = (tag_filter & Combined_Mask)
-   IF (Result == Combined_Mask) -> CANDIDATE
+// Linear Scan of Metadata Region
+if ((anchor.tag_filter & required) == required) {
+    // Potential Match (Bloom Filter has false positives)
+    // Perform string comparison on Extension Block to verify.
+}
 ```
-
-### 5.3 False Positive Defense (The Extension Check)
-Bloom filters are probabilistic. A "Match" means "Maybe".
-1.  **Bit Check:** Fast. Eliminates 99.9% of non-matches.
-2.  **String Check:** If bits match, the driver traverses the **Extension Chain** (see below) to perform a `strcmp` on the actual tag strings stored on disk.
-3.  **User View:** 100% Accuracy.
 
 ---
 
-## 6. The Extension Manifold (Linked Lists in Space)
+## 6. Extension Blocks (Linked Metadata)
 
-The Anchor is small (128 bytes). To support Long Filenames (>23 chars) and Unlimited Tags, HN4 uses **Extension Blocks**.
+The Anchor is fixed at 128 bytes. To support Long Filenames (>24 chars) and arbitrary tags, HN4 uses **Extension Blocks** stored in the Data Region (D1).
 
 ### 6.1 Chain Topology
-If `Inline_Buffer` contains a Pointer (LBA), it links to D1 (Flux Region).
+If the `Inline_Buffer` contains a Pointer (LBA) and the `HN4_FLAG_EXTENDED` bit is set, it links to an external block.
 
 ```text
 [ ANCHOR (D0) ]
    |
-   +--> [ EXT BLOCK 1 (D1) ]
-           Type: LONGNAME
-           Payload: "very_long_report_final_v2.pdf"
-           Next: LBA 500
+   +--> [ EXTENSION HEADER (D1) ]
+           Magic: 0x4D455441 ("META")
+           Type:  HN4_EXT_TYPE_LONGNAME
+           Data:  "very_long_report_final_v2.pdf"
+           Next:  LBA 500
              |
-             +--> [ EXT BLOCK 2 (D1) ]
-                     Type: TAG
-                     Payload: "Finance", "Q3", "Approved"
-                     Next: 0 (End)
+             +--> [ EXTENSION HEADER (D1) ]
+                     Type:  HN4_EXT_TYPE_TAG
+                     Data:  "Finance", "Q3", "Approved"
+                     Next:  0 (End of Chain)
 ```
 
-### 6.2 Safety Limits
-*   **Depth Limit:** 16 Blocks. Prevents infinite loops (Ouroboros Attack).
-*   **Magic Number:** Every extension block starts with `0x4D455441` ("META") to verify validity before parsing.
+### 6.2 Safety Constraints
+*   **Depth Limit:** `HN4_NS_MAX_EXT_DEPTH` (16 blocks). Prevents infinite loops.
+*   **Validation:** Extension pointers must point to valid Data Region addresses (`_ns_verify_extension_ptr`).
 
 ---
 
 ## 7. URI Addressing Scheme
 
-HN4 standardizes file access via URIs, removing the dependency on mount points like `/mnt/sda1` or `C:\`.
+HN4 accesses objects via Uniform Resource Identifiers (URIs), parsed by `hn4_ns_resolve`.
 
-### Scheme Syntax
+### Syntax
 `hn4://<VOLUME>/<SELECTOR>`
 
-### Selector Types
+### Selectors
 
-| Prefix | Type | Example | Resolution Logic |
+| Prefix | Type | Internal Logic | Performance |
 |:---|:---|:---|:---|
-| `id:` | **Identity** | `id:a0b1...` | **Hash -> Slot.** Fastest. Used by System/DB. |
-| `tag:` | **Semantic** | `tag:Photo` | **Scan D0 + Bloom Filter.** Returns Virtual Directory. |
-| `(none)` | **Name** | `config.ini` | **Scan D0 + String Compare.** Human convenient. |
+| `id:` | **Identity** | Hashing -> Direct Slot Access | $O(1)$ |
+| `tag:` | **Semantic** | Linear Scan + Bitwise AND | $O(N)$ (Metadata only) |
+| `(none)` | **Name** | Linear Scan + `strcmp` | $O(N)$ (Metadata only) |
 
-### Complex Query Example
-`hn4://System/tag:Log+Error#time:2023-10`
-*   **Volume:** System
-*   **Filter:** Tags "Log" AND "Error".
-*   **Slicing:** Jump to byte offset corresponding to timestamp `2023-10`.
+### Temporal Slicing
+Suffixes allow accessing specific versions or timestamps.
+*   `#time:<ns>`: Compares against `mod_clock`. Returns `HN4_ERR_TIME_PARADOX` if file is newer than requested time.
+*   `#gen:<id>`: Compares against `write_gen`. Ensures atomic consistency with a specific transaction state.
 
 ---
 
 ## 8. Security Model
 
-### 8.1 Tombstone Lifecycle (Deletion)
-HN4 does not erase data immediately. It changes state.
+### 8.1 Deletion (Tombstones)
+Deletion is a logical state change, not an immediate wipe.
+*   **Flag:** `HN4_FLAG_TOMBSTONE` is set in `data_class`.
+*   **Effect:** The file becomes invisible to standard lookups.
+*   **Reclamation:** The Scavenger process (`_reap_tombstone`) scans for expired tombstones (older than 24 hours), zeroes the Anchor, and releases the bitmap bits.
 
-```text
-[ Active File ]  --delete()-->  [ Tombstone ]  --reaper()-->  [ Void ]
-   (Visible)                   (Hidden/Undoable)             (Overwritten)
-```
-*   **Undelete:** Possible instantly by clearing the Tombstone flag (`HN4_FLAG_TOMBSTONE`).
-*   **Purge:** The Reaper process scans D0 periodically, zeroing Tombstones and freeing Bitmap bits.
-
-### 8.2 The Sovereign Key
-*   **Permissions:** A 32-bit mask in the Anchor.
-*   **Immutability:** `PERM_IMMUTABLE` creates a **WORM** (Write Once, Read Many) file. The driver physically rejects write commands to the logic layer, protecting against ransomware.
+### 8.2 Access Control
+*   **Permissions:** A 32-bit mask (`anchor.permissions`) enforcing Read/Write/Exec.
+*   **Immutability:** Setting `HN4_PERM_IMMUTABLE` creates a WORM (Write Once, Read Many) file. The driver physically rejects write commands to any handle associated with such an anchor.

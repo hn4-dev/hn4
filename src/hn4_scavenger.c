@@ -574,15 +574,27 @@ static void _evacuate_zns_victim(
             /* Perform write using the SHADOW anchor so live physics remain valid */
             if (hn4_write_block_atomic(vol, &shadow_anchor, logic_seq, hdr->payload, move_len) == HN4_OK) {
     
-            hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, &shadow_anchor);
-    
-            if (anchor_res == HN4_OK) {
-                hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-                memcpy(owner_anchor, &shadow_anchor, sizeof(hn4_anchor_t));
-                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                /* Persist to disk first */
+                hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, &shadow_anchor);
         
-                evacuated_count++;
-            } else {
+                if (anchor_res == HN4_OK) {
+                    /* ATOMIC VERIFICATION */
+                    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+                    
+                    /* Check if user updated the file while we were moving blocks */
+                    uint32_t current_gen = hn4_le32_to_cpu(owner_anchor->write_gen);
+                    if (current_gen == anchor_gen) {
+                        /* Safe to commit */
+                        memcpy(owner_anchor, &shadow_anchor, sizeof(hn4_anchor_t));
+                        evacuated_count++;
+                    } else {
+                        /* Race detected: User wrote to file. Abort this move. */
+                        HN4_LOG_WARN("ZNS Evacuator: Race detected on Anchor. Aborting move.");
+                        /* Note: We leak the space written to the new zone, but data safety is preserved */
+                    }
+                    
+                    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                } else {
                 HN4_LOG_CRIT("ZNS Evacuator: Anchor persistence failed. Abort.");
                 hn4_hal_mem_free(io_buf);
                 return;
@@ -594,8 +606,7 @@ static void _evacuate_zns_victim(
             }
         } else {
             HN4_LOG_WARN("ZNS Evacuator: Orphan Block %llu. Skipping Zone.", (unsigned long long)global_blk_idx);
-            hn4_hal_mem_free(io_buf);
-            return;
+            continue; /* Skip to next block, do not abort */
         }
     }
 

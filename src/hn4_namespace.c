@@ -462,9 +462,17 @@ static hn4_result_t _ns_resonance_scan(
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t ss = caps->logical_block_size;
     
+    uint64_t total_sectors;
+#ifdef HN4_USE_128BIT
+    hn4_u128_t diff = hn4_u128_sub(vol->sb.info.lba_bitmap_start, vol->sb.info.lba_cortex_start);
+    /* Cortex must fit in 64-bit addressing even on large drives for RAM cache reasons */
+    if (diff.hi > 0) return HN4_ERR_NOMEM; 
+    total_sectors = diff.lo;
+#else
     uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
     uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
-    uint64_t total_sectors = end_sect - start_sect;
+    total_sectors = end_sect - start_sect;
+#endif
     
     /* Batch configuration */
     uint32_t batch_bytes = 64 * 1024;

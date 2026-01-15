@@ -87,26 +87,21 @@ static hn4_result_t _broadcast_superblock(
     
     if (ss == 0) ss = 512;
     if (bs < ss || (bs % ss) != 0) return HN4_ERR_GEOMETRY;
-    if (ss < HN4_SB_SIZE && (HN4_SB_SIZE % ss != 0)) return HN4_ERR_GEOMETRY;
 
-    /* Validate Ring Pointer vs Capacity */
-    hn4_size_t dev_cap = vol->vol_capacity_bytes;
-
+    /* Validate Ring Pointer vs Capacity (128-bit safe) */
 #ifdef HN4_USE_128BIT
-    /* A safe generic check for SB pointers exceeding addressable range */
-    if (active_ring_ptr_blk.hi > 0) return HN4_ERR_GEOMETRY; 
+    hn4_u128_t total_blocks_128 = hn4_u128_div_u64(vol->vol_capacity_bytes, bs);
+    if (hn4_u128_cmp(active_ring_ptr_blk, total_blocks_128) >= 0) return HN4_ERR_GEOMETRY;
 #else
-    uint64_t total_blocks = dev_cap / bs;
+    uint64_t total_blocks = vol->vol_capacity_bytes / bs;
     if (active_ring_ptr_blk >= total_blocks) return HN4_ERR_GEOMETRY;
 #endif
 
-    /* Use ceiling division to ensure correct coverage if HN4_SB_SIZE < ss */
     uint32_t sectors_per_sb = (HN4_SB_SIZE + ss - 1) / ss;
-
     uint32_t buf_sz = HN4_ALIGN_UP(HN4_SB_SIZE, ss);
+    
     void* io_buf = hn4_hal_mem_alloc(buf_sz);
     if (!io_buf) return HN4_ERR_NOMEM;
-
     _secure_zero(io_buf, buf_sz);
 
     hn4_superblock_t* cpu_sb = hn4_hal_mem_alloc(sizeof(hn4_superblock_t));
@@ -115,7 +110,7 @@ static hn4_result_t _broadcast_superblock(
         return HN4_ERR_NOMEM;
     }
 
-
+    _secure_zero(cpu_sb, sizeof(hn4_superblock_t));
     memcpy(cpu_sb, &vol->sb, sizeof(hn4_superblock_t));
 
     cpu_sb->info.last_mount_time = hn4_hal_get_time_ns();
@@ -123,7 +118,6 @@ static hn4_result_t _broadcast_superblock(
     if (bump_generation) {
         if (cpu_sb->info.copy_generation >= HN4_MAX_GENERATION) {
             cpu_sb->info.state_flags |= HN4_VOL_LOCKED;
-            HN4_LOG_CRIT("Volume Generation Limit Reached. Volume LOCKED.");
         } else {
             cpu_sb->info.copy_generation++;
         }
@@ -134,7 +128,7 @@ static hn4_result_t _broadcast_superblock(
 
     if (vol->health.taint_counter > 0) cpu_sb->info.dirty_bits |= HN4_DIRTY_BIT_TAINT;
 
-    /* State Flag Logic */
+    /* State Logic */
     if (set_clean && !force_degraded) {
         uint32_t bad_mask = (HN4_VOL_TOXIC | HN4_VOL_PANIC | HN4_VOL_DEGRADED);
         if (!(cpu_sb->info.state_flags & bad_mask)) {
@@ -147,84 +141,54 @@ static hn4_result_t _broadcast_superblock(
         if (force_degraded) cpu_sb->info.state_flags |= HN4_VOL_DEGRADED;
     }
 
-    /* 2. Calculate Targets (Block Indices) */
+    /* 2. Calculate Targets (Using 128-bit safe logic from previous steps) */
     uint64_t targets[SB_LOC_MAX];
     bool attempt_south = false;
     uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
 
-    
-    /* 
-     * MATH: Handle 128-bit Capacity for Mirror Calculation 
-     */
 #ifdef HN4_USE_128BIT
-    /* 
-     * QUETTABYTE SCALING ENABLED
-     * Use 128-bit math primitives to calculate mirror positions accurately.
-     */
-    
-    /* NORTH: Always 0 */
+    hn4_u128_t dev_cap_128 = vol->vol_capacity_bytes;
     targets[SB_LOC_NORTH] = 0;
-
-    /* Calculation: (Capacity / 100) * 33 */
-    hn4_u128_t one_percent = hn4_u128_div_u64(dev_cap, 100);
     
-    /* EAST: one_percent * 33 */
-    hn4_u128_t east_bytes = hn4_u128_mul_u64(one_percent, 33);
+    hn4_u128_t one_pct = hn4_u128_div_u64(dev_cap_128, 100);
+    hn4_u128_t e_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 33), bs);
+    hn4_u128_t w_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 66), bs);
     
-    /* WEST: one_percent * 66 */
-    hn4_u128_t west_bytes = hn4_u128_mul_u64(one_percent, 66);
+    targets[SB_LOC_EAST] = (e_blk.hi > 0) ? 0 : e_blk.lo;
+    targets[SB_LOC_WEST] = (w_blk.hi > 0) ? 0 : w_blk.lo;
 
-    /* Convert Bytes to Blocks */
-    hn4_u128_t east_blk = hn4_u128_div_u64(east_bytes, bs);
-    hn4_u128_t west_blk = hn4_u128_div_u64(west_bytes, bs);
-
-    /* 
-     * Safety Guard: 
-     * Max Block Index 2^64 * 4KB Block = 73 Zettabytes. 
-     */
-    if (east_blk.hi > 0 || west_blk.hi > 0) {
-        HN4_LOG_WARN("Volume too large for Block Indexing. Mirrors disabled.");
-        targets[SB_LOC_EAST] = 0;
-        targets[SB_LOC_WEST] = 0;
+    hn4_u128_t sb_space_128 = hn4_u128_from_u64(sb_space);
+    if (hn4_u128_cmp(dev_cap_128, sb_space_128) > 0) {
+        hn4_u128_t south_sub = hn4_u128_sub(dev_cap_128, sb_space_128);
+        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, bs);
+        targets[SB_LOC_SOUTH] = (south_blk.hi > 0) ? 0 : south_blk.lo;
     } else {
-        targets[SB_LOC_EAST] = east_blk.lo;
-        targets[SB_LOC_WEST] = west_blk.lo;
+        targets[SB_LOC_SOUTH] = 0;
     }
-
-    /* SOUTH: Capacity - SB_SPACE */
-    hn4_u128_t south_sub = hn4_u128_sub(dev_cap, hn4_u128_from_u64(sb_space));
-    hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, bs);
-    
-    if (south_blk.hi > 0) targets[SB_LOC_SOUTH] = 0; // Too big
-    else targets[SB_LOC_SOUTH] = south_blk.lo;
-    
     attempt_south = (targets[SB_LOC_SOUTH] > 0);
 #else
-    /* Standard 64-bit Logic */
+    /* 64-bit Logic */
     targets[SB_LOC_NORTH] = 0;
-    targets[SB_LOC_EAST]  = HN4_ALIGN_UP((dev_cap / 100) * 33, bs) / bs;
-    targets[SB_LOC_WEST]  = HN4_ALIGN_UP((dev_cap / 100) * 66, bs) / bs;
-
-    uint64_t aligned_cap = HN4_ALIGN_DOWN(dev_cap, bs);
+    targets[SB_LOC_EAST]  = HN4_ALIGN_UP((vol->vol_capacity_bytes / 100) * 33, bs) / bs;
+    targets[SB_LOC_WEST]  = HN4_ALIGN_UP((vol->vol_capacity_bytes / 100) * 66, bs) / bs;
+    uint64_t aligned_cap = HN4_ALIGN_DOWN(vol->vol_capacity_bytes, bs);
     if (aligned_cap >= (sb_space * 16)) {
         targets[SB_LOC_SOUTH] = (aligned_cap - sb_space) / bs;
         attempt_south = true;
     } else {
-        targets[SB_LOC_SOUTH] = 0; 
+        targets[SB_LOC_SOUTH] = 0;
     }
 #endif
 
-    if (attempt_south) {
-        cpu_sb->info.compat_flags |= HN4_COMPAT_SOUTH_SB;
-    } else {
-        cpu_sb->info.compat_flags &= ~HN4_COMPAT_SOUTH_SB;
-    }
+    if (attempt_south) cpu_sb->info.compat_flags |= HN4_COMPAT_SOUTH_SB;
+    else cpu_sb->info.compat_flags &= ~HN4_COMPAT_SOUTH_SB;
 
     /* 3. Serialize & Checksum */
     hn4_sb_to_disk(cpu_sb, (hn4_superblock_t*)io_buf); 
     hn4_superblock_t* dsb = (hn4_superblock_t*)io_buf;
     dsb->raw.sb_crc = 0;
-    uint32_t crc = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
+    
+    uint32_t crc = hn4_crc32(0, (uint8_t*)io_buf, HN4_SB_SIZE - 4);
     dsb->raw.sb_crc = hn4_cpu_to_le32(crc);
 
     /* 4. IO Loop */
@@ -232,24 +196,9 @@ static hn4_result_t _broadcast_superblock(
 
     for (int i = 0; i < SB_LOC_MAX; i++) {
         if (i == SB_LOC_SOUTH && !attempt_south) continue;
-        
-        /* 
-         * If calculation results in 0 (North), we must SKIP this mirror
-         * to prevent corrupting the primary Superblock.
-         */
-        if (i > SB_LOC_NORTH && targets[i] == 0) {
-            slot_ok[i] = false; 
-            continue; 
-        }
+        if (i > SB_LOC_NORTH && targets[i] == 0) { slot_ok[i] = false; continue; }
 
-        if ((caps->hw_flags & HN4_HW_ZNS_NATIVE) && i > SB_LOC_NORTH) {
-            slot_ok[i] = false; // Mark as skipped/failed safely
-            continue;
-        }
-
-        /* Convert Block Index -> Sector LBA */
         hn4_addr_t phys_lba;
-        
     #ifdef HN4_USE_128BIT
         hn4_u128_t blk_128 = hn4_u128_from_u64(targets[i]);
         uint64_t sec_per_blk = bs / ss;
@@ -258,11 +207,11 @@ static hn4_result_t _broadcast_superblock(
         phys_lba = targets[i] * (bs / ss);
     #endif
 
-        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
-            if (i > SB_LOC_NORTH) {
-                slot_ok[i] = false; /* Skip Mirrors on ZNS */
-                continue;
-            }
+        if ((caps->hw_flags & HN4_HW_ZNS_NATIVE)) {
+            if (i > SB_LOC_NORTH) { slot_ok[i] = false; continue; }
+            hn4_result_t z_res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, phys_lba, NULL, 0);
+            if (z_res != HN4_OK) { slot_ok[i] = false; continue; }
+            hn4_hal_barrier(dev);
         }
         
         hn4_result_t io_res = hn4_hal_sync_io(dev, HN4_IO_WRITE, phys_lba, io_buf, sectors_per_sb);
@@ -274,16 +223,28 @@ static hn4_result_t _broadcast_superblock(
             if (i == SB_LOC_SOUTH) {
                 if (!attempt_south) break; 
 
+                HN4_LOG_WARN("South SB Write Failed. Retrying with new Generation.");
+
+                /* Remove South Flag */
                 cpu_sb->info.compat_flags &= ~HN4_COMPAT_SOUTH_SB;
                 
+                /* Bump generation to ensure new North/East/West supersedes partial write */
+                if (cpu_sb->info.copy_generation < HN4_MAX_GENERATION) {
+                    cpu_sb->info.copy_generation++;
+                }
+                
                 /* Re-serialize */
+                _secure_zero(io_buf, buf_sz);
                 hn4_sb_to_disk(cpu_sb, (hn4_superblock_t*)io_buf);
+                
+                /* Re-CRC */
                 dsb->raw.sb_crc = 0;
-                uint32_t c = hn4_crc32(0, dsb, HN4_SB_SIZE - 4);
+                uint32_t c = hn4_crc32(0, (uint8_t*)io_buf, HN4_SB_SIZE - 4);
                 dsb->raw.sb_crc = hn4_cpu_to_le32(c);
                 
+                /* Reset Loop Logic */
                 attempt_south = false; 
-                i = -1; /* Restart loop to update N/E/W */
+                i = -1; /* Loop increments to 0 */
                 memset(slot_ok, 0, sizeof(slot_ok)); 
                 continue;
             }
@@ -293,11 +254,8 @@ static hn4_result_t _broadcast_superblock(
     hn4_hal_mem_free(io_buf);
     hn4_hal_mem_free(cpu_sb); 
 
-    /* 5. Quorum Check */
     int total_success = 0;
-    for(int k=0; k<SB_LOC_MAX; k++) {
-        if(slot_ok[k]) total_success++;
-    }
+    for(int k=0; k<SB_LOC_MAX; k++) { if(slot_ok[k]) total_success++; }
     
     bool north_valid = slot_ok[SB_LOC_NORTH];
     bool quorum_met;
@@ -309,7 +267,6 @@ static hn4_result_t _broadcast_superblock(
     }
     return quorum_met ? HN4_OK : HN4_ERR_HW_IO;
 }
-
 /* =========================================================================
  * MAIN UNMOUNT IMPLEMENTATION
  * ========================================================================= */
@@ -394,10 +351,15 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                              * Check the Armored Word's ECC. If RAM corrupted, do not persist.
                              */
                             hn4_armored_word_t* w = &vol->void_bitmap[cursor];
+    
                             uint64_t safe_data;
+    
                             if (_ecc_check_and_fix(vol, w->data, w->ecc, &safe_data, NULL) != HN4_OK) {
-                                HN4_LOG_CRIT("CRITICAL: RAM Bitmap Corruption detected at word %zu during unmount!", cursor);
-                                return HN4_ERR_CPU_INSANITY; /* Abort flush */
+                                HN4_LOG_CRIT("CRITICAL: RAM Bitmap Corruption detected!");
+                                atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC | HN4_VOL_TOXIC);
+                                persistence_ok = false;
+                                final_res = HN4_ERR_CPU_INSANITY;
+                                break;
                             }
                             
                             raw[items++] = safe_data;
@@ -431,9 +393,6 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                         
                         /* Copy to scratch */
                         memcpy(meta_buf, (uint8_t*)vol->quality_mask + cursor_bytes, copy_len);
-                        
-                        /* Swap Scratch */
-                        hn4_bulk_cpu_to_le64((uint64_t*)meta_buf, (copy_len + 7) / 8);
                         
                         uint32_t sectors = (copy_len + ss - 1) / ss;
                         hn4_addr_t lba = hn4_lba_from_sectors(start_lba_val);
@@ -521,9 +480,9 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                 }
 
                 _broadcast_superblock(dev, vol, active_epoch, active_ring_ptr_blk, 
-                                    false, /* set_clean */
-                                    true,  /* force_degraded */
-                                    false  /* bump_generation (already done) */);
+                    false, /* set_clean */
+                    true,  /* force_degraded */
+                    true   /* bump_generation: YES (Write N+2) */);
                 final_res = tmp_res;
             }
         }
@@ -554,7 +513,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         hn4_hal_mem_free(vol);
     }
 
-    HN4_LOG_VAL("Unmount Complete. Status", final_res);
+    HN4_LOG_FMT("Unmount Complete. Status: %d\n", (int)final_res);
     return final_res;
 }
 

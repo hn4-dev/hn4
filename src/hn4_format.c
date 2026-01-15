@@ -218,12 +218,20 @@ static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev,
 
 
 static hn4_result_t _sanitize_generic(hn4_hal_device_t* dev, hn4_size_t capacity_bytes, uint32_t bs) {
-    HN4_LOG_VAL("Generic TRIM/Discard. Bytes", capacity_bytes);
-    /* Discard uses BLOCK COUNT */
-    if (capacity_bytes % bs != 0) {
-    /* Align down to avoid discarding beyond capacity */
-    capacity_bytes = HN4_ALIGN_DOWN(capacity_bytes, bs);
+#ifdef HN4_USE_128BIT
+    /* Check alignment via division remainder simulation or assumption */
+    /* Since we don't have a full u128%u32 helper here easily, and capacity usually block aligned */
+    /* We skip alignment check relying on caller, OR implement using div helper */
+    /* Simplified: If low bits don't match mask */
+    if ((capacity_bytes.lo & (bs - 1)) != 0) {
+         /* Naive align down for power-of-2 bs */
+         capacity_bytes.lo &= ~((uint64_t)bs - 1);
     }
+#else
+    if (capacity_bytes % bs != 0) {
+        capacity_bytes = HN4_ALIGN_DOWN(capacity_bytes, bs);
+    }
+#endif
     /* hn4_hal_sync_io_large expects len_bytes and divides by bs internally */
     return hn4_hal_sync_io_large(dev, HN4_IO_DISCARD, hn4_addr_from_u64(0), NULL, capacity_bytes, bs);
     }

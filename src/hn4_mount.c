@@ -53,13 +53,15 @@ static inline hn4_result_t _phys_lba_from_block(
     *out_addr = hn4_u128_mul_u64(blk, sectors_per_block);
 #else
     /* Standard check */
-    uint64_t max_lba = total_capacity_bytes / sector_size;
+    uint64_t total_logical_blocks = total_capacity_bytes / block_size;
+    
+    /* FIX: Validate Logical Index first */
+    if (block_idx >= total_logical_blocks) return HN4_ERR_GEOMETRY;
+
+    /* Now safe to multiply */
     if (block_idx > (UINT64_MAX / sectors_per_block)) return HN4_ERR_GEOMETRY;
     
-    uint64_t raw_lba = block_idx * sectors_per_block;
-    if (raw_lba >= max_lba) return HN4_ERR_GEOMETRY;
-    
-    *out_addr = raw_lba;
+    *out_addr = block_idx * sectors_per_block;
 #endif
 
     return HN4_OK;
@@ -107,11 +109,14 @@ static hn4_result_t _validate_sb_integrity(HN4_IN const void* buffer)
     uint32_t raw32[4];
     memcpy(raw32, buffer, sizeof(raw32));
 
-    /* Cast to struct to ensure we respect ABI padding/offsets */
-    const hn4_superblock_t* sb_view = (const hn4_superblock_t*)buffer;
+    /* FIX: Reconstruct Magic from safe copy */
+    uint64_t magic_lo = raw32[0];
+    uint64_t magic_hi = raw32[1];
+    /* Combine (Assumes Disk is LE) */
+    uint64_t safe_magic = hn4_le64_to_cpu(magic_lo | (magic_hi << 32));
 
     /* 1. Magic Check */
-    if (HN4_UNLIKELY(hn4_le64_to_cpu(sb_view->info.magic) != HN4_MAGIC_SB)) {
+    if (HN4_UNLIKELY(safe_magic != HN4_MAGIC_SB)) {
         /* 
          * Endian Safety.
          * Normalize disk data (LE) to CPU before comparing with host constant.
@@ -191,6 +196,8 @@ static hn4_result_t _read_sb_at_lba(
         read_bytes = HN4_MAX(min_bytes, HN4_ALIGN_UP(safe_bs, dev_sector_size));
     }
     uint32_t sectors = read_bytes / dev_sector_size;
+
+    memset(io_buf, 0, read_bytes);
 
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, lba, io_buf, sectors);
     if (res != HN4_OK) return res;
@@ -346,12 +353,17 @@ static hn4_result_t _execute_cardinal_vote(
         /* s_off = cap - sb_space */
         /* We need a 128-bit version of _calc_south_offset logic */
         uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, current_bs);
-        hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
         
-        /* Check heuristic: Capacity must be > 16x SB Size */
-        /* Since we have u128, just check south_sub > 0 mostly */
+        hn4_u128_t min_req = hn4_u128_from_u64(sb_space * 16);
         
-        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
+        if (hn4_u128_cmp(real_cap, min_req) < 0) {
+            block_indices[2] = HN4_OFFSET_INVALID;
+        } else {
+            hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
+            hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
+            if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
+            else block_indices[2] = south_blk.lo;
+        }
         if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
         else block_indices[2] = south_blk.lo;
 
@@ -421,38 +433,35 @@ static hn4_result_t _execute_cardinal_vote(
                  */
                 else if ((int64_t)(cand.info.copy_generation - max_gen) > 0) {
                     /* 
-                     * Arithmetic Safety.
-                     * Use addition to prevent underflow: Candidate + Window < Max.
-                     * This checks if Candidate is OLDER than the window relative to Max.
-                     */
-                    if ((cand.info.last_mount_time + HN4_REPLAY_WINDOW_NS) < max_ts) {
-                        
-                        /* Active Replay Protection */
-                        HN4_LOG_CRIT("SECURITY: Replay Attack Detected! Candidate LBA is suspiciously old.");
-                        continue; /* Reject this mirror */
-                    } else {
-                        newer = true;
-                    }
-                } else if (cand.info.copy_generation == max_gen) {
+                    * Use Signed Difference.
+                    * Check if (Candidate - Max) < -Window.
+                    * This correctly handles cases where Max is skewed forward.
+                    */
+                    int64_t time_diff = (int64_t)(cand.info.last_mount_time - max_ts);
                 
-                /* 
-                 * Use signed 64-bit distance. 
-                 * if abs(A - B) > Window, it's a skew violation.
-                 */
-                int64_t diff = (int64_t)(cand.info.last_mount_time - max_ts);
-                
-                /* Get absolute value safely */
-                if (diff < 0) diff = -diff;
+                if (time_diff < -(int64_t)HN4_REPLAY_WINDOW_NS) {
+                    
+                    /* Active Replay Protection */
+                    HN4_LOG_CRIT("SECURITY: Replay Attack Detected! Candidate is too old (%lld ns).", (long long)time_diff);
+                    continue; /* Reject this mirror */
+                } else {
+                    newer = true;
+                }
+            } else if (cand.info.copy_generation == max_gen) {
+    
+                /* Same generation: Check time divergence safely */
+                uint64_t t_cand = cand.info.last_mount_time;
+                uint64_t t_max  = max_ts;
+                uint64_t diff_abs = (t_cand > t_max) ? (t_cand - t_max) : (t_max - t_cand);
 
-                if ((uint64_t)diff > HN4_REPLAY_WINDOW_NS) {
-                    HN4_LOG_CRIT("Tamper: Same Gen, Time Divergence (%lld) > Window", (long long)diff);
+                if (diff_abs > HN4_REPLAY_WINDOW_NS) {
+                    HN4_LOG_CRIT("Tamper: Same Gen, Time Divergence (%llu) > Window", (unsigned long long)diff_abs);
                     final_res = HN4_ERR_TAMPERED;
                     found_valid = false;
                     goto cleanup;
                 }
 
-                if (cand.info.last_mount_time > max_ts) newer = true;
-                
+                    if (cand.info.last_mount_time > max_ts) newer = true;
                 }
 
                 if (newer) {
@@ -528,7 +537,7 @@ static hn4_result_t _execute_cardinal_vote(
                         void* verify_buf = hn4_hal_mem_alloc(io_sz);
                         if (verify_buf) {
                             if (hn4_hal_sync_io(dev, HN4_IO_READ, lba, verify_buf, secs) == HN4_OK) {
-                                if (memcmp(heal_buf, verify_buf, io_sz) != 0) {
+                                if (memcmp(heal_buf, verify_buf, HN4_SB_SIZE) != 0) {
                                     HN4_LOG_CRIT("SB Heal Verification Failed @ LBA %llu", (unsigned long long)lba);
                                     heal_failures++;
                                 }
@@ -703,10 +712,11 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
          */
         
         /* 1. Rollback North */
-        if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba0, io_buf, sectors) != HN4_OK) {
-            HN4_LOG_CRIT("CRITICAL: Rollback of North SB FAILED. Volume is inconsistent.");
-            /* Force Panic in RAM to ensure this handle cannot do further damage */
-            vol->sb.info.state_flags |= HN4_VOL_PANIC;
+         if (north_ok) {
+            if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba0, io_buf, sectors) != HN4_OK) {
+                HN4_LOG_CRIT("CRITICAL: Rollback of North SB FAILED. Volume is inconsistent.");
+                vol->sb.info.state_flags |= HN4_VOL_PANIC;
+            }
         }
         
        /* 2. Rollback Mirrors */
@@ -800,6 +810,7 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     if (chunk_blocks == 0) chunk_blocks = 1;
 
     void* io_buf = hn4_hal_mem_alloc(chunk_blocks * bs);
+
     if (!io_buf) {
         hn4_hal_mem_free(vol->void_bitmap);
         vol->void_bitmap = NULL;
@@ -821,11 +832,8 @@ static hn4_result_t _load_bitmap_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     
     uint64_t needed_bytes = (cap_blocks + 7) / 8;
     uint64_t needed_blocks_disk = (needed_bytes + bs - 1) / bs;
-
-    /* 
-     * Convert block count to sectors before adding to LBA.
-     */
-    uint64_t needed_sectors = (needed_blocks_disk * bs) / sect_sz;
+    uint32_t spb = bs / sect_sz;
+    uint64_t needed_sectors = needed_blocks_disk * spb;
 
     /* Bounds check (All units are now Sectors) */
     if ((start_idx + needed_sectors) > end_idx) {
@@ -1020,7 +1028,7 @@ static hn4_result_t _check_block_toxicity(HN4_IN hn4_volume_t* vol, uint64_t blo
     if (block_idx >= total_blocks) return HN4_ERR_GEOMETRY;
 
     /* Buffer safety check */
-    if ((word_idx * sizeof(uint64_t)) >= vol->qmask_size) return HN4_ERR_GEOMETRY;
+    if (((word_idx + 1) * sizeof(uint64_t)) > vol->qmask_size) return HN4_ERR_GEOMETRY;
 
     /* 
      * RISK 3: Endianness 
@@ -1069,13 +1077,16 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
     memset(vol->quality_mask, 0x55, alloc_sz);
 
     /* 2. Calculate Disk Extents */
-    uint64_t start_blk, end_blk;
-    _addr_to_u64_checked(vol->sb.info.lba_qmask_start, &start_blk);
-    _addr_to_u64_checked(vol->sb.info.lba_flux_start, &end_blk);
+   uint64_t start_sect, end_sect;
+    _addr_to_u64_checked(vol->sb.info.lba_qmask_start, &start_sect);
+    _addr_to_u64_checked(vol->sb.info.lba_flux_start, &end_sect);
 
     uint64_t qmask_blocks_disk = (qmask_bytes_needed + bs - 1) / bs;
 
-    if (start_blk + qmask_blocks_disk > end_blk) {
+    uint32_t spb = bs / sect_sz;
+    uint64_t qmask_sectors = qmask_blocks_disk * spb;
+
+    if (start_sect + qmask_sectors > end_sect) {
         hn4_hal_mem_free(vol->quality_mask);
         vol->quality_mask = NULL;
         return HN4_ERR_GEOMETRY;
@@ -1111,7 +1122,11 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
 
             memcpy((uint8_t*)vol->quality_mask + mem_offset, io_buf, bytes_step);
         } else {
-            HN4_LOG_WARN("Q-Mask Partial Read Fail. Defaulting to Silver.");
+            HN4_LOG_CRIT("Q-Mask Read Failed. Media status unknown.");
+            hn4_hal_mem_free(io_buf);
+            hn4_hal_mem_free(vol->quality_mask);
+            vol->quality_mask = NULL;
+            return HN4_ERR_HW_IO;
         }
         
         mem_offset += io_n * bs;
@@ -1167,11 +1182,13 @@ static hn4_result_t _load_topology_resources(
 
     uint64_t usable_end_sector;
 
-    if (!_addr_to_u64_checked(caps->total_capacity_bytes, &usable_end_sector)) {
-        usable_end_sector = UINT64_MAX; 
-    } else {
-        usable_end_sector /= ss; // Correct: Bytes -> Sectors
-    }
+      hn4_size_t cap = caps->total_capacity_bytes;
+#ifdef HN4_USE_128BIT
+    if (cap.hi > 0) usable_end_sector = UINT64_MAX;
+    else usable_end_sector = cap.lo / ss;
+#else
+    usable_end_sector = cap / ss;
+#endif
 
     uint32_t count = hn4_hal_get_topology_count(dev);
     if (count == 0) return HN4_OK; 
@@ -1624,6 +1641,47 @@ static hn4_result_t _reconstruct_cortex_state(
     return HN4_OK;
 }
 
+static hn4_result_t _load_cortex_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOUT hn4_volume_t* vol)
+{
+    /* Skip for PICO to save RAM */
+    if (vol->sb.info.format_profile == HN4_PROFILE_PICO) return HN4_OK;
+
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps->logical_block_size;
+    
+    uint64_t start_sect, end_sect;
+    if (!_addr_to_u64_checked(vol->sb.info.lba_cortex_start, &start_sect)) return HN4_ERR_GEOMETRY;
+    if (!_addr_to_u64_checked(vol->sb.info.lba_bitmap_start, &end_sect)) return HN4_ERR_GEOMETRY;
+
+    uint64_t size_bytes = (end_sect - start_sect) * ss;
+
+    /* Safety Cap: 256MB limit for auto-loading */
+    if (size_bytes > (256 * 1024 * 1024)) {
+        /* CHANGED: Replaced "POSIX layer" with "Synapse VFS" */
+        HN4_LOG_WARN("Cortex too large for auto-load (%llu bytes). Synapse VFS may be unavailable.", size_bytes);
+        return HN4_OK;
+    }
+
+    vol->nano_cortex = hn4_hal_mem_alloc(size_bytes);
+    if (!vol->nano_cortex) {
+        /* CHANGED: Replaced "POSIX layer" with "Synapse VFS" */
+        HN4_LOG_WARN("OOM loading Cortex. Synapse VFS disabled.");
+        return HN4_OK; /* Soft fail, continue mount */
+    }
+    vol->cortex_size = size_bytes;
+
+    /* Bulk Read */
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, end_sect - start_sect);
+    
+    if (res != HN4_OK) {
+        hn4_hal_mem_free(vol->nano_cortex);
+        vol->nano_cortex = NULL;
+        return res;
+    }
+
+    return HN4_OK;
+}
+
 /* =========================================================================
  * 6. MAIN MOUNT ENTRY POINT
  * ========================================================================= */
@@ -1759,14 +1817,23 @@ hn4_result_t hn4_mount(
 
         uint64_t j_head  = hn4_addr_to_u64(vol->sb.info.journal_ptr);
         uint64_t j_start = hn4_addr_to_u64(vol->sb.info.journal_start);
-        uint64_t south_offset_bytes = _calc_south_offset(vol->vol_capacity_bytes, vol->vol_block_size);
+        uint64_t cap_u64;
+
+#ifdef HN4_USE_128BIT
+        if (vol->vol_capacity_bytes.hi > 0) cap_u64 = UINT64_MAX;
+        else cap_u64 = vol->vol_capacity_bytes.lo;
+#else
+        cap_u64 = vol->vol_capacity_bytes;
+#endif
+
+        uint64_t south_offset_bytes = _calc_south_offset(cap_u64, vol->vol_block_size);
 
         uint64_t j_end;
         
         if (south_offset_bytes != HN4_OFFSET_INVALID) {
             j_end = south_offset_bytes / ss;
         } else {
-            j_end = vol->vol_capacity_bytes / ss;
+            j_end = cap_u64 / ss;
         }
 
         if (j_head < j_start || j_head >= j_end) {
@@ -1892,20 +1959,27 @@ hn4_result_t hn4_mount(
 
     /* --- PHASE 4: PERSISTENCE (DIRTY BIT) --- */
 
-    if (!force_ro) {
-        if (st & HN4_VOL_CLEAN) {
-            vol->health.taint_counter /= 2;
-        }
-
+     if (!force_ro) {
         res = _mark_volume_dirty_and_sync(dev, vol);
-        if (res != HN4_OK) {
+        
+        if (res == HN4_OK) {
+            /* Success! Apply decay to RAM state now. */
+            if (st & HN4_VOL_CLEAN) {
+                vol->health.taint_counter /= 2;
+            }
+        } else {
             HN4_LOG_ERR("Dirty Sync Failed. Fallback RO.");
             force_ro = true;
         }
     }
 
     /* --- PHASE 5: RESOURCE LOADING --- */
-   res = _load_bitmap_resources(dev, vol);
+    res = _load_cortex_resources(dev, vol);
+    if (res != HN4_OK) {
+        HN4_LOG_WARN("Cortex Load Failed. Continuing degraded.");
+    }
+
+    res = _load_bitmap_resources(dev, vol);
     if (res != HN4_OK) {
         if (!force_ro) {
             HN4_LOG_CRIT("Bitmap Load Failed in RW. Abort.");
