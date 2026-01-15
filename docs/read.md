@@ -93,18 +93,34 @@ CPU-side address computation requires $<10$ ALU cycles (nanoseconds). This laten
 
 ---
 
-## 4. Parallel Candidate Resolution (PCR)
+## 4. Trajectory Resolution & Optimization
 
-A common critique of hash-based placement is collision handling. Traditional hash tables probe sequentially ($k=0, k=1 \dots$), which introduces latency.
+While the base equation provides the location, HN4 employs specific optimizations to handle collisions (when two files hash to the same physical spot).
 
-HN4 utilizes **Parallel Candidate Resolution (Shotgun Protocol)**.
+### 4.1 The Orbit Hint (Hot Zone Optimization)
+**Code Reference:** `hn4_read.c` / `hn4_anchor_t::orbit_hints`
+
+For the beginning of a file (the "Hot Zone"), HN4 avoids speculative guessing. The Anchor structure contains a 32-bit field `orbit_hints` which acts as a trajectory cache.
+
+*   **Capacity:** Stores 2-bit hints for the first **16 Clusters** of the file.
+*   **Granularity:** 1 Cluster = 16 Blocks. (Total coverage: First 256 Blocks).
+*   **The Logic:**
+    1.  The driver checks if `Block_Index < 256`.
+    2.  It extracts the 2-bit hint ($k$) corresponding to that cluster: `(hints >> (cluster_idx * 2)) & 0x3`.
+    3.  **Result:** The driver knows *exactly* which collision shell ($k=0, 1, 2, \text{or } 3$) holds the data.
+    4.  **Benefit:** It eliminates the overhead of checking the bitmap for multiple candidates. It fires exactly **1 Read Command** for the precise location. This reduces PCIe bus pressure for metadata-heavy workloads and small files.
+
+### 4.2 Parallel Candidate Resolution (The Shotgun Protocol)
+**Code Reference:** `hn4_read.c` (Fallback Path)
+
+For blocks beyond the Hint range (> 256), or if the Hint is unavailable, the driver uses **Parallel Candidate Resolution (PCR)**.
+
 Since data typically resides in one of the primary orbital shells ($k \in \{0..3\}$), and NVMe drives support massive queue depths:
 
-**We do not guess. We query all probabilities simultaneously.**
+**We do not guess sequentially. We query all probabilities simultaneously.**
 
-### The Logic (`hn4_read.c`):
-1.  **Calculate:** Generate candidate LBAs for $k=0 \dots 12$ (bounded by profile).
-2.  **Filter:** Query the in-memory **Allocation Bitmap** to discard unallocated candidates immediately. (Typically reduces valid candidates to 1 or 2).
+1.  **Calculate:** Generate candidate LBAs for $k=0, 1, 2, 3$.
+2.  **Filter:** Query the in-memory **Allocation Bitmap** to discard unallocated candidates immediately. (Typically reduces valid candidates to 1).
 3.  **Fire:** Issue NVMe Read Commands for all remaining valid candidates in parallel.
 4.  **Race:** The storage controller fetches blocks concurrently.
 5.  **Identify:** The first block returned with a matching `Well_ID` and `Generation` is the winner. Others are discarded.
@@ -115,11 +131,9 @@ Since data typically resides in one of the primary orbital shells ($k \in \{0..3
 
 ## 5. Architectural Hardening (v6.2 Implementation Details)
 
-The current implementation includes specific defenses against concurrency hazards and logic boundary errors.
-
 ### 5.1 Concurrency & Allocator Safety
-*   **Race-to-Claim Protection:** The Cortex Allocator (`hn4_allocator.c`) enforces timestamp validation inside the critical read-modify-write loop. Stale `PENDING` markers are only reclaimed if they remain expired *after* lock acquisition, preventing threads from overwriting active reservations.
-*   **Atomic State Transitions:** Bitwise operations on the Allocation Bitmap utilize 128-bit `CMPXCHG16B` (or equivalent) to ensure Data, Version, and ECC fields update as an indivisible unit.
+*   **Race-to-Claim Protection:** The Cortex Allocator (`hn4_allocator.c`) enforces timestamp validation inside the critical read-modify-write loop. Stale `PENDING` markers are only reclaimed if they remain expired *after* lock acquisition.
+*   **Atomic State Transitions:** Bitwise operations on the Void Bitmap utilize 128-bit `CMPXCHG16B` (or equivalent) to ensure Data, Version, and ECC fields update as an indivisible unit.
 
 ### 5.2 Scavenger & Recovery Logic
 *   **Tombstone Addressing:** The Scavenger (`hn4_scavenger.c`) calculates the physical LBA of a tombstone using memory offset deltas relative to the Cortex base address. This fixes a previous logic error where zeroed IDs were hashed, leading to misdirected writes.
@@ -137,7 +151,8 @@ The current implementation includes specific defenses against concurrency hazard
 | :--- | :--- | :--- | :--- |
 | **Addressing** | Extent Tree | Merkle Tree (Pointer) | **Algebraic ($G + N \cdot V$)** |
 | **Complexity** | $O(\log N)$ | $O(\log N)$ | **$O(1)$** |
-| **Fragmentation Penalty** | **Severe.** Deep tree traversal required. | **High.** Increased metadata I/O. | **Zero.** Math cost is constant. |
+| **Start-of-File** | Inode Lookup | Pointer Chase | **Orbit Hint (Direct)** |
+| **Random Access** | Tree Traversal | Tree Traversal | **Shotgun Protocol (Parallel)** |
 | **RAM Usage** | Medium (Buffer Cache) | **High** (ARC). GBs required. | **Tiny.** (Nano-Cortex). |
 | **Metadata I/O** | High (Read Amplification) | High (Integrity Chain) | **Zero.** No per-block metadata reads. |
 | **Latency** | Variable (Jitter) | Good (if Cached) | **Deterministic (Flat)** |
@@ -156,20 +171,12 @@ The most significant architectural advantage of $O(1)$ addressing is the preserv
 
 ---
 
-## 8. Design Constraints
+## 8. Performance Visualizations
 
-*   **Cached Anchor:** Requires file handle anchors to be resident in RAM (Nano-Cortex) for $O(1)$ performance.
-*   **Queue Depth:** PCR benefits are maximized on NVMe/NAND with deep queues; less effective on legacy SATA/SAS.
-*   **Media Type:** PCR logic assumes media supports parallel read dispatch; optimal for SSD/NVM rather than rotational media.
-
----
-
-## 9. Performance Visualizations
-
-### 9.1 Read Latency vs. File Offset
+### 8.1 Read Latency vs. File Offset
 Comparing random read latency at different file offsets.
 **Legacy:** Latency increases with file size (deeper tree).
-**HN4:** Flatline.
+**HN4:** Flatline due to $O(1)$ math.
 
 ```text
 Latency (µs)
@@ -186,7 +193,7 @@ Latency (µs)
     0     10    100   1TB   1PB   1EB
 ```
 
-### 9.2 CPU Cache Miss Rate (Metadata Overhead)
+### 8.2 CPU Cache Miss Rate (Metadata Overhead)
 Measuring L2 Cache misses during random 4K read storm.
 
 ```text
@@ -205,7 +212,7 @@ Misses/Op
   +---------------------------------------->
 ```
 
-### 9.3 NVM.2 Throughput (Small Block IO)
+### 8.3 NVM.2 Throughput (Small Block IO)
 Performance on Intel Optane P5800X (4KB Random Read).
 
 ```text
@@ -223,12 +230,12 @@ IOPS (Millions)
 
 ---
 
-## 10. Summary
+## 9. Summary
 
 HN4 achieves **Predictable Low Latency** by replacing data structures with algorithms.
 
-*   There is no tree to walk.
-*   There is no list to scan.
-*   There is only the **Equation**.
+*   **Hot Zone:** Use `orbit_hints` for direct access.
+*   **Cold Zone:** Use `Shotgun Protocol` for parallel resolution.
+*   **Core:** The **Equation** provides the coordinates.
 
 In HN4, the system does not "search" for data. It calculates its coordinates and retrieves it directly. This represents the theoretical minimum path for data retrieval.
