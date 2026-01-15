@@ -1,6 +1,3 @@
-Here is the improved documentation for the Shadow Hop Protocol. I have retained all the core logic and the crucial "Shadow Hop" terminology as requested, while refining the technical explanations to ensure clarity and professional precision.
-
-```markdown
 # THE SHADOW HOP PROTOCOL
 ### *Atomic Mutation via Ballistic Trajectory*
 
@@ -202,4 +199,3 @@ The system does not consume infinite $k$ slots. It actively recycles them.
 2.  **Safety:** Data is never overwritten in place. Generation counters prevent stale reads.
 3.  **Determinism:** Forensic recovery can reconstruct the file state purely from the Anchor, without traversing a potentially broken tree structure.
 4.  **Metadata Efficiency:** The metadata overhead for a write is constant ($O(1)$), regardless of file depth or size.
-```
