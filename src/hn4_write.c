@@ -859,7 +859,7 @@ retry_transaction:;
          */
         bool rescued = false;
 
-        if (io_res == HN4_ERR_ATOMICS_TIMEOUT) {
+        if (io_res == HN4_ERR_ATOMICS_TIMEOUT && !(vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE)) {
             HN4_LOG_WARN("WRITE_ATOMIC: Timeout. Attempting Rescue Protocol...");
 
             /* 1. Force Barrier to drain drive queue */

@@ -316,10 +316,21 @@ static hn4_result_t _reap_tombstone(
     memcpy(&saved_anchor, anchor, sizeof(hn4_anchor_t));
 
     /* 5. ATOMIC DESTRUCTION */
-    hn4_anchor_t dead_anchor;
-    memset(&dead_anchor, 0, sizeof(hn4_anchor_t));
-    dead_anchor.seed_id = saved_anchor.seed_id; 
+   hn4_anchor_t dead_anchor;
 
+    memcpy(&dead_anchor, &saved_anchor, sizeof(hn4_anchor_t));
+    
+    dead_anchor.mass = 0;
+    dead_anchor.gravity_center = 0;
+    
+    /* Clear Name to allow reuse by new files with same name */
+    memset(dead_anchor.inline_buffer, 0, sizeof(dead_anchor.inline_buffer));
+    
+    /* Ensure Tombstone flag remains set */
+    uint64_t bleached_dclass = HN4_FLAG_TOMBSTONE | HN4_FLAG_VALID;
+    dead_anchor.data_class = hn4_cpu_to_le64(bleached_dclass);
+
+    /* Preserve generation to prevent races */
     dead_anchor.write_gen = anchor->write_gen; 
     
     res = hn4_write_anchor_atomic(vol, &dead_anchor);
@@ -328,7 +339,8 @@ static hn4_result_t _reap_tombstone(
         hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
         /* Guard against resurrection race */
         if (hn4_le32_to_cpu(anchor->write_gen) == start_gen) {
-            _secure_zero(anchor, sizeof(hn4_anchor_t));
+            /* FIX: Update RAM with Bleached state, do not zero */
+            memcpy(anchor, &dead_anchor, sizeof(hn4_anchor_t));
         } else {
             res = HN4_ERR_GENERATION_SKEW;
         }
@@ -533,7 +545,8 @@ static void _evacuate_zns_victim(
                 shadow_anchor.data_class = hn4_cpu_to_le64(dclass);
             }
 
-            if (hn4_write_block_atomic(vol, &shadow_anchor, logic_seq, hdr->payload, move_len) == HN4_OK) {
+             if (hn4_write_block_atomic(vol, &shadow_anchor, logic_seq, hdr->payload, move_len, 
+                                       HN4_PERM_SOVEREIGN | HN4_PERM_WRITE) == HN4_OK) {
                 if (hn4_write_anchor_atomic(vol, &shadow_anchor) == HN4_OK) {
                     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
 
@@ -672,6 +685,7 @@ static void _rollback_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t seed_h
  */
 static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool full_pivot) {
     uint32_t bs = vol->vol_block_size;
+    
     void* buf = hn4_hal_mem_alloc(bs);
     if (!buf) return;
 
@@ -732,7 +746,7 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
         }
 
         /* Note: hn4_write_block_atomic updates new_anchor in RAM */
-        if (hn4_write_block_atomic(vol, &new_anchor, n, buf, write_len) != HN4_OK) {
+         if (hn4_read_block_atomic(vol, anchor, n, buf, bs, HN4_PERM_SOVEREIGN | HN4_PERM_READ) != HN4_OK) {
             migration_success = false;
             break;
         }
@@ -921,6 +935,7 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
     if (dclass & HN4_FLAG_PINNED) return; 
 
     uint32_t bs = vol->vol_block_size;
+    uint32_t payload_len = HN4_BLOCK_PayloadSize(bs);
     void* buf = hn4_hal_mem_alloc(bs);
     if (!buf) return;
 
@@ -939,7 +954,8 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
         upgraded_anchor.data_class = hn4_cpu_to_le64(new_dc);
 
         /* 4. Atomic Write (Allocates NEW ballistic block) */
-        hn4_result_t res = hn4_write_block_atomic(vol, &upgraded_anchor, 0, buf, bs);
+        hn4_result_t res = hn4_write_block_atomic(vol, &upgraded_anchor, 0, buf, payload_len, 
+                                                  HN4_PERM_SOVEREIGN | HN4_PERM_WRITE);
     
         if (res == HN4_OK) {
             /* 5. Commit Anchor to Disk */

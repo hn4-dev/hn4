@@ -15,6 +15,8 @@
 #include "hn4_endians.h"
 #include "hn4.h"
 
+#define HN4_LBA_INVALID UINT64_MAX
+
 /* --- DYNAMIC FIXTURE HELPER --- */
 /* Allows creating volumes with arbitrary geometry/profile */
 typedef struct {
@@ -96,59 +98,79 @@ static void cleanup_custom_vol(hn4_volume_t* vol) {
  * Exabytes would consume Terabytes of RAM. We strictly test the math.
  */
 hn4_TEST(ExabyteProfile, MassiveAddressSpace_MathOnly) {
+    /* 1. Define Capacity (2.3 EB) */
+    uint64_t cap_u64 = 0x1FFFFFFFFFFFFFFF; 
+    
     fixture_config_t cfg = {
-        .capacity = 0x1FFFFFFFFFFFFFFF, /* ~2.3 Exabytes */
-        .block_size = 65536, /* 64KB Blocks */
+        .capacity = cap_u64, 
+        .block_size = 65536,
         .sector_size = 4096,
         .profile = HN4_PROFILE_AI,
         .hw_flags = HN4_HW_GPU_DIRECT
     };
     
-    /* 
-     * Manually construct minimal volume to avoid massive malloc.
-     * We don't use create_custom_vol because it mallocs bitmap based on cap.
-     */
     hn4_volume_t vol = {0};
     mock_hal_device_t dev = {0};
     
+    /* 
+     * FIX 1: Type Safety 
+     * Use helper to populate abstract types.
+     */
     dev.caps.logical_block_size = cfg.sector_size;
-    dev.caps.total_capacity_bytes = cfg.capacity;
-    vol.target_device = &dev;
     
-    vol.vol_capacity_bytes = cfg.capacity;
+    #ifdef HN4_USE_128BIT
+        dev.caps.total_capacity_bytes = hn4_addr_from_u64(cap_u64);
+        vol.vol_capacity_bytes = hn4_u128_from_u64(cap_u64); /* hn4_size_t */
+    #else
+        dev.caps.total_capacity_bytes = cap_u64;
+        vol.vol_capacity_bytes = cap_u64;
+    #endif
+
+    vol.target_device = &dev;
     vol.vol_block_size = cfg.block_size;
     vol.sb.info.block_size = cfg.block_size;
     
-    /* Mock Layout */
-    uint64_t total_blocks = cfg.capacity / cfg.block_size;
-    vol.sb.info.lba_flux_start = 100; /* Minimal offset */
-
     /* 
-     * MATH TEST: 
-     * Phi = (2^45) blocks. 
-     * Input G is huge.
+     * FIX 2: Initialize Horizon Boundary 
+     * The allocator calculates bounds based on (Horizon_Start - Flux_Start).
+     * We set Horizon Start to the end of the disk for this math test.
      */
+    uint64_t total_sectors = cap_u64 / cfg.sector_size;
+    vol.sb.info.lba_flux_start = hn4_lba_from_sectors(100); 
+    vol.sb.info.lba_horizon_start = hn4_lba_from_sectors(total_sectors);
+
+    /* Inputs */
     uint64_t G = 0xFFFFFFFF00ULL; 
     uint64_t V = 17;
     uint16_t M = 4; /* S=16 */
     
+    /* Execute */
     uint64_t lba = _calc_trajectory_lba(&vol, G, V, 1000, M, 0);
     
-    /* Result must be > G (roughly) and aligned */
-    ASSERT_TRUE(lba > 0);
-    /* Should fit within total blocks */
+    /* Assertions */
+    ASSERT_NE(HN4_LBA_INVALID, lba);
+    
+    uint64_t total_blocks = cap_u64 / cfg.block_size;
     ASSERT_TRUE(lba < total_blocks);
     
-    /* Verify alignment to S=16 */
-    ASSERT_EQ(0ULL, lba % 16);
+    /* Verify alignment to S=16 ( Fractal Scale 2^4 ) */
+    /* Note: _calc_trajectory_lba returns a BLOCK INDEX, not a Sector LBA */
+    /* The index itself is aligned relative to the Flux Domain start */
+    
+    /* To verify physical alignment, we must account for Flux Start offset */
+    /* However, the function returns relative block index + offset. */
+    /* Just verify logical alignment constraint: */
     
     /* 
-     * Verify Saturation Math Overflow Check
-     * Ensure (Used * 100) doesn't overflow if Used is huge.
-     * 90% of 2^45 blocks = ~3e13. 
-     * 3e13 * 100 = 3e15. Fits in uint64_t (max 1.8e19). SAFE.
+     * NOTE on Equation of State:
+     * LBA = Flux_Start + (Fractal_Index * S) + Entropy
+     * G (Gravity) in this test is aligned to S=16 (0xFF...00).
+     * Therefore Entropy is 0. 
+     * Result must be modulo S == 0.
      */
+    ASSERT_EQ(0ULL, lba % 16);
 }
+
 
 /* =========================================================================
  * TEST PC2: Pico No-Cortex-Cache Assumption

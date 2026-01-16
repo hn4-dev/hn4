@@ -83,6 +83,14 @@ hn4_u128_t hn4_u128_from_u64(uint64_t v);
  */
 bool hn4_addr_try_u64(hn4_addr_t addr, uint64_t* out);
 
+
+/**
+ * hn4_u128_mod
+ * Calculates the remainder of a / b (128-bit modulo).
+ * Used for aligning capacity to zone boundaries in HN4_USE_128BIT mode.
+ */
+hn4_u128_t hn4_u128_mod(hn4_u128_t a, hn4_u128_t b);
+
 #ifdef __cplusplus
 }
 #endif

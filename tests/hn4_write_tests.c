@@ -9049,3 +9049,259 @@ hn4_TEST(Tethers, Tag_Based_Append_Only) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
+
+hn4_TEST(SelfHealing, Overwrite_Fixes_Rot) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xBADF00D;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.gravity_center = hn4_cpu_to_le64(3000);
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+    uint8_t* buf = calloc(1, bs);
+
+    /* 1. Write Initial Valid Data */
+    memset(buf, 0xAA, payload_cap);
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, payload_cap));
+
+    /* 2. Corrupt the Block on Disk */
+    uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
+    uint64_t lba = _calc_trajectory_lba(vol, G, 0, 0, 0, 0); // k=0
+    
+    /* Read Raw, Flip Bits, Write Back without CRC update */
+    uint32_t spb = bs / 512;
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba * spb), buf, spb);
+    buf[100] ^= 0xFF; /* Corrupt Payload */
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba * spb), buf, spb);
+
+    /* Verify Read Fails (Data Rot) */
+    hn4_result_t read_res = hn4_read_block_atomic(vol, &anchor, 0, buf, bs);
+    ASSERT_EQ(HN4_ERR_PAYLOAD_ROT, read_res);
+
+    /* 3. Perform FULL Overwrite (Should skip Thaw/Read) */
+    memset(buf, 0xBB, payload_cap);
+    /* Note: Must be full payload_cap length to skip Thaw */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, payload_cap));
+
+    /* 4. Verify Read Succeeds (New Data) */
+    memset(buf, 0, bs);
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, buf, bs));
+    ASSERT_EQ(0xBB, buf[0]);
+
+    free(buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(MemorySafety, Unaligned_User_Buffer) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+
+    /* 1. Allocate buffer + padding */
+    uint32_t len = 1024;
+    uint8_t* base_ptr = malloc(len + 16);
+    
+    /* 2. Create misaligned pointer (odd address) */
+    uint8_t* unaligned_ptr = base_ptr + 3; 
+    
+    /* Fill with known pattern */
+    for (int i=0; i<len; i++) unaligned_ptr[i] = (uint8_t)i;
+
+    /* 3. Perform Write */
+    /* If driver uses optimized SIMD loads requiring alignment without checks, this might crash */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, unaligned_ptr, len));
+
+    /* 4. Read back to aligned buffer to verify data integrity */
+    uint8_t* read_buf = calloc(1, 4096);
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+
+    ASSERT_EQ(0, memcmp(read_buf, unaligned_ptr, len));
+
+    free(base_ptr);
+    free(read_buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(ZNS, Zone_Full_Rollover_Behavior) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Configure Small Zones (Mocking 2 Blocks per Zone) */
+    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
+    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    /* Block Size is 4096. Zone = 8192 bytes (2 blocks). */
+    mock->caps.zone_size_bytes = 8192; 
+
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.device_type_tag = HN4_DEV_ZNS;
+    /* Align block size to zone size if needed, but 4k fits in 8k */
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Pick a G aligned to start of a zone */
+    uint64_t G = 4000; /* Block Index */
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t* buf = calloc(1, 4096);
+
+    /* 2. Fill the Zone (2 Blocks) */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10)); // 1/2
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 10)); // 2/2 (Zone Full)
+
+    /* 3. Attempt Write to Block 2 (Calculated LBA falls in same zone logic? No.) */
+    /* ZNS Allocation logic: LBA = G + Index. 
+       If G=4000 (Start of Zone N).
+       Index 0 -> 4000 (Zone N).
+       Index 1 -> 4001 (Zone N).
+       Index 2 -> 4002 (Zone N+1).
+       
+       So normally, Ballistic math handles rollover naturally by incrementing LBA into next zone.
+       
+       BUT, let's test a COLLISION case: 
+       Write Block 0 (Zone N).
+       Overwrite Block 0 -> Should map to Zone N (Append).
+       Overwrite Block 0 again -> Should map to Zone N (Append).
+       Zone N is now physically full (3 appends, capacity 2).
+       The 3rd write should fail HN4_ERR_ZONE_FULL.
+    */
+    
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10)); // Overwrite 1 (Works, Zone capacity used 3/2? No, 2/2 used before this)
+    /* Wait, previous 2 writes used 2 slots. Zone is full. 
+       This overwrite targets G+0 (Zone N). HAL Mock should return ZONE_FULL. */
+    
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, buf, 10);
+    
+    /* Verify Logic: Driver should catch ZONE_FULL and either Fallback to Horizon or Fail */
+    if (res == HN4_OK) {
+        /* If it succeeded, check if it moved to Horizon */
+        uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
+        ASSERT_TRUE(dclass & HN4_HINT_HORIZON);
+    } else {
+        /* Failing with ZONE_FULL is also acceptable if Horizon isn't configured/avail */
+        ASSERT_EQ(HN4_ERR_ZONE_FULL, res);
+    }
+
+    free(buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(ZNS, Append_Enforces_Barrier) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Configure ZNS Mock */
+    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
+    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    
+    /* We cannot spy on the barrier call directly in C without a mock framework.
+       However, we can verify that the operation succeeds and data is consistent.
+       This test acts as a regression guard for the ZNS code path execution. */
+    
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.device_type_tag = HN4_DEV_ZNS;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(5000);
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "FLUSH_CHECK";
+    
+    /* Perform Write */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 11));
+
+    /* 
+     * In a real driver, we'd assert the Flush counter incremented. 
+     * In this mock environment, we verify the write counter in health stats 
+     * (if available) or simply ensure the operation completed without error.
+     */
+    
+    /* Verify data integrity post-barrier */
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "FLUSH_CHECK"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(NVM, Direct_Memory_Access_Verification) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Enable NVM Mode */
+    struct { hn4_hal_caps_t caps; uint8_t* raw_mem; }* mock = (void*)dev;
+    mock->caps.hw_flags |= HN4_HW_NVM;
+    
+    /* Extract the backend RAM pointer from the opaque mock struct */
+    /* Note: Layout relies on _w_inject_nvm_buffer implementation in fixture */
+    uint8_t* backend_ram = mock->raw_mem; // Assuming struct layout matches fixture
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 8000;
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "DIRECT_RAM";
+    
+    /* 2. Write Data */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10));
+
+    /* 3. Calculate expected byte offset in RAM */
+    /* k=0 location */
+    uint64_t lba = _calc_trajectory_lba(vol, G, 0, 0, 0, 0);
+    uint64_t bs = vol->vol_block_size;
+    uint32_t ss = 512;
+    uint32_t spb = bs / ss;
+    
+    /* Physical Sector -> Byte Offset */
+    uint64_t byte_offset = (lba * spb) * ss;
+    
+    /* Offset to Payload inside block (Header skip) */
+    uint64_t payload_offset = byte_offset + sizeof(hn4_block_header_t);
+
+    /* 4. Direct Inspection of RAM (Bypassing Read API) */
+    /* This proves the HAL memcpy/CLWB path worked */
+    ASSERT_EQ(0, memcmp(backend_ram + payload_offset, buf, 10));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}

@@ -83,8 +83,9 @@ static int _get_error_weight(hn4_result_t e)
 
 static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)
 {
-    if (current == HN4_OK) return new_err;
-    if (new_err == HN4_OK) return current;
+    /* Hot-path optimization: success needs no merging */
+    if (HN4_LIKELY(current == HN4_OK)) return new_err;
+    if (HN4_LIKELY(new_err == HN4_OK)) return current;
 
     int w_cur = _get_error_weight(current);
     int w_new = _get_error_weight(new_err);
@@ -92,7 +93,6 @@ static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_e
     if (w_new > w_cur) return new_err;
     if (w_new < w_cur) return current;
 
-    /* Tie-breaker: Deterministic ordering (prefer lower numerical value) */
     return (new_err < current) ? new_err : current;
 }
 
@@ -153,11 +153,11 @@ static hn4_result_t _validate_block(
     uint32_t stored_hcrc     = hn4_le32_to_cpu(hdr->header_crc);
     uint32_t calc_hcrc       = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, header_boundary);
 
-    if (stored_hcrc != calc_hcrc) return HN4_ERR_HEADER_ROT;
+    if (HN4_UNLIKELY(stored_hcrc != calc_hcrc)) return HN4_ERR_HEADER_ROT;
 
     /* 3. Identity Check */
     hn4_u128_t disk_id = hn4_le128_to_cpu(hdr->well_id);
-    if (disk_id.lo != expected_well_id.lo || disk_id.hi != expected_well_id.hi) {
+     if (HN4_UNLIKELY(disk_id.lo != expected_well_id.lo || disk_id.hi != expected_well_id.hi)) {
         return HN4_ERR_ID_MISMATCH;
     }
 
@@ -172,9 +172,8 @@ static hn4_result_t _validate_block(
 
     uint32_t blk_gen_32 = (uint32_t)blk_gen_64;
     uint32_t exp_gen_32 = (uint32_t)expected_gen;
-    int32_t gen_diff = (int32_t)(blk_gen_32 - exp_gen_32);
     
-    if (gen_diff < 0) {
+    if (HN4_UNLIKELY((int32_t)(blk_gen_32 - exp_gen_32) < 0)) {
         return HN4_ERR_GENERATION_SKEW;
     }
 
@@ -184,7 +183,7 @@ static hn4_result_t _validate_block(
     uint32_t c_size     = comp_meta >> HN4_COMP_SIZE_SHIFT;
     uint8_t  algo       = comp_meta & HN4_COMP_ALGO_MASK;
 
-    if (algo != HN4_COMP_NONE && algo != HN4_COMP_TCC) {
+    if (HN4_UNLIKELY(algo != HN4_COMP_NONE && algo != HN4_COMP_TCC)) {
         HN4_LOG_WARN("Block Validation: Unknown Algo %u", algo);
         return HN4_ERR_ALGO_UNKNOWN;
     }
@@ -203,7 +202,7 @@ static hn4_result_t _validate_block(
     uint32_t stored_dcrc = hn4_le32_to_cpu(hdr->data_crc);
     uint32_t calc_dcrc   = hn4_crc32(HN4_CRC_SEED_DATA, hdr->payload, payload_sz);
 
-    if (stored_dcrc != calc_dcrc) {
+    if (HN4_UNLIKELY(stored_dcrc != calc_dcrc)) {
         HN4_LOG_WARN("Block Validation: Payload CRC Mismatch");
         return HN4_ERR_PAYLOAD_ROT;
     }
@@ -245,7 +244,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     uint32_t effective_perms = perms | session_perms;
 
-    if (!(effective_perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))) return HN4_ERR_ACCESS_DENIED;
+    if (HN4_UNLIKELY(!(effective_perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))))  return HN4_ERR_ACCESS_DENIED;
 
     /* 2. Physics & Geometry Extraction */
      uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
@@ -398,7 +397,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* Sparse Logic */
-    if (valid_candidates == 0) {
+    if (HN4_UNLIKELY(valid_candidates == 0)) {
         if (probe_error != HN4_OK) {
             /* If probe had hard errors (e.g. HW_IO), report that. Don't assume sparse. */
             return probe_error;
@@ -467,7 +466,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             if (++tries < max_retries && io_res != HN4_OK) {
                 hn4_hal_micro_sleep(retry_sleep);
             }
-        } while (io_res != HN4_OK && tries < max_retries);
+        } while (HN4_UNLIKELY(io_res != HN4_OK && tries < max_retries));
 
         candidate_errors[i] = io_res;
 
@@ -516,7 +515,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                     break;
             }
 
-            if (HN4_IS_OK(decomp_res)) {
+            if (HN4_LIKELY(HN4_IS_OK(decomp_res))) {
                 winner_idx = i;
                 deep_error = decomp_res;
 
@@ -554,12 +553,8 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 6. Auto-Medic */
-    /* 6. Auto-Medic */
-    if (HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0) {
-
+      if (HN4_UNLIKELY(HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0)) {
         hn4_block_header_t* w_hdr = (hn4_block_header_t*)io_buf;
-        /* FIX: Removed algo check. Valid data (Compressed or Raw) in io_buf is authoritative. */
-
         if (vol->read_only) {
             HN4_LOG_WARN("READ_ATOMIC: Skipping Auto-Medic (RO).");
         } else {
@@ -601,6 +596,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     if (winner_idx == -1) {
         /* Do not wipe output buffer on error */
         return deep_error;
+    }
+
+    if (deep_error == HN4_OK && probe_error == HN4_INFO_HEALED) {
+        return HN4_INFO_HEALED;
     }
 
     return deep_error;

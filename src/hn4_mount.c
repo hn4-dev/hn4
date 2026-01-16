@@ -471,18 +471,24 @@ static hn4_result_t _execute_cardinal_vote(
 
                     if (gen_diff > 0) {
                         /* 
-                         * CASE A: NEWER GENERATION
-                         * SECURITY: Coherence Check.
-                         * A newer generation cannot travel back in time beyond the skew window.
-                         * Check: if (CandTime < MaxTime - Window) -> Replay/Attack
-                         */
+                        * CASE A: NEWER GENERATION
+                        * Distinguish between "Replay Attack" and "Clock Reset".
+                        * If the HAL clock is monotonic (resets on boot), 'time_diff' will be negative
+                        * after a reboot. We cannot use Time to validate Gen if clocks are volatile.
+                        *
+                        * We ONLY enforce the window if the timestamp is non-zero and plausible.
+                        * For now, we Trust The Generation (TTG) over the Time if Gen is strictly higher.
+                        */
+    
+                    #ifdef HN4_STRICT_WALL_CLOCK
+                        /* Only enable this if HAL guarantees persistent RTC (Battery backed) */
                         if (time_diff < -(int64_t)HN4_REPLAY_WINDOW_NS) {
-                            HN4_LOG_CRIT("SECURITY: Replay Attack! Gen %llu is > %llu, but Time is ancient.",
-                                (unsigned long long)cand.info.copy_generation, (unsigned long long)max_gen);
-                            continue; /* Reject this mirror */
+                            HN4_LOG_CRIT("SECURITY: Replay Attack! Gen %llu > %llu, Time ancient.", ...);
+                            continue; 
                         }
+                    #endif
                         is_better = true;
-                    } 
+                    }                   
                     else if (gen_diff == 0) {
                         /* 
                          * CASE B: SAME GENERATION
@@ -1585,6 +1591,7 @@ static hn4_result_t _reconstruct_cortex_state(
 
         /* B. Get Ballistic Parameters */
         uint64_t G = hn4_le64_to_cpu(anchor->gravity_center);
+        hn4_u128_t anchor_cpu_id = hn4_le128_to_cpu(anchor->seed_id);
         uint64_t mass = hn4_le64_to_cpu(anchor->mass);
         
         /* Extract V (Orbit Vector) */
@@ -1658,15 +1665,15 @@ static hn4_result_t _reconstruct_cortex_state(
                         {
                             /* Complete UUID Verification */
                             hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
-                            if (disk_id.lo == anchor->seed_id.lo && 
-                                disk_id.hi == anchor->seed_id.hi) 
+                            
+                            if (disk_id.lo == anchor_cpu_id.lo && 
+                                disk_id.hi == anchor_cpu_id.hi) 
                                 {
                                     /* It is OUR data. Mark found and stop probing. */
                                     found_block_n = true;
                                     break; 
                                 }
-        
-                            }
+                        }
                         }
     
                     /* If IO failed or ID didn't match, it is a collision. Continue probing k+1. */
@@ -2167,8 +2174,9 @@ cleanup:
     if (vol) {
         if (vol->void_bitmap) hn4_hal_mem_free(vol->void_bitmap);
         if (vol->quality_mask) hn4_hal_mem_free(vol->quality_mask);
+        if (vol->locking.l2_summary_bitmap) hn4_hal_mem_free(vol->locking.l2_summary_bitmap); 
         if (vol->topo_map) hn4_hal_mem_free(vol->topo_map);
-        if (vol->nano_cortex) hn4_hal_mem_free(vol->nano_cortex); /* Also safe to free if allocated */
+        if (vol->nano_cortex) hn4_hal_mem_free(vol->nano_cortex);
         hn4_hal_mem_free(vol);
     }
     return res;

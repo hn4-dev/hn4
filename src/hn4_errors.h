@@ -7,7 +7,7 @@
  * DESCRIPTION:
  *   Defines the status codes for the HN4 Storage Engine.
  *   
- * ERROR PARADIGM: THE NEGATIVE MANIFOLD
+ * ERROR PARADIGM: THE NEGATIVE MANIFOLD (Classic)
  *   - 0      : The Singularity (Success)
  *   - > 0    : The Positive Manifold (Informational / Non-Fatal)
  *   - < 0    : The Negative Manifold (Hard Errors / Fatal)
@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-/* Type definition for results (Signed 32-bit Integer) */
+/* Type definition for results (Signed 32-bit Integer - RESTORED) */
 typedef int32_t hn4_result_t;
 
 /* =========================================================================
@@ -41,14 +41,11 @@ typedef int32_t hn4_result_t;
 #define HN4_INFO_HORIZON_FALLBACK       4   /* Allocation succeeded, but forced to Linear Log (D1.5) instead of Flux (D1) */
 #define HN4_INFO_THAWED                 5   /* Write succeeded, but data was forced to decompress due to entropy */
 
-/* 
- * Helper Macros 
- * WARNING: HN4_IS_OK(x) is true for Positive Manifold codes (1..5).
- * If you require strict success (0), check (x == HN4_OK).
- */
-#define HN4_IS_OK(x)    ((x) >= 0)
-#define HN4_IS_ERR(x)   ((x) < 0)
+/* Helper Macros */
 
+#define HN4_IS_OK(x)        ((x) >= 0)
+#define HN4_IS_ERR(x)       ((x) < 0)
+#define HN4_IS_INFO(x)      ((x) > 0)
 
 /* =========================================================================
  * 1. THE VOID (SPACE & ALLOCATION)
@@ -140,6 +137,8 @@ typedef int32_t hn4_result_t;
 
 /* Block Header well_id mismatch (Phantom Read / Stale Data). */
 #define HN4_ERR_PHANTOM_BLOCK           -0x403
+/* Alias for newer code using GHOST nomenclature */
+#define HN4_ERR_GHOST_BLOCK             HN4_ERR_PHANTOM_BLOCK
 
 /* Decompression (LZ4/ZSTD) failed (Corrupt Payload). */
 #define HN4_ERR_DECOMPRESS_FAIL         -0x404

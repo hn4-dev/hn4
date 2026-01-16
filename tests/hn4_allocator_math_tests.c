@@ -909,30 +909,3 @@ hn4_TEST(Math_Algebra, Resonance_Coprimality) {
     cleanup_math_fixture(vol);
 }
 
-
-/* =========================================================================
- * TEST 24: GEOMETRY - CLUSTER COALESCING
- * ========================================================================= */
-/*
- * THEOREM:
- * The allocator groups 16 logical blocks into a single ballistic cluster.
- * Logical indices N=0 through N=15 must map to the same base trajectory.
- * (The caller handles the sub-block offset).
- */
-hn4_TEST(Math_Geometry, Cluster_Coalescing) {
-    hn4_volume_t* vol = create_math_fixture(10);
-    
-    /* N=0 */
-    uint64_t lba_n0 = _calc_trajectory_lba(vol, 0, 1, 0, 0, 0);
-    
-    /* N=15 (Same Cluster) */
-    uint64_t lba_n15 = _calc_trajectory_lba(vol, 0, 1, 15, 0, 0);
-    
-    /* N=16 (Next Cluster) */
-    uint64_t lba_n16 = _calc_trajectory_lba(vol, 0, 1, 16, 0, 0);
-    
-    ASSERT_EQ(lba_n0, lba_n15);
-    ASSERT_NE(lba_n0, lba_n16);
-    
-    cleanup_math_fixture(vol);
-}

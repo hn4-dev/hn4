@@ -354,7 +354,8 @@ hn4_result_t hn4_tensor_read(
                 anchor, 
                 block_idx, 
                 bounce_buf, 
-                ctx->block_size
+                ctx->block_size,
+                HN4_PERM_READ | HN4_PERM_SOVEREIGN
             );
 
             if (HN4_UNLIKELY(HN4_IS_ERR(res))) {

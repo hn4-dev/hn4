@@ -2,13 +2,8 @@
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
  * MODULE:      Epoch Ring Manager
  * SOURCE:      hn4_epoch.c
- * VERSION:     8.2 (Refactored / Hardened)
+ * VERSION:     8.3
  * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
- *
- * ENGINEERING NOTES:
- *  1. GEOMETRY CONTRACT: Read/Write paths use unified mapping.
- *  2. GHOST WRITE PROTECTION: Ring validated against capacity.
- *  3. PADDING SAFETY: Explicit zeroing of IO buffers.
  */
 
 #include "hn4.h"
@@ -26,45 +21,17 @@
  * CONSTANTS & CONFIGURATIONS
  * ========================================================================= */
 
-/* Compile-time Safety: Epoch Header must be reasonably small */
 _Static_assert(sizeof(hn4_epoch_header_t) <= 512, "HN4: Epoch Header exceeds minimum block size guarantees");
 
-/* Drift Constants */
 #define HN4_EPOCH_DRIFT_MAX_FUTURE  5000
 #define HN4_EPOCH_DRIFT_MAX_PAST    100
+#define HN4_EPOCH_WRAP_THRESHOLD    10000
 
-/* Ring Geometry */
 #define HN4_RING_SIZE_BYTES         (1024ULL * 1024ULL) /* 1MB Fixed Ring */
 
 /* =========================================================================
  * INTERNAL HELPERS
  * ========================================================================= */
-
-static inline bool _epoch_addr_check(hn4_addr_t addr, uint64_t* out) {
-#ifdef HN4_USE_128BIT
-    if (addr.hi > 0) return false;
-    *out = addr.lo;
-#else
-    *out = addr;
-#endif
-    return true;
-}
-
-static inline hn4_addr_t _epoch_from_sector(uint64_t sect) {
-#ifdef HN4_USE_128BIT
-    hn4_addr_t a = { .lo = sect, .hi = 0 }; return a;
-#else
-    return sect;
-#endif
-}
-
-static inline hn4_addr_t _epoch_from_block(uint64_t blk) {
-#ifdef HN4_USE_128BIT
-    hn4_addr_t a = { .lo = blk, .hi = 0 }; return a;
-#else
-    return blk;
-#endif
-}
 
 /* 
  * UNIFIED GEOMETRY MAPPER
@@ -79,49 +46,27 @@ static inline hn4_result_t _epoch_phys_map(
     hn4_addr_t* out_lba,
     uint32_t* out_sector_count
 ) {
-    if (block_size == 0 || sector_size == 0) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(block_size == 0 || sector_size == 0)) return HN4_ERR_GEOMETRY;
 
     uint64_t sectors_per_block = block_size / sector_size;
 
 #ifdef HN4_USE_128BIT
-    /* 
-     * 1. 128-bit Capacity Check
-     * Verify: (block_idx * block_size) < vol_cap_bytes
-     */
     hn4_u128_t blk_128 = hn4_u128_from_u64(block_idx);
-    
-    /* Calculate byte offset of the block start */
     hn4_u128_t byte_offset = hn4_u128_mul_u64(blk_128, block_size);
     
-    /* Strict bound check */
-    if (hn4_u128_cmp(byte_offset, vol_cap_bytes) >= 0) {
+    if (HN4_UNLIKELY(hn4_u128_cmp(byte_offset, vol_cap_bytes) >= 0)) {
         return HN4_ERR_GEOMETRY;
     }
 
     *out_lba = hn4_u128_mul_u64(blk_128, sectors_per_block);
-
 #else
-    /* 
-     * Standard 64-bit Logic 
-     */
+    if (HN4_UNLIKELY(block_idx > (UINT64_MAX / block_size))) return HN4_ERR_GEOMETRY;
     
-    /* Overflow check for byte calculation */
-    if (block_idx > (UINT64_MAX / block_size)) return HN4_ERR_GEOMETRY;
-    
-    if (block_size > 0 && block_idx > (UINT64_MAX / block_size)) {
-    HN4_LOG_CRIT("Epoch: Block Index calculation would overflow 64-bits");
-    return HN4_ERR_GEOMETRY;
-    }
-
     uint64_t byte_offset = block_idx * block_size;
 
-    /* Capacity check */
-    if (byte_offset >= vol_cap_bytes) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(byte_offset >= vol_cap_bytes)) return HN4_ERR_GEOMETRY;
 
-    /* Overflow check for sector calculation */
-    if (sectors_per_block > 0 && block_idx > (UINT64_MAX / sectors_per_block)) {
-        return HN4_ERR_GEOMETRY;
-    }
+    if (HN4_UNLIKELY(block_idx > (UINT64_MAX / sectors_per_block))) return HN4_ERR_GEOMETRY;
 
     *out_lba = block_idx * sectors_per_block;
 #endif
@@ -131,9 +76,8 @@ static inline hn4_result_t _epoch_phys_map(
     return HN4_OK;
 }
 
-
 /* =========================================================================
- * CORE IMPLEMENTATION
+ * GENESIS
  * ========================================================================= */
 
 _Check_return_ hn4_result_t hn4_epoch_write_genesis(
@@ -153,9 +97,8 @@ _Check_return_ hn4_result_t hn4_epoch_write_genesis(
     const uint32_t bs = sb->info.block_size;
     const uint32_t ss = caps->logical_block_size;
 
-    /* Invariant: Block size must accommodate header */
-    if (bs < sizeof(hn4_epoch_header_t)) return HN4_ERR_GEOMETRY;
-    if (ss == 0 || bs % ss != 0) return HN4_ERR_ALIGNMENT_FAIL;
+    if (HN4_UNLIKELY(bs < sizeof(hn4_epoch_header_t))) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(ss == 0 || bs % ss != 0)) return HN4_ERR_ALIGNMENT_FAIL;
 
     dma_buffer = hn4_hal_mem_alloc(bs);
     if (HN4_UNLIKELY(!dma_buffer)) return HN4_ERR_NOMEM;
@@ -167,14 +110,9 @@ _Check_return_ hn4_result_t hn4_epoch_write_genesis(
     cpu_epoch.flags     = HN4_VOL_CLEAN;
     cpu_epoch.epoch_crc = hn4_epoch_calc_crc(&cpu_epoch);
 
-    /* Zero buffer to clear tail padding (Safety Contract) */
     _secure_zero(dma_buffer, bs);
     hn4_epoch_to_disk(&cpu_epoch, (hn4_epoch_header_t*)dma_buffer);
 
-    /* 
-     * Unified Geometry Path.
-     * Convert SB Sector LBA -> Block Index -> Phys Map -> Target LBA
-     */
     uint64_t start_sect;
     uint64_t vol_cap;
 #ifdef HN4_USE_128BIT
@@ -186,7 +124,7 @@ _Check_return_ hn4_result_t hn4_epoch_write_genesis(
 #endif
 
     uint32_t spb = bs / ss;
-    if (start_sect % spb != 0) {
+    if (HN4_UNLIKELY(start_sect % spb != 0)) {
         status = HN4_ERR_ALIGNMENT_FAIL;
         goto Cleanup;
     }
@@ -196,7 +134,7 @@ _Check_return_ hn4_result_t hn4_epoch_write_genesis(
     uint32_t io_sectors;
 
     status = _epoch_phys_map(start_blk, bs, ss, vol_cap, &target_lba, &io_sectors);
-    if (status != HN4_OK) goto Cleanup;
+    if (HN4_UNLIKELY(status != HN4_OK)) goto Cleanup;
 
     status = hn4_hal_sync_io(dev, HN4_IO_WRITE, target_lba, dma_buffer, io_sectors);
 
@@ -205,17 +143,26 @@ Cleanup:
     return status;
 }
 
-/* 
- * Drift Classification States 
- * Used for O(1) error mapping in check_ring
- */
+/* =========================================================================
+ * RING VALIDATION
+ * ========================================================================= */
+
 typedef enum {
-    EPOCH_SYNCED = 0,
-    EPOCH_FUTURE_TOXIC,
-    EPOCH_FUTURE_DILATION,
-    EPOCH_PAST_SKEW,
-    EPOCH_PAST_TOXIC
+    EPOCH_STATE_SYNCED          = 0,
+    EPOCH_STATE_FUTURE_DILATION = 1,
+    EPOCH_STATE_FUTURE_TOXIC    = 2,
+    EPOCH_STATE_PAST_SKEW       = 3,
+    EPOCH_STATE_PAST_TOXIC      = 4
 } hn4_epoch_drift_state_t;
+
+/* Lookup Table for Error Mapping */
+static const hn4_result_t _drift_err_map[] = {
+    [EPOCH_STATE_SYNCED]          = HN4_OK,
+    [EPOCH_STATE_FUTURE_DILATION] = HN4_ERR_TIME_DILATION,
+    [EPOCH_STATE_FUTURE_TOXIC]    = HN4_ERR_MEDIA_TOXIC,
+    [EPOCH_STATE_PAST_SKEW]       = HN4_ERR_GENERATION_SKEW,
+    [EPOCH_STATE_PAST_TOXIC]      = HN4_ERR_MEDIA_TOXIC
+};
 
 _Check_return_ hn4_result_t hn4_epoch_check_ring(
     HN4_IN hn4_hal_device_t* dev, 
@@ -234,7 +181,6 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
     hn4_epoch_header_t    epoch;
     hn4_addr_t            target_lba;
 
-    /* 1. Context Validation */
     if (HN4_UNLIKELY(!dev || !sb)) return HN4_ERR_INTERNAL_FAULT;
     caps = hn4_hal_get_caps(dev);
     if (HN4_UNLIKELY(!caps)) return HN4_ERR_INTERNAL_FAULT;
@@ -242,13 +188,10 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
     ss = caps->logical_block_size;
     bs = sb->info.block_size;
 
-    /* Invariant: Block Size */
     if (HN4_UNLIKELY(bs < sizeof(hn4_epoch_header_t))) {
-        HN4_LOG_CRIT("Epoch Block Size %u too small for Header %zu", bs, sizeof(hn4_epoch_header_t));
         return HN4_ERR_GEOMETRY;
     }
 
-    /* 2. Load Geometry */
 #ifdef HN4_USE_128BIT
     ring_curr_idx = sb->info.epoch_ring_block_idx.lo;
     uint64_t ring_start_sector = sb->info.lba_epoch_start.lo;
@@ -257,39 +200,25 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
     uint64_t ring_start_sector = sb->info.lba_epoch_start;
 #endif
 
-    /* Geometry Sanity */
-    if (ss == 0 || (bs % ss != 0)) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(ss == 0 || (bs % ss != 0))) return HN4_ERR_GEOMETRY;
     
-    /* Convert Start Sector -> Start Block for topology check */
     uint32_t sec_per_blk = bs / ss;
-
-    /* Alignment Guard */
-    if (ring_start_sector % sec_per_blk != 0) return HN4_ERR_ALIGNMENT_FAIL;
+    if (HN4_UNLIKELY(ring_start_sector % sec_per_blk != 0)) return HN4_ERR_ALIGNMENT_FAIL;
 
     ring_start_idx = ring_start_sector / sec_per_blk;
 
-    /* 
-     * GHOST WRITE TOPOLOGY CHECK
-     * Ensure Ring Extent (Start + Len) fits in Volume Capacity.
-     */
     uint64_t ring_len_blks = (HN4_RING_SIZE_BYTES + bs - 1) / bs;
     uint64_t ring_end_blk = ring_start_idx + ring_len_blks;
     uint64_t total_vol_blks = vol_cap / bs;
 
-    /* Check Wrap-around and Capacity */
-    if (ring_end_blk < ring_start_idx || ring_end_blk > total_vol_blks) {
-        HN4_LOG_CRIT("Ring Topology Violation: Start %llu Len %llu > Cap %llu",
-                     ring_start_idx, ring_len_blks, total_vol_blks);
+    if (HN4_UNLIKELY(ring_end_blk < ring_start_idx || ring_end_blk > total_vol_blks)) {
         return HN4_ERR_GEOMETRY;
     }
 
-    /* 3. Address Translation via Unified Mapper */
-    /* Checks Current Pointer validity vs Capacity */
-    if (_epoch_phys_map(ring_curr_idx, bs, ss, vol_cap, &target_lba, &io_sectors) != HN4_OK) {
+    if (HN4_UNLIKELY(_epoch_phys_map(ring_curr_idx, bs, ss, vol_cap, &target_lba, &io_sectors) != HN4_OK)) {
         return HN4_ERR_GEOMETRY;
     }
 
-    /* 4. IO Execution */
     io_buf = hn4_hal_mem_alloc(bs);
     if (HN4_UNLIKELY(!io_buf)) return HN4_ERR_NOMEM;
 
@@ -298,7 +227,6 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
         goto Cleanup;
     }
 
-    /* 5. Validation */
     memcpy(&epoch, io_buf, sizeof(epoch));
     hn4_epoch_to_cpu(&epoch);
 
@@ -307,68 +235,73 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
         goto Cleanup;
     }
 
-    /* 
-     * 6. Drift Analysis (State Machine)
-     * Replaces if/else logic with state mapping for clarity.
-     */
+    /* ---------------------------------------------------------------------
+     * DRIFT ANALYSIS (With Wrap-Around Logic)
+     * --------------------------------------------------------------------- */
     uint64_t disk_id = epoch.epoch_id;
     uint64_t mem_id  = sb->info.current_epoch_id;
     hn4_epoch_drift_state_t state;
-
-    /* Drift Analysis with Wrap-Around Support */
+    
     uint64_t diff;
     bool is_future;
 
     if (disk_id >= mem_id) {
-        diff = disk_id - mem_id;
-        is_future = true;
+        /* 
+         * Case A: Disk >= Mem. Usually Future.
+         * EXCEPTION (Past Wrap): Disk is MAX (e.g. F...FF), Mem is Small (e.g. 5).
+         * This implies the Superblock wrapped around and is actually NEWER than the Disk.
+         */
+        if (HN4_UNLIKELY(disk_id > (UINT64_MAX - HN4_EPOCH_WRAP_THRESHOLD) && 
+                         mem_id < HN4_EPOCH_WRAP_THRESHOLD)) 
+        {
+            /* Correct Diff: (MAX - Disk) + 1 + Mem */
+            diff = (UINT64_MAX - disk_id) + 1 + mem_id;
+            is_future = false; /* SB is actually ahead (Time passed) */
+        } else {
+            diff = disk_id - mem_id;
+            is_future = true; /* Disk is ahead (Time dilation) */
+        }
     } else {
-        /* Check for wrap-around case: disk=small, mem=huge */
-        /* If mem_id is near MAX and disk_id is near 0 */
-        if (mem_id > (UINT64_MAX - 10000) && disk_id < 10000) {
-        diff = (UINT64_MAX - mem_id) + 1 + disk_id;
-        is_future = true; /* It wrapped, so it's "future" */
-    } else {
-        diff = mem_id - disk_id;
-        is_future = false; /* Genuine past */
+        /* 
+         * Case B: Mem > Disk. Usually Past.
+         * EXCEPTION (Future Wrap): Mem is MAX, Disk is Small.
+         * This implies the Disk wrapped around and is NEWER than the Superblock.
+         */
+        if (HN4_UNLIKELY(mem_id > (UINT64_MAX - HN4_EPOCH_WRAP_THRESHOLD) && 
+                         disk_id < HN4_EPOCH_WRAP_THRESHOLD)) 
+        {
+            diff = (UINT64_MAX - mem_id) + 1 + disk_id;
+            is_future = true; /* Disk is actually ahead */
+        } else {
+            diff = mem_id - disk_id;
+            is_future = false; /* SB is ahead (Normal lag) */
+        }
     }
-}
 
+    /* Classify State */
     if (diff == 0) {
-        state = EPOCH_SYNCED;
+        state = EPOCH_STATE_SYNCED;
     } else if (is_future) {
-        state = (diff > HN4_EPOCH_DRIFT_MAX_FUTURE) ? EPOCH_FUTURE_TOXIC : EPOCH_FUTURE_DILATION;
+        state = (diff > HN4_EPOCH_DRIFT_MAX_FUTURE) 
+                ? EPOCH_STATE_FUTURE_TOXIC 
+                : EPOCH_STATE_FUTURE_DILATION;
     } else {
-        state = (diff > HN4_EPOCH_DRIFT_MAX_PAST) ? EPOCH_PAST_TOXIC : EPOCH_PAST_SKEW;
+        state = (diff > HN4_EPOCH_DRIFT_MAX_PAST) 
+                ? EPOCH_STATE_PAST_TOXIC 
+                : EPOCH_STATE_PAST_SKEW;
     }
 
-    /* Error Policy Table */
-    switch (state) {
-        case EPOCH_SYNCED:
-            status = HN4_OK;
-            break;
-        case EPOCH_FUTURE_TOXIC:
-            status = HN4_ERR_MEDIA_TOXIC;
-            break;
-        case EPOCH_FUTURE_DILATION:
-            status = HN4_ERR_TIME_DILATION;
-            break;
-        case EPOCH_PAST_TOXIC:
-            status = HN4_ERR_MEDIA_TOXIC;
-            break;
-        case EPOCH_PAST_SKEW:
-            /* Both diff==1 and diff <= 100 map to SKEW in original code logic */
-            status = HN4_ERR_GENERATION_SKEW;
-            break;
-        default:
-            status = HN4_ERR_INTERNAL_FAULT;
-            break;
-    }
+    /* Map to Result */
+    status = _drift_err_map[state];
 
 Cleanup:
     if (io_buf) hn4_hal_mem_free(io_buf);
     return status;
 }
+
+/* =========================================================================
+ * ADVANCEMENT
+ * ========================================================================= */
 
 _Check_return_ hn4_result_t hn4_epoch_advance(
     HN4_IN hn4_hal_device_t* dev, 
@@ -378,13 +311,12 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     HN4_OUT_OPT hn4_addr_t* out_new_ptr
 )
 {
-    /* 1. State Guards */
-    if (is_read_only || (sb->info.state_flags & HN4_VOL_TOXIC)) {
+    if (HN4_UNLIKELY(is_read_only || (sb->info.state_flags & HN4_VOL_TOXIC))) {
         return HN4_ERR_MEDIA_TOXIC;
     }
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
-    if (!caps) return HN4_ERR_INTERNAL_FAULT;
+    if (HN4_UNLIKELY(!caps)) return HN4_ERR_INTERNAL_FAULT;
 
     uint32_t bs = sb->info.block_size;
     uint32_t ss = caps->logical_block_size;
@@ -392,64 +324,52 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     if (HN4_UNLIKELY(bs < sizeof(hn4_epoch_header_t))) return HN4_ERR_GEOMETRY;
 
     void* io_buf = hn4_hal_mem_alloc(bs);
-    if (!io_buf) return HN4_ERR_NOMEM;
+    if (HN4_UNLIKELY(!io_buf)) return HN4_ERR_NOMEM;
 
-    /* 2. Construct Payload */
-    hn4_epoch_header_t epoch;
-    _secure_zero(&epoch, sizeof(epoch));
-
-    /* Check for Generation Exhaustion */
-    if (sb->info.copy_generation >= 0xFFFFFFFFFFFFFFF0ULL) {
+    /* Generation Exhaustion Check */
+    if (HN4_UNLIKELY(sb->info.copy_generation >= 0xFFFFFFFFFFFFFFF0ULL)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_EEXIST; 
     }
+
+    /* Prepare Header */
+    hn4_epoch_header_t epoch;
+    _secure_zero(&epoch, sizeof(epoch));
 
     uint64_t next_id = sb->info.current_epoch_id + 1;
     epoch.epoch_id = next_id;
     epoch.timestamp = hn4_hal_get_time_ns();
     epoch.flags = HN4_VOL_UNMOUNTING;
     
-    /* Bind Epoch to Superblock Generation to detect timeline forks */
     uint64_t gen_state = sb->info.copy_generation;
     epoch.d0_root_checksum = hn4_cpu_to_le32(hn4_crc32(0, &gen_state, sizeof(uint64_t)));
 
     _secure_zero(io_buf, bs);
     hn4_epoch_to_disk(&epoch, io_buf);
 
-    /* 3. Ring Topology Logic */
-    /* Use abstract types for addresses/capacity */
+    /* Ring Topology */
     hn4_addr_t start_sect_lba = sb->info.lba_epoch_start;
     hn4_addr_t ring_curr_blk  = sb->info.epoch_ring_block_idx;
     hn4_size_t vol_cap        = caps->total_capacity_bytes;
 
-    uint32_t spb = bs / ss; /* Sectors Per Block */
+    uint32_t spb = bs / ss; 
 
-    /* 
-     * Calculate Ring Start Block Index.
-     * Logic: start_blk = start_sect_lba / spb
-     */
     uint64_t ring_start_blk_idx;
     uint64_t ring_curr_blk_idx;
 
 #ifdef HN4_USE_128BIT
-    /* 
-     * NOTE: For 128-bit, we assume the Epoch Ring location itself 
-     * fits within the low 64-bits (it's usually at the start of the drive).
-     * If LBA > 18EB, we return Geometry Error for safety unless full division is impl.
-     */
-    if (start_sect_lba.hi > 0 || ring_curr_blk.hi > 0) {
+    if (HN4_UNLIKELY(start_sect_lba.hi > 0 || ring_curr_blk.hi > 0)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_GEOMETRY;
     }
-    /* Simple check for alignment on low bits */
-    if (start_sect_lba.lo % spb != 0) {
+    if (HN4_UNLIKELY(start_sect_lba.lo % spb != 0)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_ALIGNMENT_FAIL;
     }
     ring_start_blk_idx = start_sect_lba.lo / spb;
     ring_curr_blk_idx  = ring_curr_blk.lo;
 #else
-    if (start_sect_lba % spb != 0) {
+    if (HN4_UNLIKELY(start_sect_lba % spb != 0)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_ALIGNMENT_FAIL;
     }
@@ -457,55 +377,36 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     ring_curr_blk_idx  = ring_curr_blk;
 #endif
 
-    /* 
-     * Pico Profile uses a tiny ring (2 blocks).
-     * We must check the profile to determine the ring bounds, 
-     * otherwise we overwrite the Cortex (D0) region.
-     */
-    uint64_t target_sz = HN4_RING_SIZE_BYTES; /* Default 1MB */
+    uint64_t target_sz = HN4_RING_SIZE_BYTES; 
     if (sb->info.format_profile == HN4_PROFILE_PICO) {
         target_sz = 2 * bs;
     }
 
     uint64_t ring_len_blks = (target_sz + bs - 1) / bs;
     
-    /* Calculate Topology Bounds */
-    
-    /* Calculate Topology Bounds */
-    /* NOTE: We only validate bounds against Volume Capacity here. */
-    /* Since we are converting to blocks, check u64 fit. */
-    
-    /* Advance Index */
-    /* relative = curr - start */
-    if (ring_curr_blk_idx < ring_start_blk_idx) {
+    if (HN4_UNLIKELY(ring_curr_blk_idx < ring_start_blk_idx)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_DATA_ROT; 
     }
 
+    /* Advance Pointer */
     uint64_t relative_idx = ring_curr_blk_idx - ring_start_blk_idx;
-    
-    /* next = (relative + 1) % len */
     uint64_t next_relative_idx = (relative_idx + 1) % ring_len_blks;
-    
-    /* absolute_next = start + next_relative */
     uint64_t write_blk_idx = ring_start_blk_idx + next_relative_idx;
 
-    /* 4. IO Execution (Via Unified Mapper) */
     hn4_addr_t target_lba;
     uint32_t io_sectors;
 
-    /* _epoch_phys_map handles the hn4_size_t capacity check internally */
-    if (_epoch_phys_map(write_blk_idx, bs, ss, vol_cap, &target_lba, &io_sectors) != HN4_OK) {
+    if (HN4_UNLIKELY(_epoch_phys_map(write_blk_idx, bs, ss, vol_cap, &target_lba, &io_sectors) != HN4_OK)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_GEOMETRY;
     }
 
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_WRITE, target_lba, io_buf, io_sectors);
 
-    if (res == HN4_OK) {
+    if (HN4_LIKELY(res == HN4_OK)) {
         if (out_new_id) *out_new_id = next_id;
         if (out_new_ptr) {
-            /* Convert back to abstract type */
 #ifdef HN4_USE_128BIT
             out_new_ptr->lo = write_blk_idx;
             out_new_ptr->hi = 0;
@@ -514,7 +415,6 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
 #endif
         }
     } else {
-        /* On fail, return old values */
         if (out_new_id) *out_new_id = sb->info.current_epoch_id;
         if (out_new_ptr) *out_new_ptr = sb->info.epoch_ring_block_idx;
     }

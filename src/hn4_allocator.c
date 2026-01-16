@@ -23,6 +23,8 @@
 #include "hn4_endians.h"
 #include "hn4_annotations.h"
 
+    
+
 /* =========================================================================
  * 0. SAFETY & ALIGNMENT ASSERTIONS
  * ========================================================================= */
@@ -791,7 +793,7 @@ hn4_result_t _bitmap_op(
 
         /* 4. WRITE: Commit changes if mutated or healed */
         if (mutation_needed) {
-            hn4_result_t w_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, sector_buf, 1);
+            hn4_result_t w_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, sector_buf, sectors_to_io);
             
             if (w_res != HN4_OK) {
                 if (op == BIT_TEST) {

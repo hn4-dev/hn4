@@ -127,7 +127,7 @@ static uint64_t _ns_parse_hex_u64(const char* s, size_t len)
 static bool _ns_verify_extension_ptr(hn4_volume_t* vol, uint64_t lba) 
 {
     /* NOTE: Explicitly check against UINT64_MAX boundary as Sentinel */
-    if (lba == UINT64_MAX) return false;
+    if (HN4_UNLIKELY(lba == UINT64_MAX)) return false;
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     uint32_t ss = caps->logical_block_size;
@@ -137,16 +137,16 @@ static bool _ns_verify_extension_ptr(hn4_volume_t* vol, uint64_t lba)
     uint32_t spb = bs / ss;
 
     /* Alignment Check: Extension blocks must align to FS Block Size */
-    if (spb > 0 && (lba % spb != 0)) return false;
+    if (spb > 0 && HN4_UNLIKELY(lba % spb != 0)) return false;
 
     hn4_addr_t addr_lba   = hn4_addr_from_u64(lba);
     hn4_addr_t flux_start = vol->sb.info.lba_flux_start;
 
     /* Lower Bound: Must be after Metadata */
 #ifdef HN4_USE_128BIT
-    if (hn4_u128_cmp(addr_lba, flux_start) < 0) return false;
+    if (HN4_UNLIKELY(hn4_u128_cmp(addr_lba, flux_start) < 0)) return false;
 #else
-    if (addr_lba < flux_start) return false;
+    if (HN4_UNLIKELY(addr_lba < flux_start)) return false;
 #endif
 
     /* Upper Bound: Capacity */
@@ -226,7 +226,7 @@ hn4_result_t _ns_scan_cortex_slot(
             uint64_t dclass_le = raw->data_class;
             
             /* The "Wall": Empty slot stops linear probe */
-            if (raw->seed_id.lo == 0 && raw->seed_id.hi == 0 && dclass_le == 0) {
+            if (HN4_UNLIKELY(raw->seed_id.lo == 0 && raw->seed_id.hi == 0 && dclass_le == 0)) {
                 break; 
             }
 
@@ -245,7 +245,7 @@ hn4_result_t _ns_scan_cortex_slot(
             temp.checksum = 0;
             uint32_t calc_crc = hn4_crc32(0, &temp, sizeof(hn4_anchor_t));
 
-            if (stored_crc == calc_crc) {
+            if (HN4_LIKELY(stored_crc == calc_crc)) {
                 uint32_t curr_gen = hn4_le32_to_cpu(temp.write_gen);
                 
                 /* Resolve Duplicate/Update Conflicts */
@@ -291,7 +291,7 @@ hn4_result_t _ns_scan_cortex_slot(
         hn4_addr_t read_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, sector_off);
         uint32_t   read_n   = (byte_in_sec + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
 
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, read_lba, buf, read_n) != HN4_OK) continue;
+        if (HN4_UNLIKELY(hn4_hal_sync_io(vol->target_device, HN4_IO_READ, read_lba, buf, read_n) != HN4_OK)) continue;
 
         const hn4_anchor_t* raw = (const hn4_anchor_t*)((uint8_t*)buf + byte_in_sec);
         
@@ -392,12 +392,12 @@ static hn4_result_t _ns_get_or_compare_name(
                     hn4_addr_t phys = hn4_addr_from_u64(ext_lba);
                     
                     /* NOTE: Read full block to ensure payload coverage */
-                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, ext_buf, spb) != HN4_OK) {
+                    if (HN4_UNLIKELY(hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, ext_buf, spb) != HN4_OK)) {
                         break;
                     }
 
                     hn4_extension_header_t* ext = (hn4_extension_header_t*)ext_buf;
-                    if (hn4_le32_to_cpu(ext->magic) != HN4_MAGIC_META) break;
+                    if (HN4_UNLIKELY(hn4_le32_to_cpu(ext->magic) != HN4_MAGIC_META)) break;
                     
                     uint32_t type = hn4_le32_to_cpu(ext->type);
                     

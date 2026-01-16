@@ -109,7 +109,6 @@
      * This maximizes compression ratio at the cost of CPU, which is acceptable for HDDs.
      * SSD/RAM Mode uses Fast Scan (8 bytes) to save CPU.
      * 
-     * FIX 7 & 8: Range limited to [-127, 127]. Rejects 0 and -128.
      */
     static inline int8_t _tcc_detect_linear_gradient(
         const uint8_t* p,
@@ -117,6 +116,7 @@
         uint32_t device_type
     )
     {
+        if (HN4_UNLIKELY(p + 2 > end)) return 0;
         const bool deep_scan = (device_type == HN4_DEV_HDD);
         int limit = deep_scan ? 32 : 8;
 
@@ -556,7 +556,6 @@ hn4_result_t hn4_decompress_block(
 
             case HN4_OP_GRADIENT:
             {
-                /* Input Bounds Check (Need 2 bytes: Start + Slope) */
                 if (HN4_UNLIKELY(ip + 2 > iend)) return HN4_ERR_DATA_ROT;
                 
                 uint8_t val = *ip++;
@@ -564,19 +563,9 @@ hn4_result_t hn4_decompress_block(
                 
                 if (slope == 0 || slope == -128) return HN4_ERR_DATA_ROT;
 
-                /* 
-                 * [BUG FIX] CRITICAL SAFETY CHECK
-                 * If len is 0 (due to corruption or fuzzing), 'len - 1' below 
-                 * would underflow to UINT32_MAX, causing heap corruption.
-                 * Explicitly break if length is zero.
-                 */
-                if (len == 0) break;
+                /* FIX: Return error on invalid length to prevent underflow */
+                if (len == 0) return HN4_ERR_DATA_ROT;
 
-                /* 
-                 * Strict Range Pre-Validation
-                 * Calculate total delta using 64-bit math to avoid overflow.
-                 * If the progression exits [0, 255], the stream is corrupt.
-                 */
                 int64_t total_delta = (int64_t)(len - 1) * (int64_t)slope;
                 int64_t final_val   = (int64_t)val + total_delta;
 

@@ -124,24 +124,27 @@ hn4_u128_t hn4_u128_mul_u64(hn4_u128_t a, uint64_t b) {
     res.lo = (uint64_t)r;
     res.hi = (uint64_t)(r >> 64) + (a.hi * b);
 #else
-    /* Manual 64x64->128 decomposition for lo*b, plus hi*b */
-     uint64_t a_lo = a.lo & 0xFFFFFFFFULL;
-    uint64_t a_hi = a.lo >> 32;
-    uint64_t b_lo = b & 0xFFFFFFFF;
-    uint64_t b_hi = b >> 32;
-
-    uint64_t p0 = a_lo * b_lo;
-    uint64_t p1 = a_lo * b_hi;
-    uint64_t p2 = a_hi * b_lo;
-    uint64_t p3 = a_hi * b_hi;
-
-    uint64_t carry = (p1 & 0xFFFFFFFF) + (p0 >> 32);
-   carry += (p2 & 0xFFFFFFFFULL); // Lower 32 of p2
+    /* Correct Decomposition: a * b = (a.hi<<64 + a.lo) * b */
     
-    res.lo = a.lo * b; // CPU handles low part wrap correctly
-    
-    // High part accumulation
-    res.hi = (a.hi * b) + p3 + (p1 >> 32) + (p2 >> 32) + (carry >> 32);
+    /* 1. Calculate a.lo * b (Full 128-bit result needed for carry) */
+    uint64_t al = a.lo & 0xFFFFFFFFULL;
+    uint64_t ah = a.lo >> 32;
+    uint64_t bl = b & 0xFFFFFFFFULL;
+    uint64_t bh = b >> 32;
+
+    uint64_t p0 = al * bl;
+    uint64_t p1 = al * bh;
+    uint64_t p2 = ah * bl;
+    uint64_t p3 = ah * bh;
+
+    /* Sum partials to find carry from low 64 to high 64 */
+    /* p1 and p2 overlap in the middle 32 bits */
+    uint64_t c0 = (p0 >> 32) + (p1 & 0xFFFFFFFF) + (p2 & 0xFFFFFFFF);
+    uint64_t c1 = (c0 >> 32) + (p1 >> 32) + (p2 >> 32) + p3; /* This is the carry */
+
+    /* 2. Final Result */
+    res.lo = a.lo * b; /* CPU wraps low part correctly */
+    res.hi = (a.hi * b) + c1; /* Add high part + carry from low */
 #endif
     return res;
 }
@@ -238,4 +241,71 @@ hn4_u128_t hn4_u128_div_u64(hn4_u128_t a, uint64_t b) {
 
 #endif
     return q;
+}
+
+hn4_u128_t hn4_u128_mod(hn4_u128_t a, hn4_u128_t b) {
+    /* Guard: Modulo by zero */
+    if (b.lo == 0 && b.hi == 0) {
+        /* Return 0 or Sentinel on DivByZero */
+        hn4_u128_t zero = {0, 0};
+        return zero;
+    }
+
+#if defined(__SIZEOF_INT128__)
+    /* 
+     * OPTIMIZED PATH: Compiler Intrinsics
+     * Compiles to single 'div' instruction on x64
+     */
+    unsigned __int128 va = ((unsigned __int128)a.hi << 64) | a.lo;
+    unsigned __int128 vb = ((unsigned __int128)b.hi << 64) | b.lo;
+    
+    unsigned __int128 res = va % vb;
+    
+    hn4_u128_t ret;
+    ret.lo = (uint64_t)res;
+    ret.hi = (uint64_t)(res >> 64);
+    return ret;
+
+#else
+    /* 
+     * PORTABLE PATH: Binary Long Division
+     * Used when __int128 is unavailable.
+     */
+    
+    /* Optimization: If Divisor > Dividend, remainder is Dividend */
+    if (hn4_u128_cmp(b, a) > 0) return a;
+    
+    /* Optimization: If Divisor is equal, remainder is 0 */
+    if (hn4_u128_cmp(b, a) == 0) {
+        hn4_u128_t zero = {0, 0};
+        return zero;
+    }
+
+    hn4_u128_t rem = {0, 0};
+    
+    /* Iterate from MSB (127) down to 0 */
+    for (int i = 127; i >= 0; i--) {
+        /* Shift remainder left by 1 */
+        rem.hi = (rem.hi << 1) | (rem.lo >> 63);
+        rem.lo = (rem.lo << 1);
+        
+        /* Get bit 'i' from Dividend */
+        uint64_t bit;
+        if (i >= 64) {
+            bit = (a.hi >> (i - 64)) & 1;
+        } else {
+            bit = (a.lo >> i) & 1;
+        }
+        
+        /* Inject bit into LSB of remainder */
+        rem.lo |= bit;
+        
+        /* If Remainder >= Divisor, subtract Divisor */
+        if (hn4_u128_cmp(rem, b) >= 0) {
+            rem = hn4_u128_sub(rem, b);
+        }
+    }
+    
+    return rem;
+#endif
 }

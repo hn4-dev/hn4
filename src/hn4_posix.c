@@ -136,7 +136,7 @@ static size_t _imp_strlen(const char* s) {
 static void _imp_strncpy_safe(char* dst, const char* src, size_t n) {
     if (n == 0) return;
     size_t i;
-    for (i = 0; i < n - 1 && src[i] != '\0'; i++) dst[i] = src[i];
+    for (i = 0; i < n && src[i] != '\0'; i++) dst[i] = src[i];
     for (; i < n; i++) dst[i] = '\0'; /* Zero-fill rest */
 }
 
@@ -217,14 +217,14 @@ static hn4_mode_t _perms_to_mode(uint32_t p) {
 }
 
 static int _resolve_path(hn4_volume_t* vol, const char* path, hn4_lookup_ctx_t* ctx) {
-    if (!path) return -HN4_EINVAL;
+    if (HN4_UNLIKELY(!path)) return -HN4_EINVAL;
     if (!vol->nano_cortex) return -HN4_EIO;
     
     _imp_memset(ctx, 0, sizeof(hn4_lookup_ctx_t));
     
     size_t len = _imp_strlen(path);
-    if (len == 0) return -HN4_ENOENT;
-    if (len >= HN4_MAX_PATH) return -HN4_ENAMETOOLONG;
+    if (HN4_UNLIKELY(len == 0)) return -HN4_ENOENT;
+    if (HN4_UNLIKELY(len >= HN4_MAX_PATH)) return -HN4_ENAMETOOLONG;
 
     /* Root Detection */
     bool is_root = false;
@@ -470,7 +470,7 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
             /* Slot occupied, retry with new UUID */
         }
 
-        if (!slot_reserved) {
+        if (HN4_UNLIKELY(!slot_reserved)) {
             return -HN4_ENOSPC; /* Cortex Saturated or Bad Luck */
         }
 
@@ -496,7 +496,7 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
          * 5. Write to Disk 
          * This will write to 'target_slot' because we used the same hash logic.
          */
-        if (hn4_write_anchor_atomic(vol, &new_anc) != HN4_OK) {
+        if (HN4_UNLIKELY(hn4_write_anchor_atomic(vol, &new_anc) != HN4_OK)) {
             /* Rollback Reservation */
             hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
             /* Mark as Tombstone or Invalid to free it */
@@ -553,7 +553,7 @@ static bool _is_write_mode(int flags) {
 }
 
 hn4_ssize_t hn4_posix_read(hn4_volume_t* vol, hn4_handle_t* handle, void* buf, size_t count) {
-    if (!vol || !handle || !buf) return -HN4_EINVAL;
+     if (HN4_UNLIKELY(!vol || !handle || !buf)) return -HN4_EINVAL;
     
     hn4_vfs_handle_t* fh = (hn4_vfs_handle_t*)handle;
     if (fh->is_directory) return -HN4_EISDIR;
@@ -587,9 +587,16 @@ hn4_ssize_t hn4_posix_read(hn4_volume_t* vol, hn4_handle_t* handle, void* buf, s
         uint32_t chunk = payload - b_off;
         if (chunk > to_read) chunk = to_read;
 
-         hn4_result_t res = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs);
+         hn4_result_t res = hn4_read_block_atomic(
+             vol, 
+             &fh->cached_anchor, 
+             b_idx, 
+             io, 
+             bs, 
+             fh->session_perms /* Added 6th argument */
+         );
 
-        if (res == HN4_OK || res == HN4_INFO_HEALED) {
+        if (HN4_LIKELY(res == HN4_OK || res == HN4_INFO_HEALED)) {
             _imp_memcpy(ptr, (uint8_t*)io + b_off, chunk);
         } else if (res == HN4_INFO_SPARSE) {
             _imp_memset(ptr, 0, chunk);
@@ -707,7 +714,7 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
              * Sparse/Not Found is acceptable for RMW (treat as zeros).
              * Any other error is fatal.
              */
-            if (r != HN4_OK && r != HN4_INFO_SPARSE && r != HN4_ERR_NOT_FOUND && r != HN4_INFO_HEALED) {
+            if (HN4_UNLIKELY(r != HN4_OK && r != HN4_INFO_SPARSE && r != HN4_ERR_NOT_FOUND && r != HN4_INFO_HEALED)) {
                 ret_code = _map_err(r);
                 goto cleanup;
             }
@@ -740,7 +747,7 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         /* Execute Atomic Write */
         hn4_result_t w = hn4_write_block_atomic(vol, target_anchor, b_idx, io, valid_len, fh->session_perms);
         
-        if (w != HN4_OK) {
+        if (HN4_UNLIKELY(w != HN4_OK)) {
             ret_code = _map_err(w);
             goto cleanup;
         }

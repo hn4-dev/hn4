@@ -556,26 +556,58 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
 #endif
         }
 
-    /* Zone Alignment validation for ZNS */
-    if (virt_cap > 0) {
+   /* 
+     * Determine if Virtual Capacity is requested.
+     * Logic adapts to 64-bit scalar vs 128-bit struct.
+     */
+    bool use_virtual = false;
+#ifdef HN4_USE_128BIT
+    if (virt_cap.lo != 0 || virt_cap.hi != 0) use_virtual = true;
+#else
+    if (virt_cap > 0) use_virtual = true;
+#endif
+
+    if (use_virtual) {
+        /* --- VIRTUAL PATH --- */
         if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+#ifdef HN4_USE_128BIT
+            /* 128-bit Alignment Check: (Size % Zone) must be 0 */
+            hn4_u128_t zone_sz_128 = hn4_u128_from_u64(caps->zone_size_bytes);
+            hn4_u128_t rem = hn4_u128_mod(virt_cap, zone_sz_128);
+            
+            if (rem.lo != 0 || rem.hi != 0) {
+                 HN4_LOG_CRIT("Virtual capacity misaligned with ZNS Zone Size");
+                 return HN4_ERR_ALIGNMENT_FAIL;
+            }
+#else
+            /* 64-bit Alignment Check */
             if (!HN4_IS_ALIGNED(virt_cap, caps->zone_size_bytes)) {
                  HN4_LOG_CRIT("Virtual capacity misaligned with ZNS Zone Size");
                  return HN4_ERR_ALIGNMENT_FAIL;
             }
+#endif
         }
         capacity_bytes = virt_cap;
-    } else {
+    } 
+    else {
+        /* --- HARDWARE DEFAULT PATH --- */
 #ifdef HN4_USE_128BIT
-        capacity_bytes = caps->total_capacity_bytes.lo;
+        capacity_bytes = caps->total_capacity_bytes; 
+    
+        /* If ZNS, Align Down: Cap - (Cap % Zone) */
+        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+            hn4_u128_t zone_sz = hn4_u128_from_u64(caps->zone_size_bytes);
+            hn4_u128_t rem = hn4_u128_mod(capacity_bytes, zone_sz);
+            capacity_bytes = hn4_u128_sub(capacity_bytes, rem);
+        }
 #else
         capacity_bytes = caps->total_capacity_bytes;
-#endif
-        /* Hardware Optimization vs Portability */
-        /* We align down to Zone Size to ensure we don't straddle a partial zone at end of drive */
+        
+        /* If ZNS, Align Down using bitwise/integer math */
         if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
             capacity_bytes = HN4_ALIGN_DOWN(capacity_bytes, caps->zone_size_bytes);
         }
+#endif
     }
 
      hn4_result_t res = _check_profile_compatibility(pid, caps, capacity_bytes);
