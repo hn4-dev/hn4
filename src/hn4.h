@@ -590,24 +590,17 @@ typedef struct {
     void*           npu_tunnel_ctx; /* GPU Direct Context */
 } hn4_handle_t;
 
-/* 
- * THE ECHO CHAMBER (Transient Metadata Log)
- * Aligned to 32 bytes for cache efficiency and obfuscation padding.
- */
-#define HN4_MAGIC_ECHO 0xECA0
+typedef struct {
+    _Atomic uint64_t old_lba; /* Key */
+    _Atomic uint64_t new_lba; /* Value */
+    _Atomic uint32_t version;
+    _Atomic uint64_t seed_hash; 
+    _Atomic uint64_t slot_epoch; 
+} hn4_delta_entry_t;
 
-typedef struct HN4_PACKED {
-    uint32_t slot_idx;      /* Index in the Cortex array */
-    uint32_t write_gen;     /* New generation ID */
-    uint64_t mass;          /* New file size */
-    uint64_t mod_clock;     /* Timestamp */
-    uint32_t partial_crc;   /* Checksum of this entry */
-    uint16_t magic;         /* HN4_MAGIC_ECHO (Obfuscated) */
-    uint16_t flags;         /* Commit / Tombstone markers */
-} hn4_echo_entry_t;
+#define HN4_DELTA_TABLE_SIZE 1024 
 
-_Static_assert(sizeof(hn4_echo_entry_t) == 32, "Echo Entry must be 32 bytes");
-
+static hn4_delta_entry_t _delta_table[HN4_DELTA_TABLE_SIZE];
 
 typedef struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
     hn4_spinlock_t lock;
@@ -619,7 +612,7 @@ typedef struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
 } hn4_shard_lock_t;
 
 
-/* Runtime Volume Handle */
+/* Runtime Volumfe Handle */
 typedef struct {
     /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
     void*               target_device;
@@ -688,6 +681,10 @@ typedef struct {
     /* Repair Queue */
     hn4_medic_queue_t   medic_queue;
     int64_t             last_log_ts;
+
+     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+        hn4_delta_entry_t delta_table[HN4_DELTA_TABLE_SIZE];
+    } redirect;
 
     /* --- HIGH-THROUGHPUT LOCKING ZONE --- */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
@@ -807,11 +804,6 @@ typedef enum {
     BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
 } hn4_bit_op_t;
 
-
-
-/* =========================================================================
- * FIXED NANO STRUCTURES & CONSTANTS
- * ========================================================================= */
 #define HN4_CORTEX_SLOT_SIZE    128
 #define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" */
 #define HN4_MAGIC_NANO_PENDING  0x504E4447   /* "PNDG" */
@@ -821,7 +813,7 @@ typedef struct HN4_PACKED {
     uint32_t magic;         /* 0x00 */
     uint32_t header_crc;    /* 0x04 */
     uint64_t payload_len;   /* 0x08 */
-    uint64_t version;       /* 0x10 (Fix 9) */
+    uint64_t version;       /* 0x10 */
     uint32_t data_crc;      /* 0x18 */
     uint32_t flags;         /* 0x1C */
     uint8_t  data[];        /* 0x20 */

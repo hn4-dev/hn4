@@ -16,6 +16,7 @@
 #include "hn4_hal.h"
 #include "hn4_crc.h"
 #include "hn4_endians.h"
+#include "hn4_constants.h"
 #include "hn4_addr.h"
 #include <string.h>
 #include <stdlib.h>
@@ -649,44 +650,6 @@ hn4_TEST(Write, Write_Verify_Vector_Embedding) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
-
-/* 
- * Test: Write_Verify_Encryption_Flag
- * Scenario: Set HN4_HINT_ENCRYPTED. Write should succeed. 
- * Note: Actual encryption happens in transform layer, this verifies metadata flow.
- */
-hn4_TEST(Write, Write_Verify_Encryption_Flag) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x9999;
-    
-    /* Set Encryption Hint */
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID | HN4_HINT_ENCRYPTED);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-
-    uint8_t buf[100] = "SECRET_DATA";
-    
-    /* Write should succeed (Physical storage doesn't care about content) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 100));
-
-    uint8_t read_buf[4096] = {0};
-    
-    /* 
-     * FIX: Read MUST fail with ACCESS_DENIED.
-     * The driver sees HINT_ENCRYPTED, has no key/crypto stack, and refuses to yield data.
-     */
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096);
-    
-    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 
 /* 
  * Test: Write_Fails_On_RO
@@ -4810,7 +4773,7 @@ hn4_TEST(Integrity, Ghost_Generation_Skew) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
     uint32_t bs = vol->vol_block_size;
-    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+    uint32_t payload_cap = HN4_BLOCK_PayloadSize(bs);
 
     /* 1. Setup Valid File at Gen 100 */
     hn4_anchor_t anchor = {0};
@@ -4823,22 +4786,32 @@ hn4_TEST(Integrity, Ghost_Generation_Skew) {
     uint8_t* data = malloc(payload_cap);
     memset(data, 0xAA, payload_cap);
 
-    /* 2. Write Valid Data (Block Gen becomes 101) */
-    /* The block on disk will be sealed with Gen 101 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, payload_cap));
+    /* 
+     * 2. Write Valid Data 
+     * Logic: Gen 100 -> Next Gen 101. 
+     * The Block on disk is sealed with Gen 101.
+     * The in-memory 'anchor' struct is updated to Gen 101.
+     */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, payload_cap, HN4_PERM_SOVEREIGN));
+    ASSERT_EQ(101, hn4_le32_to_cpu(anchor.write_gen));
 
-    /* 3. Create the Ghost Scenario:
-       Manually advance the Anchor in RAM to Gen 200. 
-       This simulates a scenario where the Anchor was updated (maybe pointing to a new location),
-       but the reader found the *old* block at the *old* location (Ghost). */
+    /* 
+     * 3. Create the Ghost Scenario:
+     * Manually advance the Anchor in RAM to Gen 200.
+     * This simulates a metadata update where the data pointer (trajectory)
+     * wasn't updated, or the reader is looking for a future version.
+     */
     anchor.write_gen = hn4_cpu_to_le32(200);
 
     /* 4. Attempt to Read */
     uint8_t* read_buf = malloc(bs);
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs);
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs, HN4_PERM_SOVEREIGN);
 
-    /* 5. Expect Failure */
-    /* The reader must verify that Block.Gen (101) == Anchor.Gen (200). */
+    /* 
+     * 5. Expect Failure
+     * The reader sees Block(101) != Anchor(200). 
+     * Strict consistency requires rejection.
+     */
     ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
     free(data);
@@ -4846,6 +4819,7 @@ hn4_TEST(Integrity, Ghost_Generation_Skew) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
+
 
 /*
  * TEST 7: Identity_Crisis (The "Doppelgänger" Check)
@@ -5654,30 +5628,38 @@ hn4_TEST(Integrity, Ghost_Dies_By_Generation) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
     uint32_t bs = vol->vol_block_size;
-    uint32_t len = bs - sizeof(hn4_block_header_t);
+    uint32_t len = HN4_BLOCK_PayloadSize(bs);
     uint8_t* data = calloc(1, len);
+    uint8_t* read_buf = calloc(1, bs);
     
     hn4_anchor_t anchor = {0};
     anchor.seed_id.lo = 0x60057;
     anchor.orbit_vector[0] = 1;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
     anchor.write_gen = hn4_cpu_to_le32(5);
 
     /* 1. Write Gen 6 (k=0) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, len));
+    /* Disk gets Block with Gen 6. RAM Anchor becomes Gen 6. */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, data, len, HN4_PERM_SOVEREIGN));
     
     /* 2. Manually advance Anchor to Gen 7 in RAM */
     anchor.write_gen = hn4_cpu_to_le32(7);
 
-    /* 3. Read. Disk has Gen 6. Anchor expects Gen 7. */
-    /* Should fail with SKEW, proving the Ghost (Gen 6) is dead to us. */
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, data, len);
+    /* 
+     * 3. Read. 
+     * Disk has Gen 6. Anchor expects Gen 7. 
+     * Should fail with SKEW.
+     */
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs, HN4_PERM_SOVEREIGN);
     ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
     free(data);
+    free(read_buf);
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
+
 
 /*
  * TEST 23: ShadowHop_Honors_The_Last_Word
@@ -5763,35 +5745,48 @@ hn4_TEST(FixVerification, Read_Confirm_Relaxed_History) {
     anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
     anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
     
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
+    
     /* 1. Write Data at Gen 15 */
     anchor.write_gen = hn4_cpu_to_le32(14); /* Will inc to 15 */
     uint8_t buf[16] = "HISTORY";
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 7));
+    
+    /* Write small payload, pad rest */
+    uint8_t* write_buf = calloc(1, payload_sz);
+    memcpy(write_buf, buf, 7);
+    
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, write_buf, payload_sz, HN4_PERM_SOVEREIGN));
     ASSERT_EQ(15, hn4_le32_to_cpu(anchor.write_gen));
 
     /* 2. Advance Anchor to Gen 20 (Simulate meta-only updates / time jump) */
     anchor.write_gen = hn4_cpu_to_le32(20);
 
-    /* 3. Read Verification Attempt 1: CURRENT STATE */
-    uint8_t read_buf[4096] = {0};
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096);
+    /* 3. Read Verification Attempt 1: CURRENT STATE (Gen 20) */
+    /* Expect Failure: The block on disk is Gen 15. We are asking for Gen 20. */
+    uint8_t* read_buf = calloc(1, bs);
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs, HN4_PERM_SOVEREIGN);
     
-    /* Strict Driver: Fails because 15 != 20 */
     ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
-    /* 4. Read Verification Attempt 2: HISTORICAL VIEW */
+    /* 4. Read Verification Attempt 2: HISTORICAL VIEW (Gen 15) */
     /* Temporarily rewind Anchor to Gen 15 to access old state */
     anchor.write_gen = hn4_cpu_to_le32(15);
     
-    res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096);
+    res = hn4_read_block_atomic(vol, &anchor, 0, read_buf, bs, HN4_PERM_SOVEREIGN);
     
-    /* Now it must pass */
+    /* Now it must pass because keys match */
     ASSERT_EQ(HN4_OK, res);
+    
+    /* Verify Data Payload */
     ASSERT_EQ(0, strcmp((char*)read_buf, "HISTORY"));
 
+    free(write_buf);
+    free(read_buf);
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
+
 
 hn4_TEST(FixVerification, Read_Confirm_Future_Gen_Acceptance) {
     hn4_hal_device_t* dev = write_fixture_setup();

@@ -357,7 +357,7 @@ hn4_result_t hn4_tensor_read(
                 ctx->block_size
             );
 
-            if (HN4_UNLIKELY(res != HN4_OK)) {
+            if (HN4_UNLIKELY(HN4_IS_ERR(res))) {
                 /* Error propagated from read pipeline (e.g. DATA_ROT) */
                 goto cleanup;
             }

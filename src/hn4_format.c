@@ -455,12 +455,11 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
 #endif
         
         /* IO must be block aligned */
-        uint32_t io_blocks = chunk / block_size;
-        if (io_blocks == 0) break; /* Should not happen if size aligned */
-        uint32_t io_bytes = io_blocks * block_size;
+       uint32_t io_bytes = (chunk / ss) * ss;
+    
+    if (io_bytes == 0) break; /* Genuine progress failure */
 
-        res = hn4_hal_sync_io(dev, HN4_IO_WRITE, current_lba, buffer, (io_bytes / ss));
-        if (res != HN4_OK) break;
+    res = hn4_hal_sync_io(dev, HN4_IO_WRITE, current_lba, buffer, (io_bytes / ss));
 
         current_lba = hn4_addr_add(current_lba, (io_bytes / ss));
 #ifdef HN4_USE_128BIT
@@ -489,7 +488,7 @@ static hn4_result_t _check_profile_compatibility(
     /* 1. PICO Constraints */
     if (profile_id == HN4_PROFILE_PICO) {
         /* Rule: "The device is big (>= 1GB+)" -> PICO is for micro-targets */
-        if (target_capacity > 2 * HN4_SZ_GB) {
+       if (HN4_UNLIKELY(target_capacity > 2 * HN4_SZ_GB)) {
             HN4_LOG_CRIT("PICO Profile mismatch: Volume too large (%llu bytes). Use GENERIC.", target_capacity);
             return HN4_ERR_PROFILE_MISMATCH;
         }
@@ -738,7 +737,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     /* Explicit Lower Bound Check before subtraction */
      uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); 
     
-    if (capacity_bytes < min_required) {
+    if (HN4_UNLIKELY(capacity_bytes < min_required)) {
         HN4_LOG_ERR("Drive too small for layout. Need %llu bytes.", min_required);
         return HN4_ERR_ENOSPC;
     }
@@ -795,14 +794,10 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
  * ========================================================================= */
 
 hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params) {
-    if (!dev) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(!dev)) return HN4_ERR_INVALID_ARGUMENT;
 
-    /* 
-     * Pointer Math Safety.
-     * Use public API to access capabilities instead of unsafe casting.
-     */
     const hn4_hal_caps_t* live_caps_ptr = hn4_hal_get_caps(dev);
-    if (!live_caps_ptr) return HN4_ERR_INTERNAL_FAULT;
+    if (HN4_UNLIKELY(!live_caps_ptr)) return HN4_ERR_INTERNAL_FAULT;
 
     /* 
      * Ghost Capacity Race Condition.
@@ -864,7 +859,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     /* --- STEP 1: CALCULATE GEOMETRY --- */
 
     res = _calc_geometry(params, caps, &sb_cpu);
-    if (res != HN4_OK) return res;
+    if (HN4_UNLIKELY(res != HN4_OK)) return res;
 
     /* --- STEP 2: SANITIZE (THE NUKE) --- */
     hn4_size_t total_cap = sb_cpu.info.total_capacity;
@@ -886,7 +881,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         res = _sanitize_generic(dev, total_cap, caps->logical_block_size);
     }
     
-    if (res != HN4_OK) {
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_ERR("Sanitization failed. Aborting format to preserve data safety.");
         return res;
     }
@@ -900,8 +895,8 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     uint64_t snap_cap_val = hn4_addr_to_u64(baseline_cap);
     uint64_t curr_cap_val = hn4_addr_to_u64(current_live_caps->total_capacity_bytes);
 
-    if (snap_cap_val != curr_cap_val || 
-        baseline_ss != current_live_caps->logical_block_size) 
+    if (HN4_UNLIKELY(snap_cap_val != curr_cap_val || 
+                     baseline_ss != current_live_caps->logical_block_size)) 
     {
         HN4_LOG_CRIT("Device geometry changed during format! Aborting.");
         return HN4_ERR_GEOMETRY;
@@ -924,7 +919,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     uint32_t ss = caps->logical_block_size;
     if (ss == 0) ss = 512;
 
-    if (bs < ss || (bs % ss) != 0) {
+    if (HN4_UNLIKELY(bs < ss || (bs % ss) != 0)) {
         HN4_LOG_CRIT("Geometry Error: BS %u is not multiple of SS %u", bs, ss);
         return HN4_ERR_GEOMETRY;
     }
@@ -1007,22 +1002,22 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     
     #undef SAFE_ZERO_REGION
 
-    if ((res = _survey_silicon_cartography(dev, &sb_cpu)) != HN4_OK) {
+    if (HN4_UNLIKELY((res = _survey_silicon_cartography(dev, &sb_cpu)) != HN4_OK)) {
         return res;
     }
 
     sb_cpu.info.state_flags |= HN4_VOL_METADATA_ZEROED;
 
     /* Write Genesis Anchors */
-    if ((res = hn4_anchor_write_genesis(dev, &sb_cpu)) != HN4_OK) return res;
-    if ((res = hn4_epoch_write_genesis(dev, &sb_cpu)) != HN4_OK) return res;
+    if (HN4_UNLIKELY((res = hn4_anchor_write_genesis(dev, &sb_cpu)) != HN4_OK)) return res;
+    if (HN4_UNLIKELY((res = hn4_epoch_write_genesis(dev, &sb_cpu)) != HN4_OK)) return res;
 
     hn4_hal_barrier(dev);
 
     /* --- STEP 5: COMMIT SUPERBLOCKS --- */
     uint32_t write_sz = HN4_ALIGN_UP(HN4_SB_SIZE, bs); 
     void* sb_buf = hn4_hal_mem_alloc(write_sz);
-    if (!sb_buf) return HN4_ERR_NOMEM;
+    if (HN4_UNLIKELY(!sb_buf)) return HN4_ERR_NOMEM;
 
     memset(sb_buf, 0, write_sz);
     hn4_packed_sb_t* packed_sb = (hn4_packed_sb_t*)sb_buf;
@@ -1137,7 +1132,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     }
 
     /* Poison on Failure */
-     if (res != HN4_OK) {
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_CRIT("SB Commit Failed. Poisoning geometry.");
         memset(sb_buf, 0xDE, write_sz); 
         uint32_t* p = (uint32_t*)sb_buf;

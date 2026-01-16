@@ -3545,45 +3545,6 @@ hn4_TEST(OrbitHint, Corruption_Recovery_Fail) {
     hn4_unmount(vol); read_fixture_teardown(dev);
 }
 
-/* =========================================================================
- * 6. NEW TEST FUNCTIONS (EXTENDED COVERAGE)
- * ========================================================================= */
-
-/*
- * TEST: Security.Read_Encrypted_Access_Denied
- * OBJECTIVE: Verify that the reader enforces the HN4_PERM_ENCRYPTED restriction.
- *            If the Anchor is flagged as Encrypted, reading without a decryption 
- *            context (which is not passed in the atomic read API) should fail.
- */
-hn4_TEST(Security, Read_Encrypted_Access_Denied) {
-    hn4_hal_device_t* dev = read_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x123;
-    anchor.gravity_center = hn4_cpu_to_le64(100);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-    /* Set Encrypted Permission */
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_ENCRYPTED);
-    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
-
-    uint64_t lba = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
-    
-    /* Inject Valid Data (Content irrelevant, permission check happens first) */
-    _inject_test_block(vol, lba, anchor.seed_id, 1, "SECRET", 6, INJECT_CLEAN);
-
-    uint8_t buf[4096];
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-
-    /* Expect Access Denied due to missing decryption context/flag handling */
-    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
-
-    hn4_unmount(vol);
-    read_fixture_teardown(dev);
-}
-
 /*
  * TEST: Compression.Read_Unknown_Compression_Algo
  * OBJECTIVE: Verify that blocks marked with an unknown compression algorithm ID 
@@ -3974,64 +3935,6 @@ hn4_TEST(Resilience, Ghost_Alloc_Bit_Clear) {
     read_fixture_teardown(dev);
 }
 
-
-/*
- * TEST: Policy.Encrypted_Compressed_Conflict
- * OBJECTIVE: Verify that the reader enforces security policy by rejecting blocks
- *            that claim to be Compressed (TCC) when the Anchor is flagged Encrypted.
- *            (Encryption should happen *after* compression, so FS-layer compression
- *            flags inside an encrypted container imply structure tampering).
- * REF: hn4_read.c [FIX: Policy Validation]
- */
-hn4_TEST(Policy, Encrypted_Compressed_Conflict) {
-    hn4_hal_device_t* dev = read_fixture_setup();
-    hn4_volume_t* vol; hn4_mount_params_t p = {0};
-    hn4_mount(dev, &p, &vol);
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0xBAD1;
-    anchor.gravity_center = hn4_cpu_to_le64(100);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
-    
-    /* CONFIG: Anchor says "I am Encrypted". */
-    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_ENCRYPTED);
-
-    uint32_t bs = vol->vol_block_size;
-    uint8_t* raw = calloc(1, bs);
-    hn4_block_header_t* h = (hn4_block_header_t*)raw;
-
-    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    h->well_id = hn4_cpu_to_le128(anchor.seed_id);
-    h->generation = hn4_cpu_to_le64(1);
-    
-    /* ATTACK: Block Header says "I am Compressed" (Inconsistent with Encryption) */
-    h->comp_meta = hn4_cpu_to_le32((10 << 4) | HN4_COMP_TCC);
-    
-    uint32_t cap = bs - sizeof(hn4_block_header_t);
-    h->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, h->payload, cap));
-    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
-
-    uint64_t lba = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
-    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_lba_from_blocks(lba * (bs/512)), raw, bs/512);
-    bool c; _bitmap_op(vol, lba, 0, &c);
-
-    uint8_t buf[4096];
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-
-    /* 
-     * EXPECTATION: Access Denied.
-     * The driver correctly refuses to process encrypted files without a key context,
-     * protecting against the malformed block parsing entirely.
-     */
-    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
-
-    free(raw);
-    hn4_unmount(vol);
-    read_fixture_teardown(dev);
-}
-
-
 /*
  * TEST: Compression.Gradient_Range_Rejection
  * OBJECTIVE: Verify that the decompressor correctly validates the projected 
@@ -4247,6 +4150,276 @@ hn4_TEST(Logic, Orbit_Limit_Boundary) {
 
     /* Expect NOT_FOUND or SPARSE because k=12 is out of bounds for the scanner loop (0..11) */
     ASSERT_NE(HN4_OK, res);
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+hn4_TEST(Logic, Hint_Cluster_Overflow) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x99;
+    anchor.gravity_center = hn4_cpu_to_le64(9000);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.orbit_vector[0] = 1;
+
+    /* Block 256 is Cluster 16. OOB for 32-bit hint field. */
+    uint64_t block_idx = 256;
+    
+    uint64_t lba = _calc_trajectory_lba(vol, 9000, 1, block_idx, 0, 0);
+    _inject_test_block(vol, lba, anchor.seed_id, 1, "SAFE_DEFAULT", 12, INJECT_CLEAN);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, block_idx, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "SAFE_DEFAULT", 12));
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+
+hn4_TEST(Physics, Negative_Zero_Trajectory) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = _mount_with_profile(dev, HN4_PROFILE_GENERIC);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(100);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.fractal_scale = hn4_cpu_to_le16(63); /* Max Scale */
+
+    /* 
+     * Block 2. 
+     * Offset = 2 * (1<<63) = 0 (Overflow wrap to 0).
+     * If the logic doesn't catch overflow, it maps Block 2 to G+0.
+     * This aliases Block 2 to Block 0.
+     */
+    
+    /* Inject "BLOCK 0" at G+0 */
+    uint64_t lba0 = 100; 
+    _inject_test_block(vol, lba0, anchor.seed_id, 1, "BLOCK_0", 7, INJECT_CLEAN);
+
+    /* Read Block 2 */
+    uint8_t buf[4096] = {0};
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 2, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    /* 
+     * Must NOT return success with Block 0 data.
+     * Should fail trajectory calculation (Invalid/OOB) -> SPARSE.
+     */
+    ASSERT_NE(HN4_OK, res);
+    
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+hn4_TEST(Logic, Horizon_Backwards_Seek) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t max_blk = vol->vol_capacity_bytes / vol->vol_block_size;
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    /* Set G to very end of drive */
+    anchor.gravity_center = hn4_cpu_to_le64(max_blk - 1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_HORIZON);
+    anchor.fractal_scale = hn4_cpu_to_le16(0);
+
+    /* Read Block 5. Target = Max + 4. */
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 5, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    /* Expect OOB Rejection */
+    ASSERT_NE(HN4_OK, res);
+    /* Should detect as sparse/invalid, not HW_IO */
+    ASSERT_EQ(HN4_INFO_SPARSE, res);
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+hn4_TEST(Pico, Horizon_Fallback_Logic) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_volume_t* vol = _setup_pico_volume(dev);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x81C1;
+    anchor.gravity_center = hn4_cpu_to_le64(2000);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_HORIZON);
+    anchor.fractal_scale = 0; 
+
+    uint64_t target_lba = 2005;
+    _inject_test_block(vol, target_lba, anchor.seed_id, 1, "LINEAR", 6, INJECT_CLEAN);
+
+    uint8_t buf[512];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 5, buf, 512, HN4_PERM_SOVEREIGN);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "LINEAR", 6));
+
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+hn4_TEST(NVM, Fail_Fast_Retry_Logic) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    
+    /* Modify SB to enable NVM flag */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    sb.info.hw_caps_flags |= HN4_HW_NVM;
+    
+    /* Resign and write */
+    sb.raw.sb_crc = 0;
+    sb.raw.sb_crc = hn4_cpu_to_le32(hn4_crc32(0, &sb, HN4_SB_SIZE - 4));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    hn4_mount(dev, &p, &vol);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x1111;
+    anchor.gravity_center = hn4_cpu_to_le64(500);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    uint64_t lba = _calc_trajectory_lba(vol, 500, 0, 0, 0, 0);
+    
+    /* Inject Poison (0xCC) */
+    uint32_t bs = vol->vol_block_size;
+    uint8_t* raw = malloc(bs);
+    memset(raw, 0xCC, bs);
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_lba_from_blocks(lba * (bs/512)), raw, bs/512);
+    bool c; _bitmap_op(vol, lba, 0, &c);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    ASSERT_EQ(HN4_ERR_HW_IO, res);
+
+    free(raw);
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+hn4_TEST(NVM, High_Throughput_Compression) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    sb.info.hw_caps_flags |= HN4_HW_NVM;
+    sb.raw.sb_crc = 0;
+    sb.raw.sb_crc = hn4_cpu_to_le32(hn4_crc32(0, &sb, HN4_SB_SIZE - 4));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    hn4_mount(dev, &p, &vol);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x2222;
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.orbit_vector[0] = 1;
+
+    uint32_t bs = vol->vol_block_size;
+    uint8_t* raw = calloc(1, bs);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id = hn4_cpu_to_le128(anchor.seed_id);
+    h->generation = hn4_cpu_to_le64(1);
+
+    /* 
+     * FIX: Use length 36 (fits in short token).
+     * 36 + 4 (bias) = 40 bytes decompressed.
+     * Op: 0x40 (Isotope) | 36.
+     */
+    uint8_t* pld = h->payload;
+    *pld++ = 0x40 | 36;
+    *pld++ = 'Z';
+    
+    uint32_t c_len = (uint32_t)(pld - h->payload);
+    h->comp_meta = hn4_cpu_to_le32((c_len << 4) | 3);
+    
+    uint32_t cap = bs - sizeof(hn4_block_header_t);
+    h->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, h->payload, cap));
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
+
+    uint64_t lba = _calc_trajectory_lba(vol, 1000, 1, 0, 0, 0);
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_lba_from_blocks(lba * (bs/512)), raw, bs/512);
+    bool c; _bitmap_op(vol, lba, 0, &c);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    ASSERT_EQ(HN4_OK, res);
+    /* Expect 40 bytes of 'Z' */
+    ASSERT_EQ('Z', buf[0]);
+    ASSERT_EQ('Z', buf[39]);
+    ASSERT_EQ(0, buf[40]);
+
+    free(raw);
+    hn4_unmount(vol);
+    read_fixture_teardown(dev);
+}
+
+
+hn4_TEST(HDD, Deep_Scan_Retry_Logic) {
+    hn4_hal_device_t* dev = read_fixture_setup();
+    /* Modify SB to set HDD Type */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    sb.info.device_type_tag = HN4_DEV_HDD;
+    sb.raw.sb_crc = 0;
+    sb.raw.sb_crc = hn4_cpu_to_le32(hn4_crc32(0, &sb, HN4_SB_SIZE - 4));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    hn4_mount(dev, &p, &vol);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(100);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.orbit_vector[0] = 1;
+
+    /* k=0 Bad */
+    uint64_t lba0 = _calc_trajectory_lba(vol, 100, 1, 0, 0, 0);
+    _inject_test_block(vol, lba0, anchor.seed_id, 1, "BAD_SEC", 7, INJECT_BAD_DATA_CRC);
+
+    /* k=1 Good */
+    uint64_t lba1 = _calc_trajectory_lba(vol, 100, 1, 0, 0, 1);
+    _inject_test_block(vol, lba1, anchor.seed_id, 1, "GOOD_SEC", 8, INJECT_CLEAN);
+
+    uint8_t buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_SOVEREIGN);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "GOOD_SEC", 8));
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);

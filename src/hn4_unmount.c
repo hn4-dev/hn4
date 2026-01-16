@@ -268,7 +268,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     hn4_result_t final_res = HN4_OK;
     hn4_result_t tmp_res;
 
-    if (!vol || !vol->target_device) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(!vol || !vol->target_device)) return HN4_ERR_INVALID_ARGUMENT;
 
     /* 
      * Reference Check:
@@ -276,7 +276,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
      * If > 1, active handles exist. Deny unmount to prevent UAF.
      */
     uint32_t refs = atomic_load(&vol->health.ref_count);
-    if (refs > 1) {
+    if (HN4_UNLIKELY(refs > 1)) {
         HN4_LOG_WARN("Unmount Denied: Volume Busy (Refcount %u)", refs);
         return HN4_ERR_BUSY;
     }
@@ -293,7 +293,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         
         /* 1.1 Data Flush (FUA) */
         tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_lba_from_sectors(0), NULL, 0);
-        if (tmp_res != HN4_OK) {
+        if (HN4_UNLIKELY(tmp_res != HN4_OK)) {
             HN4_LOG_ERR("Data Flush Failed: %d", tmp_res);
             persistence_ok = false;
             final_res = tmp_res;
@@ -314,7 +314,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
             void* meta_buf = hn4_hal_mem_alloc(flush_buf_sz);
             
             /* Fallback to Block Size if 2MB alloc fails */
-            if (!meta_buf) {
+            if (HN4_UNLIKELY(!meta_buf)) {
                 flush_buf_sz = bs;
                 meta_buf = hn4_hal_mem_alloc(flush_buf_sz);
             }
@@ -345,7 +345,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     
                             uint64_t safe_data;
     
-                            if (_ecc_check_and_fix(vol, w->data, w->ecc, &safe_data, NULL) != HN4_OK) {
+                            if (HN4_UNLIKELY(_ecc_check_and_fix(vol, w->data, w->ecc, &safe_data, NULL) != HN4_OK)) {
                                 HN4_LOG_CRIT("CRITICAL: RAM Bitmap Corruption detected!");
                                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC | HN4_VOL_TOXIC);
                                 persistence_ok = false;
@@ -363,7 +363,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                         uint32_t sectors = (items * 8 + ss - 1) / ss;
                         hn4_addr_t lba = hn4_lba_from_sectors(start_lba_val); 
                         
-                        if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, meta_buf, sectors) != HN4_OK) {
+                        if (HN4_UNLIKELY(hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, meta_buf, sectors) != HN4_OK)) {
                             persistence_ok = false;
                             final_res = HN4_ERR_HW_IO;
                         }
@@ -417,8 +417,9 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
             }
         }
 
-        /* 1.2 Epoch Advance */
-        uint64_t active_epoch = vol->sb.info.current_epoch_id;
+       /* 1.2 Epoch Advance */
+
+       uint64_t active_epoch = vol->sb.info.current_epoch_id;
         hn4_addr_t active_ring_ptr_blk = vol->sb.info.epoch_ring_block_idx;
         bool epoch_failed = false;
 
@@ -431,19 +432,31 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                 &active_ring_ptr_blk
             );
 
-            /* In-memory pointers are updated by _epoch_advance logic only on success.
-               We pass these 'active' values to broadcast, but we do NOT update vol->sb 
-               until broadcast succeeds (conceptually). */
+            if (tmp_res == HN4_OK) {
+                /* 
+                 * Audit the Epoch transition. We record the NEW Epoch ID as the principal hash.
+                 * Old/New LBA context uses the Ring Ptr to track physical movement.
+                 */
+                hn4_result_t log_res = hn4_chronicle_append(
+                    dev, 
+                    vol, 
+                    HN4_CHRONICLE_OP_SNAPSHOT,
+                    hn4_lba_from_blocks(hn4_addr_to_u64(vol->sb.info.epoch_ring_block_idx)), /* Old Ring Ptr */
+                    hn4_lba_from_blocks(hn4_addr_to_u64(active_ring_ptr_blk)),               /* New Ring Ptr */
+                    active_epoch                                                             /* New Epoch ID */
+                );
 
-            if (tmp_res != HN4_OK) {
+                if (log_res != HN4_OK) {
+                    HN4_LOG_WARN("Chronicle Append Failed (%d). Audit Trail incomplete.", log_res);
+                    /* We don't fail unmount for this, but we log the integrity gap */
+                }
+            } else {
                 HN4_LOG_ERR("Epoch Advance Failed: %d", tmp_res);
                 persistence_ok = false;
                 epoch_failed = true;
                 if (final_res == HN4_OK) final_res = tmp_res;
             }
         }
-
-        
 
         /* 1.3 SB Broadcast */
         /* Pass bump_generation = true for standard clean path */
@@ -452,7 +465,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                                       epoch_failed,
                                       true /* bump_generation */);
         
-        if (tmp_res != HN4_OK) {
+        if (HN4_UNLIKELY(tmp_res != HN4_OK)) {
             HN4_LOG_ERR("SB Broadcast Failed: %d", tmp_res);
             if (final_res == HN4_OK) final_res = tmp_res;
             persistence_ok = false;
@@ -462,7 +475,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         if (persistence_ok) {
             tmp_res = hn4_hal_sync_io(dev, HN4_IO_FLUSH, hn4_lba_from_sectors(0), NULL, 0);
             
-            if (tmp_res != HN4_OK) {
+            if (HN4_UNLIKELY(tmp_res != HN4_OK)) {
                 HN4_LOG_CRIT("Final Flush Failed! Reverting to DEGRADED.");
                 
                 vol->health.taint_counter++;
@@ -493,7 +506,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     /* Optional retention on error for debugging */
     bool retain_debug = false;
 #ifdef HN4_DEBUG_RETAIN_ON_ERROR
-    if (HN4_IS_ERR(final_res)) {
+    if (HN4_UNLIKELY(HN4_IS_ERR(final_res))) {
         HN4_LOG_CRIT("Unmount failed (%d). Retaining structs.", final_res);
         retain_debug = true;
     }

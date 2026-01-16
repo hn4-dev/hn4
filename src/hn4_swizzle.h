@@ -32,7 +32,9 @@ static inline uint64_t hn4_rotl64(uint64_t x, int k) {
 #if defined(_MSC_VER)
     return _rotl64(x, k);
 #else
-    return (x << k) | (x >> (64 - k));
+    const unsigned int mask = k & 63;
+    if (mask == 0) return x;
+    return (x << mask) | (x >> (64 - mask));
 #endif
 }
 

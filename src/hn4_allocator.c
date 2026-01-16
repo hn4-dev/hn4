@@ -144,27 +144,44 @@ _hn4_cas128(volatile void *dst,
     return success;
 
 #elif defined(__aarch64__)
+    if (_hn4_cpu_features & HN4_CPU_ARM_LSE) {
+        register uint64_t x0_lo asm("x0") = expected->lo;
+        register uint64_t x1_hi asm("x1") = expected->hi;
+        register uint64_t x2_lo asm("x2") = desired.lo;
+        register uint64_t x3_hi asm("x3") = desired.hi;
 
-    /* FIX: Enforce even-odd register pairs (x0,x1 and x2,x3) for CASPAL */
-    register uint64_t x0_lo asm("x0") = expected->lo;
-    register uint64_t x1_hi asm("x1") = expected->hi;
-    register uint64_t x2_lo asm("x2") = desired.lo;
-    register uint64_t x3_hi asm("x3") = desired.hi;
-
-    __asm__ __volatile__ (
-        "caspal x0, x1, x2, x3, [%4]"
-        : "+r"(x0_lo), "+r"(x1_hi)
-        : "r"(x2_lo), "r"(x3_hi), "r"(dst)
-        : "memory"
-    );
-
-    bool success = (x0_lo == expected->lo) &&
-                   (x1_hi == expected->hi);
-
-    expected->lo = x0_lo;
-    expected->hi = x1_hi;
-
-    return success;
+        __asm__ __volatile__ (
+            "caspal x0, x1, x2, x3, [%4]"
+            : "+r"(x0_lo), "+r"(x1_hi)
+            : "r"(x2_lo), "r"(x3_hi), "r"(dst)
+            : "memory"
+        );
+        expected->lo = x0_lo;
+        expected->hi = x1_hi;
+        return (x0_lo == expected->lo && x1_hi == expected->hi); // Simplified logic check
+    } else {
+        /* ARMv8.0 Compatible LL/SC Loop */
+        uint64_t old_lo, old_hi;
+        int res;
+        __asm__ __volatile__(
+            "1: ldxp %0, %1, [%4]\n"
+            "   cmp %0, %2\n"
+            "   ccmp %1, %3, #0, eq\n"
+            "   b.ne 2f\n"
+            "   stxp %w5, %6, %7, [%4]\n"
+            "   cbnz %w5, 1b\n"
+            "2:\n"
+            : "=&r"(old_lo), "=&r"(old_hi)
+            : "r"(expected->lo), "r"(expected->hi), "r"(dst), "r"(res), "r"(desired.lo), "r"(desired.hi)
+            : "cc", "memory"
+        );
+        
+        if (old_lo == expected->lo && old_hi == expected->hi) return true;
+        
+        expected->lo = old_lo;
+        expected->hi = old_hi;
+        return false;
+    }
 
 #else
     /* 
@@ -221,9 +238,6 @@ static inline bool _hn4_cas64(volatile uint64_t* dst,
 /*
  * _hn4_load128
  * Atomic 128-bit load WITHOUT side-effects.
- * 
- * FIX 1 (ARM): Used LDXP + CLREX. No STXP. No RMW semantics.
- * FIX 2 (x64): Reverted to CMPXCHG16B(0,0) to guarantee atomicity.
  */
 static inline hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
     hn4_aligned_u128_t  ret;
@@ -437,11 +451,12 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     uint64_t limit_update;  // 95%
     uint64_t limit_recover; // 85%
 
-    if (cap_blocks <= (UINT64_MAX / 100)) {
+    if (cap_blocks <= (UINT64_MAX / HN4_SATURATION_UPDATE)) {
         limit_genesis = (cap_blocks * HN4_SATURATION_GENESIS) / 100;
         limit_update  = (cap_blocks * HN4_SATURATION_UPDATE) / 100;
         limit_recover = (cap_blocks * (HN4_SATURATION_GENESIS - 5)) / 100;
     } else {
+        /* Fallback for Exabyte/Quettabyte scales */
         limit_genesis = (cap_blocks / 100) * HN4_SATURATION_GENESIS;
         limit_update  = (cap_blocks / 100) * HN4_SATURATION_UPDATE;
         limit_recover = (cap_blocks / 100) * (HN4_SATURATION_GENESIS - 5);
@@ -700,9 +715,9 @@ hn4_result_t _bitmap_op(
         const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
         const uint32_t ss = caps->logical_block_size;
         
-        if (HN4_UNLIKELY(ss > 4096)) return HN4_ERR_NOMEM;
-
-         void* sector_buf = hn4_hal_mem_alloc(4096);
+        uint32_t alloc_size = (ss > 4096) ? ss * 2 : 8192; 
+        void* sector_buf = hn4_hal_mem_alloc(alloc_size);
+        
         if (!sector_buf) return HN4_ERR_NOMEM;
         
         /* Coordinate Calculation */
@@ -1196,10 +1211,6 @@ _alloc_cortex_run(
                     
                     hn4_addr_t claim_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, head_sect_offset);
                     
-                    /* 
-                     * FIX: RMW Cycle into separate CLAIM BUFFER 
-                     * Do NOT use io_buffer here, or we destroy the batch context for the loop.
-                     */
                     if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, claim_lba, claim_buf, 1) != HN4_OK) {
                         status = HN4_ERR_HW_IO; 
                         goto Cleanup;
@@ -1247,7 +1258,6 @@ _alloc_cortex_run(
 
                     claim_hdr->header_crc = hn4_cpu_to_le32(p_crc);
 
-                    /* FIX: Commit Reservation using claim_buf */
                     if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, claim_lba, claim_buf, 1) != HN4_OK) {
                         status = HN4_ERR_HW_IO; 
                         goto Cleanup;
@@ -1893,13 +1903,13 @@ hn4_alloc_genesis(
         uint64_t S = 1ULL << fractal_scale;
         uint64_t total_blocks;
     #ifdef HN4_USE_128BIT
-        hn4_u128_t cap = vol->vol_capacity_bytes;
-        hn4_u128_t res = hn4_u128_div_u64(cap, bs);
-        /* Safety: If blocks exceed 64-bit count (~18 Exabytes of 4KB blocks), we clamp/fail */
+            hn4_u128_t limit_addr = vol->sb.info.lba_horizon_start;
+        hn4_u128_t res = hn4_u128_div_u64(limit_addr, (bs / ss)); /* Convert Sector LBA -> Block Index */
+    
         if (res.hi > 0) return HN4_ERR_GEOMETRY; 
         total_blocks = res.lo;
     #else
-        total_blocks = vol->vol_capacity_bytes / bs;
+        total_blocks = vol->sb.info.lba_horizon_start / sec_per_blk;
     #endif
         uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
         uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
@@ -1913,9 +1923,12 @@ hn4_alloc_genesis(
 
         if (flux_aligned_blk < total_blocks) {
 
+            if (flux_aligned_blk >= total_blocks) return HN4_ERR_ENOSPC;
+
             uint64_t available_blocks = total_blocks - flux_aligned_blk;
             uint64_t phi = available_blocks / S;
             
+            /* Strict check against 0 to prevent FPE in modulo math later */
             if (phi > 0) {
                 
                 /*

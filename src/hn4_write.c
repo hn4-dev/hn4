@@ -298,16 +298,16 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
     HN4_LOG_CRIT("WRITE_ATOMIC: Enter. Vol=%p Block=%llu Len=%u", vol, (unsigned long long)block_idx, len);
 
     /* 1. Pre-flight Validation */
-    if (!vol || !anchor || !data) {
+    if (HN4_UNLIKELY(!vol || !anchor || !data)) {
         HN4_LOG_CRIT("WRITE_ATOMIC: Invalid Args (NULL ptr)");
         return HN4_ERR_INVALID_ARGUMENT;
     }
 retry_transaction:;
-    if (vol->read_only) {
+    if (HN4_UNLIKELY(vol->read_only)) {
         HN4_LOG_CRIT("WRITE_ATOMIC: Volume is RO");
         return HN4_ERR_ACCESS_DENIED;
     }
-    if (vol->sb.info.state_flags & HN4_VOL_PANIC) {
+    if (HN4_UNLIKELY(vol->sb.info.state_flags & HN4_VOL_PANIC)) {
         HN4_LOG_CRIT("WRITE_ATOMIC: Volume Panic. Writes disabled.");
         return HN4_ERR_VOLUME_LOCKED;
     }
@@ -387,7 +387,7 @@ retry_transaction:;
 
     /* 3. Allocate IO Buffer */
     void* io_buf = hn4_hal_mem_alloc(bs);
-    if (!io_buf) {
+    if (HN4_UNLIKELY(!io_buf)) {
         HN4_LOG_CRIT("WRITE_ATOMIC: OOM allocating IO buffer");
         return HN4_ERR_NOMEM;
     }
@@ -406,7 +406,7 @@ retry_transaction:;
     if (old_lba != HN4_LBA_INVALID && len < payload_cap) {
         void* thaw_buf = hn4_hal_mem_alloc(bs);
         
-        if (!thaw_buf) {
+         if (HN4_UNLIKELY(!thaw_buf)) {
             HN4_LOG_CRIT("WRITE_ATOMIC: Thaw alloc failed. Aborting to prevent data loss.");
             hn4_hal_mem_free(io_buf); /* Clean up the main buffer before return */
             return HN4_ERR_NOMEM;
@@ -415,7 +415,7 @@ retry_transaction:;
         hn4_addr_t old_phys = hn4_lba_from_blocks(old_lba * sectors);
         
         hn4_result_t r_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, old_phys, thaw_buf, sectors);
-        if (r_res != HN4_OK) {
+        if (HN4_UNLIKELY(r_res != HN4_OK)) {
             HN4_LOG_CRIT("WRITE_ATOMIC: Thaw read failed. Aborting.");
             hn4_hal_mem_free(thaw_buf);
             hn4_hal_mem_free(io_buf);
@@ -425,7 +425,7 @@ retry_transaction:;
         hn4_block_header_t* old_hdr = (hn4_block_header_t*)thaw_buf;
         hn4_block_header_t* new_hdr_view = (hn4_block_header_t*)io_buf;
 
-        if (hn4_le32_to_cpu(old_hdr->magic) != HN4_BLOCK_MAGIC) {
+        if (HN4_UNLIKELY(hn4_le32_to_cpu(old_hdr->magic) != HN4_BLOCK_MAGIC)) {
             HN4_LOG_CRIT("WRITE_ATOMIC: Thaw source corrupt (Phantom Block). Aborting.");
             hn4_hal_mem_free(thaw_buf);
             hn4_hal_mem_free(io_buf);
@@ -606,7 +606,7 @@ retry_transaction:;
         for (uint8_t k = 0; k <= k_limit; k++) {
             uint64_t candidate = _calc_trajectory_lba(vol, G, V, block_idx, M, k);
 
-            if (candidate == HN4_LBA_INVALID) continue;
+            if (HN4_UNLIKELY(candidate == HN4_LBA_INVALID)) continue;
 
             /* Active Quality Mask Check */
             if (vol->quality_mask) {
@@ -639,12 +639,12 @@ retry_transaction:;
             bool bit_flipped; /* Indicates 0->1 transition (Allocation Success) */
             hn4_result_t op_res = _bitmap_op(vol, candidate, BIT_SET, &bit_flipped);
 
-            if (op_res != HN4_OK) {
+            if (HN4_UNLIKELY(op_res != HN4_OK)) {
                 alloc_res = HN4_ERR_BITMAP_CORRUPT;
                 break;
             }
 
-            if (bit_flipped) {
+            if (HN4_LIKELY(bit_flipped)) {
                 atomic_thread_fence(memory_order_release);
                 target_lba = candidate;
                 alloc_res = HN4_OK;
@@ -788,6 +788,10 @@ retry_transaction:;
                     
                     txn_anchor.gravity_center = hn4_cpu_to_le64(new_G);
                     
+                    /* Note: This is safe because we haven't committed the Generation yet. 
+                       If we fail later, the old Generation makes this G update irrelevant/ignored. */
+                    anchor->gravity_center = hn4_cpu_to_le64(new_G);
+                    
                     /* Update Bitmap: Release 'target', Claim 'actual' */
                     _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
                     _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
@@ -839,7 +843,7 @@ retry_transaction:;
         do {
             io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, phys_sector, io_buf, sectors);
             
-            if (io_res != HN4_OK) {
+            if (HN4_UNLIKELY(io_res != HN4_OK)) {
                 if (++tries < max_retries) {
                     hn4_hal_micro_sleep(retry_sleep);
                 }
@@ -987,10 +991,10 @@ retry_transaction:;
     uint32_t expected_gen_le = hn4_cpu_to_le32(current_gen);
     uint32_t new_gen_le      = hn4_cpu_to_le32((uint32_t)next_gen);
 
-    if (!atomic_compare_exchange_strong(
+    if (HN4_UNLIKELY(!atomic_compare_exchange_strong(
         (_Atomic uint32_t*)&anchor->write_gen, 
         &expected_gen_le, 
-        new_gen_le))
+        new_gen_le)))
     {
         HN4_LOG_WARN("WRITE_ATOMIC: Race detected. Expected Gen %u, Found %u. Retrying.", 
                      current_gen, hn4_le32_to_cpu(expected_gen_le));

@@ -263,12 +263,18 @@ hn4_result_t hn4_write_anchor_atomic(
      * Since anchors are 128 bytes but sectors are 512/4096 bytes, we cannot write just the anchor.
      * We must read the sector, update the slot, and write back.
      */
+    /* 3. Read-Modify-Write (RMW) */
     void* io_buf = hn4_hal_mem_alloc(ss);
     if (!io_buf) return HN4_ERR_NOMEM;
+
+    /* Map Sector LBA to one of the 64 shard locks in the volume struct */
+    uint64_t lock_idx = hn4_addr_to_u64(write_lba) % HN4_CORTEX_SHARDS;
+    hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
     /* Read */
     hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, io_buf, 1);
     if (res != HN4_OK) {
+        hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
         hn4_hal_mem_free(io_buf);
         return res;
     }
@@ -278,6 +284,9 @@ hn4_result_t hn4_write_anchor_atomic(
 
     /* Write */
     res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, 1);
+    
+    /* Release Lock immediately after IO submission */
+    hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
     
     /* Barrier to ensure metadata persistence */
     if (res == HN4_OK) {

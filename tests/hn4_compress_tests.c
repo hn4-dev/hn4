@@ -1192,3 +1192,199 @@ hn4_TEST(Compress, _TCC_Tiny_Buffer_Fuzz) {
 
     compress_teardown(dev);
 }
+
+/* =========================================================================
+ * 52. TCC GRADIENT 8-BIT OVERFLOW CHECK
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the compressor rejects a gradient that mathematically overflows
+ * the 8-bit value range, even if it doesn't wrap around during the scan.
+ * Wait, the compressor checks wrap-around during detection.
+ * This test verifies the decompressor's safety check `if (final_val < 0 || final_val > 255)`.
+ * We manually construct a malicious token that claims a valid gradient but overflows.
+ */
+hn4_TEST(Compress, _TCC_Gradient_Decompress_Overflow) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Token: Gradient (0x80) | Len 4 (biased -> 8 items)
+     * Data: Start=200, Slope=10.
+     * 200, 210, 220, 230, 240, 250, 260(OVERFLOW), 270.
+     */
+    uint8_t stream[] = { 0x80 | 4, 200, 10 };
+    
+    uint8_t dst[64];
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_decompress_block(stream, sizeof(stream), dst, 64, &out_len);
+    
+    /* Decompressor MUST catch the overflow before writing */
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 53. TCC LITERAL BUFFER ALIGNMENT (4GB SAFE)
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that `_flush_literal_buffer` correctly handles chunking when the 
+ * pending literal size exceeds `HN4_MAX_TOKEN_LEN` (8223 bytes).
+ * It should emit multiple Literal tokens.
+ */
+hn4_TEST(Compress, _TCC_Literal_Chunking) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 10KB of random literals */
+    uint32_t len = 10240;
+    uint8_t* data = calloc(1, len);
+    for(uint32_t i=0; i<len; i++) data[i] = (uint8_t)rand();
+    
+    /* Ensure no accidental patterns */
+    for(uint32_t i=0; i<len; i+=2) data[i] ^= 0x55;
+
+    void* out = calloc(1, 20000);
+    uint32_t out_len = 0;
+
+    ASSERT_EQ(HN4_OK, hn4_compress_block(data, len, out, 20000, &out_len, HN4_DEV_SSD, 0));
+
+    /* 
+     * Analysis:
+     * Max token ~8KB. 10KB input requires at least 2 tokens.
+     * Token 1: 8223 bytes. Token 2: ~2017 bytes.
+     * Verify we have multiple headers.
+     */
+    uint8_t* p = (uint8_t*)out;
+    ASSERT_EQ(HN4_OP_LITERAL, p[0] & 0xC0); /* First Header */
+    
+    /* We can't easily find the second header without parsing, so verify decode. */
+    
+    uint8_t* check = calloc(1, len);
+    uint32_t clen;
+    ASSERT_EQ(HN4_OK, hn4_decompress_block(out, out_len, check, len, &clen));
+    ASSERT_EQ(len, clen);
+    ASSERT_EQ(0, memcmp(data, check, len));
+
+    free(data); free(out); free(check);
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 54. TCC ISOTOPE 1-BYTE PAYLOAD LIMIT
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the Isotope logic correctly handles the payload byte when the 
+ * destination buffer has exactly enough space for the token but NOT the payload byte.
+ * (Boundary check on `op++ = ip[0]`).
+ */
+hn4_TEST(Compress, _TCC_Isotope_Dest_Buffer_Tight) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    uint8_t data[8] = {0}; /* Isotope candidate */
+    
+    /* 
+     * Isotope (len 8 -> count 4 -> fits in 1 byte header).
+     * Output needs: 1 byte header + 1 byte payload = 2 bytes.
+     * Provide 1 byte buffer.
+     */
+    uint8_t out[1];
+    uint32_t out_len = 0;
+
+    hn4_result_t res = hn4_compress_block(data, 8, out, 1, &out_len, HN4_DEV_SSD, 0);
+    
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 55. TCC GRADIENT DEEP SCAN FALSE START
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that if HDD Deep Scan speculatively accepts a gradient, but then
+ * fails during the verification loop, it correctly resets and emits literals
+ * without corrupting the anchor pointer.
+ */
+hn4_TEST(Compress, _TCC_HDD_DeepScan_Backtrack) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    /* 
+     * Data: 0..15 (Valid Gradient), 16=0xFF (Break).
+     * Deep Scan checks index 0, 16, 31.
+     * Index 0=0. Index 16=0xFF. 
+     * Slope Calc: (0xFF - 0) / 16 = 255/16 != Integer.
+     * Wait, Deep scan slope check logic:
+     * int32_t end_val = p[0] + (31 * slope);
+     * If 16 is 0xFF, the slope calc from p[0]..p[1] (0->1, slope=1) won't match p[16].
+     * So Deep Scan rejects immediately.
+     * 
+     * We need a case where Deep Scan *predicts* success but *fails* linear check.
+     * P[0]=0, P[1]=1 (Slope=1).
+     * P[16]=16 (Match).
+     * P[31]=31 (Match).
+     * P[5]=0xFF (Mismatch).
+     * 
+     * This forces the code to enter the loop `for (int i = 2; i < limit; i++)`.
+     * It fails at i=5. Returns 0.
+     * Caller sees 0, falls through to `ip++`.
+     * Anchor accumulates literals.
+     */
+    uint8_t data[32];
+    for(int i=0; i<32; i++) data[i] = (uint8_t)i;
+    data[5] = 0xFF; /* Corruption in middle */
+
+    void* out = calloc(1, 128);
+    uint32_t len = 0;
+
+    ASSERT_EQ(HN4_OK, hn4_compress_block(data, 32, out, 128, &len, HN4_DEV_HDD, 0));
+
+    /* Verify correctness (Should be Literals) */
+    uint8_t check[32];
+    uint32_t clen;
+    ASSERT_EQ(HN4_OK, hn4_decompress_block(out, len, check, 32, &clen));
+    ASSERT_EQ(0, memcmp(data, check, 32));
+
+    free(out);
+    compress_teardown(dev);
+}
+
+/* =========================================================================
+ * 56. TCC OUTPUT BUFFER WRAPAROUND
+ * ========================================================================= */
+/*
+ * OBJECTIVE:
+ * Verify that the compressor checks for pointer wraparound if `dst + cap` overflows `uintptr_t`.
+ * While rare in user space, this is a critical kernel safety check.
+ * Since we can't easily mock `uintptr_t` wrap on 64-bit, we test the logic via
+ * passing a huge capacity that would logically wrap if added to a high address.
+ * 
+ * Actually, `oend = op + dst_capacity`.
+ * If `dst` is at 0xFFFF... and `cap` is large, `oend` wraps to small.
+ * `p < oend` becomes false immediately.
+ * Writes fail `p + 1 > oend`.
+ * 
+ * We simulate this by passing a buffer pointer at the very end of address space?
+ * Hard to do in portable C unit test.
+ * 
+ * Alternative: Verify `dst_capacity` limits.
+ * Pass a valid buffer but tell compressor `dst_capacity = 0`.
+ * Should fail ENOSPC immediately.
+ */
+hn4_TEST(Compress, _TCC_Zero_Capacity_Fail) {
+    hn4_hal_device_t* dev = compress_setup();
+    
+    uint8_t data[16] = {0};
+    uint8_t out[16];
+    uint32_t len = 0;
+
+    /* Cap = 0 */
+    hn4_result_t res = hn4_compress_block(data, 16, out, 0, &len, HN4_DEV_SSD, 0);
+    
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+
+    compress_teardown(dev);
+}

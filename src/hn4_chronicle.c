@@ -146,11 +146,14 @@ hn4_result_t hn4_chronicle_append(
     hn4_addr_t start = vol->sb.info.journal_start;
     hn4_addr_t head  = vol->sb.info.journal_ptr;
     hn4_addr_t end;
+    uint32_t bs = vol->sb.info.block_size;
+    uint64_t sb_res = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
+    
 #ifdef HN4_USE_128BIT
-    /* Convert bytes to sectors */
-    end = hn4_u128_div_u64(vol->sb.info.total_capacity, ss);
+    hn4_u128_t cap_safe = hn4_u128_sub(vol->sb.info.total_capacity, hn4_u128_from_u64(sb_res));
+    end = hn4_u128_div_u64(cap_safe, ss);
 #else
-    end = vol->sb.info.total_capacity / ss;
+    end = (vol->sb.info.total_capacity - sb_res) / ss;
 #endif
 
     /* 
@@ -460,8 +463,21 @@ hn4_result_t hn4_chronicle_verify_integrity(
     /* 
      * REVERSE VERIFICATION 
      */
-    uint64_t head = hn4_addr_to_u64(vol->sb.info.journal_ptr);
-    uint64_t cursor = (head == start) ? (end - 1) : (head - 1);
+    hn4_addr_t head_addr = vol->sb.info.journal_ptr;
+    hn4_addr_t cursor_addr;
+    
+#ifdef HN4_USE_128BIT
+    if (hn4_u128_cmp(head_addr, start) == 0) {
+        cursor_addr = hn4_u128_sub(end, hn4_u128_from_u64(1));
+    } else {
+        cursor_addr = hn4_u128_sub(head_addr, hn4_u128_from_u64(1));
+    }
+#else
+    uint64_t head_val = head_addr;
+    uint64_t start_val = start;
+    uint64_t end_val = end;
+    cursor_addr = (head_val == start_val) ? (end_val - 1) : (head_val - 1);
+#endif
     
     void* buf = hn4_hal_mem_alloc(ss);
     void* prev_buf = hn4_hal_mem_alloc(ss);
@@ -471,18 +487,31 @@ hn4_result_t hn4_chronicle_verify_integrity(
         return HN4_ERR_NOMEM;
     }
 
-    if (hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_sectors(cursor), buf, 1) != HN4_OK) {
+    /* Use cursor_addr (typed) instead of cursor (u64) */
+    if (hn4_hal_sync_io(dev, HN4_IO_READ, cursor_addr, buf, 1) != HN4_OK) {
         hn4_hal_mem_free(buf); hn4_hal_mem_free(prev_buf);
         return HN4_ERR_HW_IO;
     }
 
-    if (!_is_sector_valid(buf, ss, cursor)) {
-        if (head == start) {
+    /* Pass typed address to validation logic */
+     if (!_is_sector_valid(buf, ss, cursor_addr)) {
+        
+        /* FIX: Handle address comparison based on build mode */
+        bool is_empty_log = false;
+    #ifdef HN4_USE_128BIT
+        if (hn4_u128_cmp(head_addr, start) == 0) is_empty_log = true;
+    #else
+        if (head_addr == start) is_empty_log = true;
+    #endif
+
+        if (is_empty_log) {
             hn4_hal_mem_free(buf); hn4_hal_mem_free(prev_buf);
             return HN4_OK; /* Empty Log */
         } else {
-            /* Use Rate Limited Log */
-            _log_ratelimited(vol, "Chronicle: Corrupt Tip Detected", cursor);
+            /* Use Rate Limited Log (cast to u64 for logging if 128bit) */
+            uint64_t cursor_val = hn4_addr_to_u64(cursor_addr);
+            _log_ratelimited(vol, "Chronicle: Corrupt Tip Detected", cursor_val);
+            
             vol->sb.info.state_flags |= HN4_VOL_PANIC;
             hn4_hal_mem_free(buf); hn4_hal_mem_free(prev_buf);
             return HN4_ERR_TAMPERED;
@@ -509,7 +538,16 @@ hn4_result_t hn4_chronicle_verify_integrity(
     /* Verify backwards */
     hn4_result_t status = HN4_OK;
     uint64_t steps = 0;
-    uint64_t max_steps = (end - start);
+    
+    /* Calculate max steps using 128-bit safe subtraction */
+    uint64_t max_steps;
+#ifdef HN4_USE_128BIT
+    hn4_u128_t diff_128 = hn4_u128_sub(end, start);
+    /* Safe assumption: journal size < 18EB */
+    max_steps = diff_128.lo;
+#else
+    max_steps = (end - start);
+#endif
     
     while (steps < max_steps) {
 
@@ -524,9 +562,22 @@ hn4_result_t hn4_chronicle_verify_integrity(
 
         if (curr_seq == 1) break; /* Genesis reached */
 
-        uint64_t prev_lba = (cursor == start) ? (end - 1) : (cursor - 1);
+        /* Calculate Previous LBA (Typed) */
+        hn4_addr_t prev_lba;
+    #ifdef HN4_USE_128BIT
+        if (hn4_u128_cmp(cursor_addr, start) == 0) {
+            prev_lba = hn4_u128_sub(end, hn4_u128_from_u64(1));
+        } else {
+            prev_lba = hn4_u128_sub(cursor_addr, hn4_u128_from_u64(1));
+        }
+    #else
+        uint64_t c_val = cursor_addr;
+        uint64_t s_val = start;
+        uint64_t e_val = end;
+        prev_lba = (c_val == s_val) ? (e_val - 1) : (c_val - 1);
+    #endif
 
-        if (hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_sectors(prev_lba), prev_buf, 1) != HN4_OK) {
+        if (hn4_hal_sync_io(dev, HN4_IO_READ, prev_lba, prev_buf, 1) != HN4_OK) {
             status = HN4_ERR_HW_IO;
             break;
         }
@@ -543,14 +594,15 @@ hn4_result_t hn4_chronicle_verify_integrity(
 
         /* Verify Hash Link - Only if valid */
         if (_calc_sector_link_crc(prev_buf, ss) != expected_prev_hash) {
-            HN4_LOG_ERR("Chronicle: Hash Mismatch at LBA %llu", prev_lba);
+            uint64_t prev_lba_u64 = hn4_addr_to_u64(prev_lba);
+            HN4_LOG_ERR("Chronicle: Hash Mismatch at LBA %llu", prev_lba_u64);
             status = HN4_ERR_TAMPERED;
             break;
         }
 
         /* Step Back */
         memcpy(buf, prev_buf, ss);
-        cursor = prev_lba;
+        cursor_addr = prev_lba;
         steps++;
     }
 

@@ -2628,3 +2628,4 @@ hn4_TEST(Persistence, Bitmap_QMask_Barrier_Flow) {
     hn4_hal_mem_free(mdev->mmio_base);
     hn4_hal_mem_free(mdev);
 }
+

@@ -408,8 +408,10 @@ static hn4_result_t _execute_cardinal_vote(
 #endif
 
         /* Scan Cardinal Points */
-        for (int i = 0; i < 3; i++) {
-            if (block_indices[i] == HN4_OFFSET_INVALID) continue;
+         for (int i = 0; i < 3; i++) {
+          if (block_indices[i] == HN4_OFFSET_INVALID ||
+            (caps->hw_flags & HN4_HW_ZNS_NATIVE))
+            continue;
 
             hn4_addr_t lba;
             if (_phys_lba_from_block(block_indices[i], current_bs, sector_sz, cap_bytes, &lba) != HN4_OK) continue;
@@ -969,12 +971,16 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     cap_bytes = sb->info.total_capacity;
     hw_cap = caps->total_capacity_bytes;
     
-    if (cap_bytes > hw_cap) return HN4_ERR_GEOMETRY;
-    if (cap_bytes < (2ULL * 1024 * 1024)) return HN4_ERR_GEOMETRY;
+        if (cap_bytes > hw_cap) return HN4_ERR_GEOMETRY;
+        if (cap_bytes < (2ULL * 1024 * 1024)) return HN4_ERR_GEOMETRY;
 #endif
 
     uint32_t bs = sb->info.block_size;
-    if (bs == 0) return HN4_ERR_GEOMETRY;
+
+    if (bs == 0 || bs > (64 * 1024 * 1024)) {
+        HN4_LOG_CRIT("Mount Rejected: Block Size %u exceeds 64MB limit", bs);
+        return HN4_ERR_GEOMETRY;
+    }
 
     /* 
      * The Superblock stores pointers as Sector LBAs (Sector Indices).
@@ -1776,14 +1782,14 @@ hn4_result_t hn4_mount(
     hn4_volume_t* vol = NULL;
     bool force_ro = false;
 
-    if (!dev || !out_vol) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(!dev || !out_vol)) return HN4_ERR_INVALID_ARGUMENT;
 
     /* Spec 10.5: Thermal Awareness */
     uint32_t temp_c = hn4_hal_get_temperature(dev);
-    if (temp_c > 85) {
+    if (HN4_UNLIKELY(temp_c > 85)) {
         HN4_LOG_CRIT("Thermal Critical (%u C). Mount Denied.", temp_c);
         return HN4_ERR_THERMAL_CRITICAL;
-    } else if (temp_c > 75) {
+    } else if (HN4_UNLIKELY(temp_c > 75)) {
         HN4_LOG_WARN("High Temperature (%u C). Forcing Read-Only.", temp_c);
         force_ro = true;
     }
@@ -1800,30 +1806,41 @@ hn4_result_t hn4_mount(
     hn4_hal_spinlock_init(&vol->medic_queue.lock);
 
     if (params && (params->mount_flags & HN4_MNT_READ_ONLY)) force_ro = true;
-    
+ 
+    /* --- PHASE 1: CARDINAL VOTE --- */
 
-  const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
-    if (params && (params->mount_flags & HN4_MNT_WORMHOLE)) {
+    res = _execute_cardinal_vote(dev, !force_ro, &vol->sb);
+    if (HN4_UNLIKELY(res != HN4_OK)) goto cleanup;
+
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+
+     if (params) {
+        vol->sb.info.mount_intent |= params->mount_flags;
+    }
+    
+    bool wormhole_req = (params && (params->mount_flags & HN4_MNT_WORMHOLE));
+    bool wormhole_disk = (vol->sb.info.mount_intent & HN4_MNT_WORMHOLE);
+
+    if (wormhole_req || wormhole_disk) {
         if (!(caps->hw_flags & HN4_HW_STRICT_FLUSH)) {
-            HN4_LOG_CRIT("Mount Denied: Hardware lacks Strict Flush for Wormhole.");
+            HN4_LOG_CRIT("Mount Denied: Hardware lacks Strict Flush for Wormhole (Req:%d Disk:%d).", 
+                         wormhole_req, wormhole_disk);
             res = HN4_ERR_HW_IO;
             goto cleanup;
         }
+        /* Ensure the flag is set in memory for the session */
+        vol->sb.info.mount_intent |= HN4_MNT_WORMHOLE;
     }
 
-    /* --- PHASE 1: CARDINAL VOTE --- */
-    res = _execute_cardinal_vote(dev, !force_ro, &vol->sb);
-    if (res != HN4_OK) goto cleanup;
-
-    
     res = _validate_sb_layout(&vol->sb, caps);
-    if (res != HN4_OK) {
+  
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_CRIT("Mount Rejected: Invalid Geometry/Layout in Superblock");
         goto cleanup;
     }
 
     vol->vol_block_size = vol->sb.info.block_size;
-    if (!_addr_to_u64_checked(vol->sb.info.total_capacity, &vol->vol_capacity_bytes)) {
+    if (HN4_UNLIKELY(!_addr_to_u64_checked(vol->sb.info.total_capacity, &vol->vol_capacity_bytes))) {
         res = HN4_ERR_GEOMETRY;
         goto cleanup;
     }
@@ -1844,7 +1861,7 @@ hn4_result_t hn4_mount(
     
     uint64_t total_blocks = (vol->vol_capacity_bytes + vol->vol_block_size - 1) / vol->vol_block_size;
 
-    if (ring_idx >= total_blocks) {
+    if (HN4_UNLIKELY(ring_idx >= total_blocks)) {
         HN4_LOG_CRIT("Epoch Ring Pointer Out of Bounds (Idx %llu >= Max %llu)", ring_idx, total_blocks);
         res = HN4_ERR_DATA_ROT;
         goto cleanup;
@@ -1950,12 +1967,12 @@ hn4_result_t hn4_mount(
     /* --- PHASE 2: STATE ANALYSIS --- */
     uint32_t st = vol->sb.info.state_flags;
 
-     if (st & HN4_VOL_NEEDS_UPGRADE) {
+    if (HN4_UNLIKELY(st & HN4_VOL_NEEDS_UPGRADE)) {
         HN4_LOG_WARN("Volume marked NEEDS_UPGRADE. Forcing Read-Only to prevent structure corruption.");
         force_ro = true;
     }
 
-    if (st & HN4_VOL_DEGRADED) {
+    if (HN4_UNLIKELY(st & HN4_VOL_DEGRADED)) {
         HN4_LOG_WARN("Mounting DEGRADED volume. Redundancy is compromised.");
         /* We continue, but operations are at risk */
     }
@@ -1985,14 +2002,14 @@ hn4_result_t hn4_mount(
 
    /* ----- HARD FAIL CHECKS (not part of state_flags) ----- */
 
-    if ((vol->sb.info.incompat_flags & ~HN4_SUPPORTED_INCOMPAT_MASK) != 0) {
+    if (HN4_UNLIKELY((vol->sb.info.incompat_flags & ~HN4_SUPPORTED_INCOMPAT_MASK) != 0)) {
         HN4_LOG_CRIT("Mount Denied: Unsupported Incompatible Features (0x%llx)",
                  (unsigned long long)(vol->sb.info.incompat_flags & ~HN4_SUPPORTED_INCOMPAT_MASK));
                  res = HN4_ERR_VERSION_INCOMPAT;
                  goto cleanup;
                 }
 
-    if (!(st & HN4_VOL_METADATA_ZEROED)) {
+    if (HN4_UNLIKELY(!(st & HN4_VOL_METADATA_ZEROED))) {
         HN4_LOG_CRIT("Mount Denied: Metadata not certified zeroed.");
         res = HN4_ERR_UNINITIALIZED;
         goto cleanup;
@@ -2053,12 +2070,12 @@ hn4_result_t hn4_mount(
 
     /* --- PHASE 5: RESOURCE LOADING --- */
     res = _load_cortex_resources(dev, vol);
-    if (res != HN4_OK) {
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_WARN("Cortex Load Failed. Continuing degraded.");
     }
 
     res = _load_bitmap_resources(dev, vol);
-    if (res != HN4_OK) {
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         if (!force_ro) {
             HN4_LOG_CRIT("Bitmap Load Failed in RW. Abort.");
             goto cleanup;
@@ -2072,6 +2089,21 @@ hn4_result_t hn4_mount(
     }
 
     res = _load_qmask_resources(dev, vol);
+
+    if (vol->sb.info.format_profile != HN4_PROFILE_PICO) {
+        uint64_t total_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+        uint64_t l2_bits = (total_blocks + 511) / 512;
+        size_t l2_bytes = HN4_ALIGN_UP(l2_bits, 8) / 8;
+        
+        vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(l2_bytes);
+        if (vol->locking.l2_summary_bitmap) {
+            memset(vol->locking.l2_summary_bitmap, 0, l2_bytes);
+            /* Note: Bitmap is lazily populated by allocators */
+        } else {
+            HN4_LOG_WARN("L2 Bitmap Alloc Failed. Allocator performance degraded.");
+        }
+    }
+
     if (res != HN4_OK) {
         if (!force_ro) {
             HN4_LOG_CRIT("Q-Mask Load Failed in RW. Abort.");
@@ -2098,7 +2130,7 @@ hn4_result_t hn4_mount(
      * PHASE 6: L10 RECOVERY (ZERO-SCAN RECONSTRUCTION)
      * Rebuild allocation truth from the Cortex Anchors.
      */
-   if (vol->sb.info.state_flags & (HN4_VOL_DIRTY | HN4_VOL_PANIC | HN4_VOL_DEGRADED)) {
+    if (HN4_UNLIKELY(vol->sb.info.state_flags & (HN4_VOL_DIRTY | HN4_VOL_PANIC | HN4_VOL_DEGRADED))) {
         HN4_LOG_WARN("Volume Unclean. Initiating Zero-Scan Reconstruction...");
         res = _reconstruct_cortex_state(dev, vol);
         
@@ -2114,7 +2146,7 @@ hn4_result_t hn4_mount(
     }
 
     res = _verify_and_heal_root_anchor(dev, vol, force_ro);
-    if (res != HN4_OK) {
+    if (HN4_UNLIKELY(res != HN4_OK)) {
         if (!force_ro) {
             HN4_LOG_CRIT("Root Anchor invalid in RW mode. Aborting mount.");
             goto cleanup;

@@ -295,13 +295,9 @@ typedef struct {
 void* hn4_hal_mem_alloc(size_t size)
 {
     _assert_hal_init();
-    
     if (size == 0) return NULL;
 
-    /* 
-     * 1. Overflow Protection 
-     * Ensure size + overhead does not wrap around size_t.
-     */
+    /* Check for integer overflow before calculation */
     size_t overhead = HN4_HAL_ALIGNMENT + sizeof(alloc_header_t);
     if (size > (SIZE_MAX - overhead)) {
         hn4_hal_panic("HAL: Allocator Integer Overflow Detected");
@@ -309,55 +305,30 @@ void* hn4_hal_mem_alloc(size_t size)
     }
 
     size_t total = size + overhead;
-    
-    /* 2. Raw Allocation */
-    void* raw = malloc(total);
+    void*  raw   = malloc(total);
     if (!raw) return NULL;
 
-    /* 
-     * 3. Alignment Calculation (FIXED)
-     * We must ensure that the 'ptr' we return starts AT LEAST
-     * sizeof(header) bytes after 'raw'.
-     */
-    uintptr_t raw_addr = (uintptr_t)raw;
-    
-    /* Calculate the earliest memory address where the Payload can start */
-    uintptr_t min_payload_addr = raw_addr + sizeof(alloc_header_t);
-
-    /* Align that address UP to the next HN4_HAL_ALIGNMENT boundary */
-    uintptr_t aligned_addr = (min_payload_addr + (HN4_HAL_ALIGNMENT - 1))
+    /* Calculate aligned address */
+    uintptr_t raw_addr     = (uintptr_t)raw;
+    uintptr_t aligned_addr = (raw_addr + sizeof(alloc_header_t) + (HN4_HAL_ALIGNMENT - 1))
                              & ~((uintptr_t)HN4_HAL_ALIGNMENT - 1);
 
     void* ptr = (void*)aligned_addr;
 
-    /* 
-     * 4. Header Placement
-     * Store header immediately preceding the aligned payload pointer.
-     */
+    /* Store header immediately preceding the aligned pointer */
     alloc_header_t* h = (alloc_header_t*)((uint8_t*)ptr - sizeof(alloc_header_t));
 
-    /* 
-     * 5. Critical Safety Check
-     * Verify that our header placement didn't underflow before the start of 'raw'.
-     * This protects against heap corruption of the previous block.
-     */
-    if ((void*)h < raw) {
-        free(raw);
-        hn4_hal_panic("HAL: Allocator Math Logic Error (Heap Underflow)");
-        return NULL;
-    }
+    /* Verify our math didn't corrupt the heap or overlap */
+    if ((void*)h < raw) hn4_hal_panic("Allocator Math Underflow");
 
-    /* 6. Initialize Header */
     h->magic   = HN4_MEM_MAGIC;
-    h->raw_ptr = raw; /* Save original pointer for free() */
+    h->raw_ptr = raw;
     h->_pad32  = 0;
 
-    /* 7. Secure Zeroing */
+    /* Safety: Zero memory */
     memset(ptr, 0, size);
-    
     return ptr;
 }
-
 
 void hn4_hal_mem_free(void* ptr)
 {

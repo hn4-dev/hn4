@@ -160,7 +160,7 @@ static bool _imp_safe_add_signed(int64_t base, int64_t offset, int64_t* res) {
  * ========================================================================= */
 
 #define HN4_MAX_PATH        256
-#define HN4_INLINE_NAME_MAX 28
+#define HN4_INLINE_NAME_MAX 24
 #define HN4_FLAG_IS_DIRECTORY  (1ULL << 63)
 #define HN4_EXT_TYPE_TETHER     0x03 
 
@@ -631,7 +631,6 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
      * CRITICAL: SYNC FROM SOURCE OF TRUTH
      * Reload the anchor from the Nano-Cortex (RAM Cache) to ensure we have
      * the latest Write Generation and Mass before we attempt any IO.
-     * This mitigates "Split-Brain" where a local handle writes with a stale generation.
      */
     if (vol->nano_cortex) {
         hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
@@ -702,7 +701,7 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
          * If we are writing a partial block, we must fetch the existing data.
          */
         if (rmw_needed) {
-            hn4_result_t r = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs);
+            hn4_result_t r = hn4_read_block_atomic(vol, &fh->cached_anchor, b_idx, io, bs, fh->session_perms);
             
             /* 
              * Sparse/Not Found is acceptable for RMW (treat as zeros).
@@ -715,28 +714,31 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         }
 
         /* B. OVERLAY NEW DATA */
-        /* Note: io buffer contains the BLOCK HEADER at start, but hn4_read_block_atomic
-           returns the PAYLOAD in the buffer. However, hn4_write_block_atomic expects
-           payload data to be passed in. We construct the payload in `io` then pass it. */
-           
-        /* 
-         * CORRECTION: `hn4_read_block_atomic` outputs payload.
-         * We update the payload part of the buffer.
-         */
+        /* hn4_read_block_atomic outputs payload directly into io. We update it here. */
         memcpy((uint8_t*)io + b_off, ptr, chunk);
 
         /* 
          * C. ATOMIC WRITE (THE SHADOW HOP)
+         * FIX: We must pass a pointer to the GLOBAL anchor (or as close as possible)
+         * to ensure the CAS loop inside hn4_write_block_atomic operates on the
+         * Source of Truth, not a thread-local copy.
          */
         uint32_t valid_len = payload;
         
         /* If this is the last block logical index, determine valid byte count */
-        /* Note: b_off + chunk is the valid end offset within this block buffer */
         if (fh->current_offset + chunk > hn4_le64_to_cpu(fh->cached_anchor.mass)) {
              valid_len = b_off + chunk;
         }
 
-        hn4_result_t w = hn4_write_block_atomic(vol, &fh->cached_anchor, b_idx, io, valid_len);
+        hn4_anchor_t* target_anchor = &fh->cached_anchor; /* Default to local */
+        
+        /* If Cortex exists, point directly to global memory to enable CAS concurrency */
+        if (vol->nano_cortex && fh->anchor_idx < (vol->cortex_size / sizeof(hn4_anchor_t))) {
+            target_anchor = &((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+        }
+
+        /* Execute Atomic Write */
+        hn4_result_t w = hn4_write_block_atomic(vol, target_anchor, b_idx, io, valid_len, fh->session_perms);
         
         if (w != HN4_OK) {
             ret_code = _map_err(w);
@@ -744,26 +746,21 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         }
 
         /* 
-         * D. SYNC TO GLOBAL STATE (Critical for Atomicity)
-         * We must publish the updated Anchor (New Generation, New Mass)
-         * to the Nano-Cortex immediately, or other handles will see stale metadata.
+         * D. SYNC LOCAL HANDLE
+         * The global anchor has been updated by hn4_write_block_atomic (Generation/Mass).
+         * We must refresh our local handle cache to stay consistent.
          */
-        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-        _imp_memory_barrier();
-        
+        if (vol->nano_cortex) {
+            /* 
+             * Relaxed load is fine here because we just performed a successful write, 
+             * implying we observed the latest state during the CAS loop.
+             */
+            fh->cached_anchor = *target_anchor;
+        } 
         /* 
-         * Optimistic update: We assume we own the sequence. 
-         * In a strictly POSIX compliant system, we would need a file-level mutex.
-         * Here, we broadcast the result of our atomic hop.
+         * Note: If no Cortex (Direct-IO mode), target_anchor was already &fh->cached_anchor,
+         * so it was updated in-place by the write function.
          */
-        if (fh->anchor_idx < (vol->cortex_size / sizeof(hn4_anchor_t))) {
-            ((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx] = fh->cached_anchor;
-            
-            /* CPU Cache Flush hint if platform requires manual coherence for DMA */
-            // _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx], sizeof(hn4_anchor_t));
-        }
-        
-        hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
         /* E. Advance Cursors */
         ptr += chunk;
@@ -771,15 +768,6 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         rem -= chunk;
         total_written += chunk;
         fh->dirty = true; /* Mark handle dirty for close() logic */
-
-        /* 
-         * Update Mass locally if we extended the file.
-         * (hn4_write_block_atomic handles this too, but we keep handle logic consistent)
-         */
-        uint64_t mass = hn4_le64_to_cpu(fh->cached_anchor.mass);
-        if (fh->current_offset > mass) {
-            fh->cached_anchor.mass = hn4_cpu_to_le64(fh->current_offset);
-        }
     }
 
 cleanup:

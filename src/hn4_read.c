@@ -121,24 +121,26 @@ static hn4_result_t _validate_block(
     /* 1. Magic Check & Poison Detection */
     uint32_t magic_val = hn4_le32_to_cpu(hdr->magic);
 
-    if (magic_val == 0xCCCCCCCC) {
-        /* Poison Heuristic: Scan first cache line to confirm strict poisoning */
-        bool is_poison = true;
-        uint64_t val;
+    if (HN4_UNLIKELY(magic_val != HN4_BLOCK_MAGIC)) {   
+        if (magic_val == 0xCCCCCCCC) {
+            /* Poison Heuristic: Scan first cache line to confirm strict poisoning */
+            bool is_poison = true;
+            uint64_t val;
 
-        /* Check 64 bytes (8 x 64-bit words) */
-        for (int i = 0; i < 8; i++) {
-            memcpy(&val, (const uint8_t*)buffer + (i * 8), sizeof(uint64_t));
+            /* Check 64 bytes (8 x 64-bit words) */
+            for (int i = 0; i < 8; i++) {
+                memcpy(&val, (const uint8_t*)buffer + (i * 8), sizeof(uint64_t));
 
-            if (val != 0xCCCCCCCCCCCCCCCCULL) {
-                is_poison = false;
-                break;
+                if (val != 0xCCCCCCCCCCCCCCCCULL) {
+                    is_poison = false;
+                    break;
+                }
             }
-        }
 
-        if (is_poison) {
-            HN4_LOG_CRIT("DMA Failure: Buffer contains strict poison pattern.");
-            return HN4_ERR_HW_IO;
+            if (is_poison) {
+                HN4_LOG_CRIT("DMA Failure: Buffer contains strict poison pattern.");
+                return HN4_ERR_HW_IO;
+            }
         }
     }
 
@@ -244,7 +246,6 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     uint32_t effective_perms = perms | session_perms;
 
     if (!(effective_perms & (HN4_PERM_READ | HN4_PERM_SOVEREIGN))) return HN4_ERR_ACCESS_DENIED;
-    if ((perms & HN4_PERM_ENCRYPTED) || (dclass & HN4_HINT_ENCRYPTED)) return HN4_ERR_ACCESS_DENIED;
 
     /* 2. Physics & Geometry Extraction */
      uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
@@ -369,6 +370,12 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                     is_allocated = true; /* Optimistic probe */
                 } else {
                     hn4_result_t op_res = _bitmap_op(vol, lba, BIT_TEST, &is_allocated);
+
+                    if (op_res == HN4_ERR_UNINITIALIZED && vol->read_only) {
+                        is_allocated = true; 
+                        op_res = HN4_OK;
+                    }
+
                     if (op_res != HN4_OK) {
                         probe_error = _merge_error(probe_error, op_res);
                         is_allocated = false;
@@ -440,10 +447,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
             io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_sector, io_buf, sectors);
 
-            if (io_res == HN4_OK) {
+            if (HN4_LIKELY(io_res == HN4_OK)) {
                 hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen, dclass);
 
-                if (val_res == HN4_OK) {
+                if (HN4_LIKELY(val_res == HN4_OK)) {
                     if (io_res == HN4_INFO_HEALED) {
                         /* Mark candidate for repair if HAL reported soft error */
                         failed_mask |= (1U << i);

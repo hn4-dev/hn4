@@ -359,16 +359,18 @@ static hn4_result_t _ns_get_or_compare_name(
         }
         name_scratch[i] = '\0';
     } else {
-        /* Extended path: Follow linked list */
+
         uint64_t ext_lba = 0;
+
         memcpy(&ext_lba, anchor->inline_buffer, 8);
+
         ext_lba = hn4_le64_to_cpu(ext_lba);
 
         const char* frag = (const char*)(anchor->inline_buffer + 8);
+
         size_t i = 0;
-        
-        /* Copy initial fragment from anchor */
-        for (; i < 20 && frag[i] != '\0'; i++) {
+
+        for (; i < 16 && frag[i] != '\0'; i++) {
             name_scratch[i] = frag[i];
         }
         size_t current_len = i;
