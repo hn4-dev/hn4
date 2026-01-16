@@ -4074,18 +4074,21 @@ hn4_TEST(L10_Reconstruction, Ghost_Repair) {
     root->seed_id.hi = 0xFFFFFFFFFFFFFFFFULL;
     root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
     root->orbit_vector[0] = 1;
+    root->write_gen = hn4_cpu_to_le32(1); /* Explicit Gen */
     root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, offsetof(hn4_anchor_t, checksum)));
 
     /* Anchor 1: The Ghost File */
     hn4_anchor_t* ghost = (hn4_anchor_t*)(ctx_buf + sizeof(hn4_anchor_t));
-    /* Set ID clearly */
     hn4_u128_t ghost_id = { .lo = 0xAAA, .hi = 0xBBB };
-    ghost->seed_id = ghost_id; // Raw copy (assuming test runs on LE host)
+    ghost->seed_id = ghost_id; 
     
     ghost->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
-    ghost->gravity_center = hn4_cpu_to_le64(100); /* Relative to Flux */
-    ghost->mass = hn4_cpu_to_le64(bs); /* 1 Block */
-    ghost->orbit_vector[0] = 1; /* Sequential */
+    ghost->gravity_center = hn4_cpu_to_le64(100); 
+    ghost->mass = hn4_cpu_to_le64(bs); 
+    ghost->orbit_vector[0] = 1; 
+    ghost->write_gen = hn4_cpu_to_le32(5); 
+    
+    /* Calculate Anchor Checksum LAST */
     ghost->checksum = hn4_cpu_to_le32(hn4_crc32(0, ghost, offsetof(hn4_anchor_t, checksum)));
 
     /* Write Cortex */
@@ -4097,43 +4100,48 @@ hn4_TEST(L10_Reconstruction, Ghost_Repair) {
     hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
     
     /* 
-     * FIX: Write Valid Data Block to Disk.
-     * The Deep Scan logic reads the block to verify well_id matches anchor.
+     * 3. Write Valid Data Block to Disk.
+     * Must pass Identity, Causality (Gen), and Integrity (CRC) checks.
      */
-    memset(zeros, 0, bs);
+    memset(zeros, 0, bs); /* Use zeros buffer for block data */
     hn4_block_header_t* blk = (hn4_block_header_t*)zeros;
     
-    /* Populate Header to pass validation */
     blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    blk->well_id = hn4_cpu_to_le128(ghost_id); /* Must match Anchor */
-    blk->seq_index = hn4_cpu_to_le64(0);       /* N=0 */
+    blk->well_id = hn4_cpu_to_le128(ghost_id); 
+    blk->seq_index = hn4_cpu_to_le64(0);       
+    blk->generation = hn4_cpu_to_le64(5);  
     
-    /* CRC Calculation (Optional if reconstruct only checks ID, but good for completeness) */
-    uint32_t hcrc = hn4_crc32(0, blk, offsetof(hn4_block_header_t, header_crc));
+    uint32_t payload_len = HN4_BLOCK_PayloadSize(bs);
+    uint32_t d_crc = hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, payload_len);
+    blk->data_crc = hn4_cpu_to_le32(d_crc);
+
+    uint32_t hcrc = hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc));
     blk->header_crc = hn4_cpu_to_le32(hcrc);
 
-    /* Calculate Absolute LBA: FluxStart + 100 */
+    /* Write to FluxStart + 100 */
     uint64_t target_blk_idx = flux_start_blk + 100;
     uint64_t target_lba = target_blk_idx * (bs / ss);
     
     hn4_hal_sync_io(dev, HN4_IO_WRITE, target_lba, zeros, bs/512);
     free(zeros);
 
-    /* 3. Mount */
+    /* 4. Mount (Triggers Zero-Scan Reconstruction) */
     hn4_volume_t* vol = NULL;
     hn4_mount_params_t p = {0};
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
-    /* 4. Verify Repair */
+    /* 5. Verify Repair */
     uint64_t word_idx = target_blk_idx / 64;
     uint64_t bit_idx  = target_blk_idx % 64;
 
     ASSERT_TRUE(vol->void_bitmap != NULL);
     uint64_t word = vol->void_bitmap[word_idx].data;
     
-    /* Assert Bit was resurrected */
+    /* Assert Bit was resurrected (Data proved valid, bitmap updated) */
     if (!(word & (1ULL << bit_idx))) {
-        ASSERT_TRUE(0); // Fail
+        /* Fail with context */
+        printf("Bitmap word: %llx, expected bit %llu set\n", word, bit_idx);
+        ASSERT_TRUE(0); 
     }
     
     /* Assert Taint increased (Repair occurred) */
@@ -4143,13 +4151,8 @@ hn4_TEST(L10_Reconstruction, Ghost_Repair) {
     destroy_fixture(dev);
 }
 
-
 /* 
  * Test 201: Leak Tolerance
- * Scenario: Bitmap has bit set in Flux region. No Anchor claims it.
- * Fixes:
- *   1. Calculates correct absolute bit (FluxStart + 200).
- *   2. Ensures Root Anchor exists so mount succeeds cleanly.
  */
 hn4_TEST(L10_Reconstruction, Leak_Ignored) {
     hn4_hal_device_t* dev = create_fixture_formatted();
@@ -8277,5 +8280,491 @@ hn4_TEST(Integrity, Partial_Poison_Is_Corruption) {
     
     ASSERT_EQ(HN4_ERR_BAD_SUPERBLOCK, hn4_mount(dev, &p, &vol));
 
+    destroy_fixture(dev);
+}
+
+
+/* 
+ * Test 8002: L10 - Reconstruction with Corrupt Data Block
+ * Scenario: Anchor exists. Bitmap empty (needs reconstruction).
+ *           Block 0 exists but has CRC error (Payload Rot).
+ * Logic: _reconstruct_cortex_state reads the block to verify ownership.
+ *        If block read fails (CRC error), it should NOT claim the block.
+ * Expected: Bitmap bit remains 0. Ghost not resurrected.
+ */
+hn4_TEST(L10_Reconstruction, Corrupt_Block_Ignored) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Setup Ghost Anchor */
+    uint8_t* ctx_buf = calloc(1, bs);
+    
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    /* Basic valid root */
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+
+    hn4_anchor_t* ghost = (hn4_anchor_t*)(ctx_buf + sizeof(hn4_anchor_t));
+    ghost->seed_id.lo = 0xAA; 
+    ghost->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    ghost->gravity_center = hn4_cpu_to_le64(100);
+    ghost->mass = hn4_cpu_to_le64(bs);
+    ghost->orbit_vector[0] = 1;
+    ghost->checksum = hn4_cpu_to_le32(hn4_crc32(0, ghost, sizeof(hn4_anchor_t)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Write Corrupt Block (Valid Header, Bad Payload) */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(ghost->seed_id);
+    /* Calculate CRC */
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(0, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    
+    /* CORRUPT PAYLOAD after CRC */
+    blk->payload[0] ^= 0xFF;
+    
+    /* Header CRC is valid, so `_verify_block` passes header check but fails payload check */
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(0, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, (flux_start_blk + 100) * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Ignored */
+    uint64_t target = flux_start_blk + 100;
+    uint64_t word = vol->void_bitmap[target/64].data;
+    ASSERT_FALSE(word & (1ULL << (target%64)));
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
+/* 
+ * Test 8001: L10 - Phantom Detection (Generation Mismatch - Past)
+ * Scenario: Anchor Gen = 100. Block Gen = 99 (Stale/Old).
+ * Logic: The block matches ID and Sequence, but is from an older timeline.
+ *        It must be rejected (Phantom), leaving the bitmap bit 0 (Hole).
+ * Expected: Mount OK. Bitmap bit is 0.
+ */
+hn4_TEST(L10_Reconstruction, Phantom_GenMismatch_Past) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Setup Anchor (Gen 100) */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf; // Slot 0
+    /* Minimal valid root */
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->write_gen = hn4_cpu_to_le32(100); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Write Stale Block (Gen 99) */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root->seed_id);
+    blk->seq_index = 0;
+    blk->generation = hn4_cpu_to_le64(99); /* Stale! */
+    
+    /* Valid CRC for the stale data */
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    /* Write to predicted LBA (Flux+0) */
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, flux_start_blk * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Ignored (Phantom) */
+    /* Bit 0 should be 0 (Not resurrected) */
+    ASSERT_FALSE(vol->void_bitmap[0].data & 1);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 8002: L10 - Phantom Detection (Generation Mismatch - Future)
+ * Scenario: Anchor Gen = 100. Block Gen = 101.
+ * Logic: The block claims to be from the future. This implies a torn 
+ *        transaction where the Anchor update failed but Data write succeeded.
+ *        We must revert to the Anchor's truth.
+ * Expected: Mount OK. Bitmap bit is 0.
+ */
+hn4_TEST(L10_Reconstruction, Phantom_GenMismatch_Future) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Anchor Gen 100 */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->write_gen = hn4_cpu_to_le32(100); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Block Gen 101 */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root->seed_id);
+    blk->seq_index = 0;
+    blk->generation = hn4_cpu_to_le64(101); /* Future! */
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, flux_start_blk * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Ignored */
+    ASSERT_FALSE(vol->void_bitmap[0].data & 1);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 8003: L10 - Phantom Detection (Payload Integrity Rot)
+ * Scenario: Anchor Gen = 100. Block Gen = 100.
+ *           However, Payload CRC check FAILS.
+ * Logic: Identity and Time match, but Data is corrupt.
+ *        We must NOT resurrect corrupt data. Treat as hole.
+ * Expected: Mount OK. Bitmap bit is 0.
+ */
+hn4_TEST(L10_Reconstruction, Phantom_CRC_Rot) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Anchor Gen 100 */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->write_gen = hn4_cpu_to_le32(100); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Block Gen 100, but Corrupt Payload */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root->seed_id);
+    blk->seq_index = 0;
+    blk->generation = hn4_cpu_to_le64(100);
+    
+    /* Calc Valid CRC */
+    uint32_t valid_crc = hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs));
+    blk->data_crc = hn4_cpu_to_le32(valid_crc);
+    
+    /* CORRUPT IT */
+    blk->payload[0] ^= 0xFF; 
+    
+    /* Header CRC matches the corrupted state? No, Header CRC covers header only.
+       The header itself is valid, but it claims the payload has CRC X.
+       The payload has CRC Y. */
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, flux_start_blk * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Ignored (Rot) */
+    ASSERT_FALSE(vol->void_bitmap[0].data & 1);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 8004: L10 - 64-bit Generation Hazard
+ * Scenario: Anchor Gen = 5 (32-bit). Block Gen = 0x100000005 (High bit set).
+ * Logic: The lower 32 bits match (5 == 5), but the high bits are non-zero.
+ *        The driver MUST check `disk_gen_hi == 0` to prevent aliasing.
+ * Expected: Mount OK. Block ignored.
+ */
+hn4_TEST(L10_Reconstruction, 64Bit_Gen_Hazard) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Anchor Gen 5 */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->write_gen = hn4_cpu_to_le32(5); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Block Gen 0x100000005 (High bit set) */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root->seed_id);
+    blk->seq_index = 0;
+    
+    uint64_t hazard_gen = 5 | (1ULL << 32);
+    blk->generation = hn4_cpu_to_le64(hazard_gen);
+    
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, flux_start_blk * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Ignored (High bit checked) */
+    ASSERT_FALSE(vol->void_bitmap[0].data & 1);
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 8005: L10 - Mixed State (One Valid, One Phantom)
+ * Scenario: Two blocks for same file. 
+ *           Block 0: Valid (Matches Gen).
+ *           Block 1: Phantom (Gen Mismatch).
+ * Logic: Reconstruction should set Bit 0, but leave Bit 1 clear.
+ * Expected: Bitmap = 0...01 (Binary).
+ */
+hn4_TEST(L10_Reconstruction, Mixed_Valid_And_Phantom) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Mark DIRTY to trigger reconstruction logic */
+    sb.info.state_flags = HN4_VOL_DIRTY | HN4_VOL_METADATA_ZEROED;
+    sb.raw.sb_crc = 0;
+    sb.raw.sb_crc = hn4_cpu_to_le32(hn4_crc32(0, &sb, HN4_SB_SIZE - 4));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+    
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Anchor Gen 50 */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->gravity_center = 0; 
+    root->mass = hn4_cpu_to_le64(bs * 2); /* 2 blocks */
+    root->write_gen = hn4_cpu_to_le32(50); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    
+    hn4_u128_t root_id = root->seed_id;
+    free(ctx_buf);
+
+    /* 2. Block 0: Valid (Gen 50) */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root_id); /* Use captured ID */
+    blk->seq_index = hn4_cpu_to_le64(0);
+    blk->generation = hn4_cpu_to_le64(50);
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, (flux_start_blk + 0) * (bs/512), blk_buf, bs/512);
+
+    /* 3. Block 1: Phantom (Gen 49) */
+    blk->seq_index = hn4_cpu_to_le64(1);
+    blk->generation = hn4_cpu_to_le64(49); /* Mismatch */
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, (flux_start_blk + 1) * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 4. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 5. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 6. Verify */
+    uint64_t target_0 = flux_start_blk + 0;
+    uint64_t target_1 = flux_start_blk + 1;
+
+    uint64_t word0 = vol->void_bitmap[target_0 / 64].data;
+    uint64_t word1 = vol->void_bitmap[target_1 / 64].data;
+
+    /* Check Bit 0 (Resurrected) */
+    if (!(word0 & (1ULL << (target_0 % 64)))) {
+        printf("FAIL: Block 0 not resurrected.\n");
+        ASSERT_TRUE(0);
+    }
+
+    /* Check Bit 1 (Phantom/Ignored) */
+    if (word1 & (1ULL << (target_1 % 64))) {
+        printf("FAIL: Phantom Block 1 incorrectly resurrected.\n");
+        ASSERT_TRUE(0);
+    }
+
+    if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
+/* 
+ * Test 8006: L10 - Zero Gen Consistency
+ * Scenario: Anchor Gen = 0. Block Gen = 0.
+ * Logic: Ensure that a generation of 0 (valid for fresh files) is handled correctly
+ *        and not rejected as "uninitialized".
+ * Expected: Mount OK. Block Resurrected.
+ */
+hn4_TEST(L10_Reconstruction, Zero_Gen_Consistency) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Mark DIRTY */
+    sb.info.state_flags = HN4_VOL_DIRTY | HN4_VOL_METADATA_ZEROED;
+    sb.raw.sb_crc = 0;
+    sb.raw.sb_crc = hn4_cpu_to_le32(hn4_crc32(0, &sb, HN4_SB_SIZE - 4));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, 0, &sb, HN4_SB_SIZE/512);
+
+    uint32_t bs = sb.info.block_size;
+    uint64_t flux_start_blk = sb.info.lba_flux_start / (bs / 512);
+
+    /* 1. Anchor Gen 0 */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* root = (hn4_anchor_t*)ctx_buf;
+    root->seed_id.lo = ~0ULL; root->seed_id.hi = ~0ULL;
+    root->data_class = hn4_cpu_to_le64(HN4_VOL_STATIC | HN4_FLAG_VALID);
+    root->orbit_vector[0] = 1;
+    root->gravity_center = 0;
+    root->mass = hn4_cpu_to_le64(bs); 
+    root->write_gen = hn4_cpu_to_le32(0); 
+    root->checksum = hn4_cpu_to_le32(hn4_crc32(0, root, sizeof(hn4_anchor_t)));
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    
+    hn4_u128_t root_id = root->seed_id;
+    free(ctx_buf);
+
+    /* 2. Block Gen 0 */
+    uint8_t* blk_buf = calloc(1, bs);
+    hn4_block_header_t* blk = (hn4_block_header_t*)blk_buf;
+    blk->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    blk->well_id = hn4_cpu_to_le128(root_id);
+    blk->seq_index = 0;
+    blk->generation = hn4_cpu_to_le64(0);
+    blk->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, blk->payload, HN4_BLOCK_PayloadSize(bs)));
+    blk->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, blk, offsetof(hn4_block_header_t, header_crc)));
+    
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, flux_start_blk * (bs/512), blk_buf, bs/512);
+    free(blk_buf);
+
+    /* 3. Wipe Bitmap */
+    uint8_t* zeros = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_bitmap_start, zeros, bs/512);
+    free(zeros);
+
+    /* 4. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 5. Verify Resurrected */
+    uint64_t target = flux_start_blk + 0;
+    uint64_t word = vol->void_bitmap[target / 64].data;
+    
+    if (!(word & (1ULL << (target % 64)))) {
+        printf("FAIL: Zero Gen block not resurrected.\n");
+        ASSERT_TRUE(0);
+    }
+
+    if(vol) hn4_unmount(vol);
     destroy_fixture(dev);
 }

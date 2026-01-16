@@ -222,13 +222,12 @@ static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev,
 
 static hn4_result_t _sanitize_generic(hn4_hal_device_t* dev, hn4_size_t capacity_bytes, uint32_t bs) {
 #ifdef HN4_USE_128BIT
-    /* Check alignment via division remainder simulation or assumption */
-    /* Since we don't have a full u128%u32 helper here easily, and capacity usually block aligned */
-    /* We skip alignment check relying on caller, OR implement using div helper */
-    /* Simplified: If low bits don't match mask */
-    if ((capacity_bytes.lo & (bs - 1)) != 0) {
-         /* Naive align down for power-of-2 bs */
-         capacity_bytes.lo &= ~((uint64_t)bs - 1);
+    hn4_u128_t q = hn4_u128_div_u64(capacity_bytes, bs);
+    hn4_u128_t aligned = hn4_u128_mul_u64(q, bs);
+    
+    /* If reconstruction doesn't match original, it was misaligned. Use aligned value. */
+    if (aligned.lo != capacity_bytes.lo || aligned.hi != capacity_bytes.hi) {
+        capacity_bytes = aligned;
     }
 #else
     if (capacity_bytes % bs != 0) {
@@ -775,10 +774,15 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     }
 
     uint64_t chron_end_offset = HN4_ALIGN_DOWN(capacity_bytes - tail_rsv, bs);
-    
+        
     if (chron_end_offset < chronicle_sz) return HN4_ERR_GEOMETRY;
 
     uint64_t chron_start_offset = chron_end_offset - chronicle_sz;
+
+    if (chron_start_offset < offset) {
+        HN4_LOG_ERR("Drive too small. Metadata overlaps Chronicle.");
+        return HN4_ERR_ENOSPC;
+    }
 
     /* Initialize Superblock Chronicle Pointers */
     /* Note: We divide by 'ss' (Sector Size) because these are LBA fields */

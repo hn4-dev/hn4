@@ -430,39 +430,40 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     
     uint64_t used = atomic_load_explicit(&vol->alloc.used_blocks, memory_order_acquire);
     uint64_t cap_blocks;
-
-#ifdef HN4_USE_128BIT
-    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
-    
-    /* We can safely divide by block_size (u32/u64) */
-    hn4_u128_t blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
-    
-    /* 
-     * Even 1000 Exabytes in 4KB blocks fits in uint64_t.
-     * (1e21 bytes / 4096 = 2.4e17 blocks. UINT64_MAX = 1.8e19).
-     * Safe to downcast result.
-     */
-    cap_blocks = blocks_128.lo; 
-#else
-    cap_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
-#endif
-    if (cap_blocks == 0) return true;
-
-    /* Calculate Absolute Thresholds */
     uint64_t limit_genesis; // 90%
     uint64_t limit_update;  // 95%
     uint64_t limit_recover; // 85%
 
+#ifdef HN4_USE_128BIT
+    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
+    hn4_u128_t blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
+    
+    hn4_u128_t lim_gen_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_GENESIS), 100);
+    hn4_u128_t lim_upd_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_UPDATE), 100);
+    hn4_u128_t lim_rec_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, (HN4_SATURATION_GENESIS - 5)), 100);
+
+    /* 
+     * Comparison logic: Used blocks (u64) vs Limit (u128). 
+     * If limit > u64 max, we are definitely not saturated by a u64 counter.
+     */
+    if (lim_gen_128.hi > 0) limit_genesis = UINT64_MAX; else limit_genesis = lim_gen_128.lo;
+    if (lim_upd_128.hi > 0) limit_update  = UINT64_MAX; else limit_update  = lim_upd_128.lo;
+    if (lim_rec_128.hi > 0) limit_recover = UINT64_MAX; else limit_recover = lim_rec_128.lo;
+
+#else
+    cap_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+    if (cap_blocks == 0) return true;
+    
     if (cap_blocks <= (UINT64_MAX / HN4_SATURATION_UPDATE)) {
         limit_genesis = (cap_blocks * HN4_SATURATION_GENESIS) / 100;
         limit_update  = (cap_blocks * HN4_SATURATION_UPDATE) / 100;
         limit_recover = (cap_blocks * (HN4_SATURATION_GENESIS - 5)) / 100;
     } else {
-        /* Fallback for Exabyte/Quettabyte scales */
         limit_genesis = (cap_blocks / 100) * HN4_SATURATION_GENESIS;
         limit_update  = (cap_blocks / 100) * HN4_SATURATION_UPDATE;
         limit_recover = (cap_blocks / 100) * (HN4_SATURATION_GENESIS - 5);
     }
+#endif
 
     /* 1. Update Global State Flags (Side Effect) */
     uint32_t flags = atomic_load_explicit(&vol->sb.info.state_flags, memory_order_relaxed);
@@ -740,6 +741,12 @@ hn4_result_t _bitmap_op(
         uint32_t sectors_to_io = 1;
         if ((offset_in_sec + sizeof(hn4_armored_word_t)) > ss) {
             sectors_to_io = 2;
+        }
+
+        if (alloc_size < (sectors_to_io * ss)) {
+             /* Realloc or fail - in this case fail safely */
+             if (sector_buf) hn4_hal_mem_free(sector_buf);
+             return HN4_ERR_NOMEM;
         }
 
         /* 1. READ: Fetch the sector(s) containing the target word */

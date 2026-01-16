@@ -264,7 +264,13 @@ hn4_result_t hn4_write_anchor_atomic(
      * We must read the sector, update the slot, and write back.
      */
     /* 3. Read-Modify-Write (RMW) */
-    void* io_buf = hn4_hal_mem_alloc(ss);
+   /* Calculate extent */
+    uint32_t sectors_to_io = 1;
+    if ((byte_in_sector + sizeof(hn4_anchor_t)) > ss) {
+        sectors_to_io = 2;
+    }
+
+    void* io_buf = hn4_hal_mem_alloc(sectors_to_io * ss);
     if (!io_buf) return HN4_ERR_NOMEM;
 
     /* Map Sector LBA to one of the 64 shard locks in the volume struct */
@@ -272,7 +278,7 @@ hn4_result_t hn4_write_anchor_atomic(
     hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
     /* Read */
-    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, io_buf, 1);
+    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, io_buf, sectors_to_io);
     if (res != HN4_OK) {
         hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
         hn4_hal_mem_free(io_buf);
@@ -283,7 +289,7 @@ hn4_result_t hn4_write_anchor_atomic(
     memcpy((uint8_t*)io_buf + byte_in_sector, anchor, sizeof(hn4_anchor_t));
 
     /* Write */
-    res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, 1);
+    res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, sectors_to_io);
     
     /* Release Lock immediately after IO submission */
     hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);

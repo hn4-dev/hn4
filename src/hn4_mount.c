@@ -1556,7 +1556,6 @@ static hn4_result_t _reconstruct_cortex_state(
     if (cortex_bytes > (256 * 1024 * 1024)) {
         HN4_LOG_WARN("Cortex too large for RAM cache (%llu bytes). Disabling Zero-Scan.", 
                      (unsigned long long)cortex_bytes);
-        /* Proceed without cache - Degraded but functional */
         return HN4_OK; 
     }
 
@@ -1564,22 +1563,29 @@ static hn4_result_t _reconstruct_cortex_state(
     if (!vol->nano_cortex) return HN4_ERR_NOMEM;
     vol->cortex_size = cortex_bytes;
 
-    /* 3. Linear Read (The fastest op an SSD can perform) */
-    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, cortex_sectors);
+    /* 3. Linear Read (Bulk Load Cortex) */
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_READ, vol->sb.info.lba_cortex_start, vol->nano_cortex, (uint32_t)cortex_sectors);
     if (res != HN4_OK) {
-      HN4_LOG_WARN("Cortex Linear Read failed. Disabling Zero-Scan Cache.");
-        
-        if (vol->nano_cortex) {
-            hn4_hal_mem_free(vol->nano_cortex);
-            vol->nano_cortex = NULL;
-        }
-    return HN4_OK;
-  }
+        HN4_LOG_WARN("Cortex Linear Read failed. Disabling Zero-Scan Cache.");
+        hn4_hal_mem_free(vol->nano_cortex);
+        vol->nano_cortex = NULL;
+        return HN4_OK; /* Soft fail */
+    }
 
     /* 4. Sequence Verification & Trajectory Re-Projection */
-    uint32_t anchor_count = cortex_bytes / sizeof(hn4_anchor_t);
+    uint32_t anchor_count = (uint32_t)(cortex_bytes / sizeof(hn4_anchor_t));
     hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+    
     uint64_t ghost_repairs = 0;
+    uint64_t phantom_filtered = 0;
+
+    /* Pre-allocate a scratch buffer for verification reads */
+    void* verify_buf = hn4_hal_mem_alloc(bs);
+    if (!verify_buf) { 
+        hn4_hal_mem_free(vol->nano_cortex);
+        vol->nano_cortex = NULL;
+        return HN4_ERR_NOMEM; 
+    }
 
     for (uint32_t i = 0; i < anchor_count; i++) {
         hn4_anchor_t* anchor = &anchors[i];
@@ -1602,13 +1608,10 @@ static hn4_result_t _reconstruct_cortex_state(
         uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
         
         /* Guard against header overhead exceeding block size */
-        if (bs <= sizeof(hn4_block_header_t)) {
-            /* Should be caught by mount checks, but safe default here */
-            continue; 
-        }
+        if (bs <= sizeof(hn4_block_header_t)) continue; 
 
         /* Calculate Block Count needed for this Mass */
-        uint32_t payload_sz = bs - sizeof(hn4_block_header_t); 
+        uint32_t payload_sz = HN4_BLOCK_PayloadSize(bs);
         uint64_t blocks_needed = (mass + payload_sz - 1) / payload_sz;
 
         uint64_t phys_total_blocks = vol->vol_capacity_bytes / bs;
@@ -1618,16 +1621,6 @@ static hn4_result_t _reconstruct_cortex_state(
         }
 
        /* C. Re-Project Trajectory (Deep-Scan Recovery) */
-        
-        /* Pre-allocate a scratch buffer for verification reads */
-        void* verify_buf = hn4_hal_mem_alloc(bs);
-        if (!verify_buf) { 
-            /* Clean up main buffer and return error on OOM */ 
-            hn4_hal_mem_free(vol->nano_cortex);
-            vol->nano_cortex = NULL;
-            return HN4_ERR_NOMEM; 
-        }
-
         for (uint64_t n = 0; n < blocks_needed; n++) {
             
             bool found_block_n = false;
@@ -1649,71 +1642,113 @@ static hn4_result_t _reconstruct_cortex_state(
                 /* Check Error Code. If bitmap read failed, assume worst case (skip). */
                 if (bmp_res != HN4_OK) continue;
 
-                /* Case 1: Bitmap says used. */
-                
+                hn4_addr_t phys = hn4_lba_from_blocks(lba * (bs / ss));
+
+                /* Case 1: Bitmap says USED. Verify ownership to confirm it's ours. */
                 if (is_set) {
-                    /* Optimization: If k=0 is set, we assume it's ours to save IO. */
+                    /* Optimization: If k=0 is set, we mostly assume it's ours to save IO. */
                     if (k == 0) { found_block_n = true; break; }
-                    hn4_addr_t phys = hn4_lba_from_blocks(lba * (bs / ss));
 
                     if (hn4_hal_sync_io(dev, HN4_IO_READ, phys, verify_buf, (bs/ss)) == HN4_OK) {
                         hn4_block_header_t* h = (hn4_block_header_t*)verify_buf;
         
-                        /* Check Magic + Sequence */
-                        if (hn4_le32_to_cpu(h->magic) == HN4_BLOCK_MAGIC &&
-                        hn4_le64_to_cpu(h->seq_index) == n) 
-                        {
-                            /* Complete UUID Verification */
-                            hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
-                            
-                            if (disk_id.lo == anchor_cpu_id.lo && 
-                                disk_id.hi == anchor_cpu_id.hi) 
-                                {
-                                    /* It is OUR data. Mark found and stop probing. */
-                                    found_block_n = true;
-                                    break; 
-                                }
-                        }
-                        }
-    
-                    /* If IO failed or ID didn't match, it is a collision. Continue probing k+1. */
-                    continue; 
-                }
-
-                /* Case 2: Bitmap says FREE. This might be a Ghost. Verify Identity. */
-                if (!is_set) {
-                    hn4_addr_t phys = hn4_lba_from_blocks(lba * (bs / ss));
-                    
-                    if (hn4_hal_sync_io(dev, HN4_IO_READ, phys, verify_buf, (bs/ss)) == HN4_OK) {
-                        hn4_block_header_t* h = (hn4_block_header_t*)verify_buf;
-                        
-                        /* Verify Magic + Well ID + Sequence ID */
                         if (hn4_le32_to_cpu(h->magic) == HN4_BLOCK_MAGIC &&
                             hn4_le64_to_cpu(h->seq_index) == n) 
                         {
                             hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
-                            if (disk_id.lo == anchor->seed_id.lo && 
-                                disk_id.hi == anchor->seed_id.hi) 
+                            
+                            if (disk_id.lo == anchor_cpu_id.lo && 
+                                disk_id.hi == anchor_cpu_id.hi) 
                             {
-                                /* CONFIRMED GHOST: Data exists, Bitmap was lost. */
-                                _bitmap_op(vol, lba, BIT_SET, NULL); /* Revive */
-                                ghost_repairs++;
+                                /* It is OUR data. Mark found and stop probing. */
                                 found_block_n = true;
-                                break; /* Found Block N, move to N+1 */
+                                break; 
+                            }
+                        }
+                    }
+                    /* If IO failed or ID didn't match, it is a collision. Continue probing k+1. */
+                    continue; 
+                }
+
+                /* Case 2: Bitmap says FREE. Verify Identity & Causality. */
+                if (!is_set) {
+                    if (hn4_hal_sync_io(dev, HN4_IO_READ, phys, verify_buf, (bs/ss)) == HN4_OK) {
+                        hn4_block_header_t* h = (hn4_block_header_t*)verify_buf;
+                        
+                        /* 1. Structural Check */
+                        if (hn4_le32_to_cpu(h->magic) == HN4_BLOCK_MAGIC &&
+                            hn4_le64_to_cpu(h->seq_index) == n) 
+                        {
+                            hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
+                            
+                            /* 2. Identity Check */
+                            if (disk_id.lo == anchor_cpu_id.lo && 
+                                disk_id.hi == anchor_cpu_id.hi) 
+                            {
+                                /* 
+                                 * 3. CAUSALITY CHECK (Strict 32/64 width enforcement)
+                                 * Block is 64-bit Gen, Anchor is 32-bit Gen.
+                                 * Ensure high bits are zero to match v1 Anchor constraints.
+                                 */
+                                uint64_t disk_gen_raw = hn4_le64_to_cpu(h->generation);
+                                uint32_t disk_gen_lo  = (uint32_t)(disk_gen_raw & 0xFFFFFFFF);
+                                uint32_t disk_gen_hi  = (uint32_t)(disk_gen_raw >> 32);
+                                
+                                uint32_t anchor_gen   = hn4_le32_to_cpu(anchor->write_gen);
+                                
+                                bool gen_ok = (disk_gen_hi == 0 && disk_gen_lo == anchor_gen);
+                                
+                                /* 4. INTEGRITY CHECK (CRC) */
+                                uint32_t calc_crc = hn4_crc32(HN4_CRC_SEED_DATA, h->payload, payload_sz);
+                                bool crc_ok = (calc_crc == hn4_le32_to_cpu(h->data_crc));
+
+                                if (gen_ok && crc_ok) {
+                                    /* PROVENANCE ESTABLISHED: Resurrect. */
+                                    _bitmap_op(vol, lba, BIT_SET, NULL); 
+                                    ghost_repairs++;
+                                    found_block_n = true;
+                                    
+                                    if (ghost_repairs < 10) {
+                                        HN4_LOG_WARN("Zero-Scan: Resurrected verified block @ %llu (Gen %u)", 
+                                                     (unsigned long long)lba, anchor_gen);
+                                    }
+                                    break; 
+                                } 
+                                else {
+                                    /* 
+                                     * PHANTOM DETECTED
+                                     * Filter out the noise. Do not mount it. Do not error.
+                                     */
+                                    if (phantom_filtered < 10) {
+                                        HN4_LOG_WARN("Zero-Scan: Filtered Phantom @ %llu. DiskGen %u:%u vs Anchor %u. CRC:%d", 
+                                                     (unsigned long long)lba, 
+                                                     disk_gen_hi, disk_gen_lo, 
+                                                     anchor_gen, crc_ok);
+                                    }
+                                    phantom_filtered++;
+                                    /* Implicit continue to next 'k' */
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        hn4_hal_mem_free(verify_buf);
+    }
+    
+    hn4_hal_mem_free(verify_buf);
+
+    /* Telemetry Report */
+    if (ghost_repairs > 0) {
+        HN4_LOG_WARN("Zero-Scan Reconstruction: Healed %llu Ghost Allocations.", (unsigned long long)ghost_repairs);
+        vol->health.taint_counter++;
+    } 
+    
+    if (phantom_filtered > 0) {
+        HN4_LOG_WARN("Zero-Scan Reconstruction: Filtered %llu Phantom blocks.", (unsigned long long)phantom_filtered);
     }
 
-    if (ghost_repairs > 0) {
-        HN4_LOG_WARN("Zero-Scan Reconstruction: Healed %llu Ghost Allocations.", ghost_repairs);
-        /* Mark volume as having been repaired (Taint logic) */
-        vol->health.taint_counter++;
-    } else {
+    if (ghost_repairs == 0 && phantom_filtered == 0) {
         HN4_LOG_VAL("Zero-Scan Complete. State Consistent", anchor_count);
     }
 
@@ -2142,8 +2177,13 @@ hn4_result_t hn4_mount(
         res = _reconstruct_cortex_state(dev, vol);
         
         if (res != HN4_OK) {
+            /* 
+             * Note: _reconstruct_cortex_state now swallows Phantom errors 
+             * by filtering them. If it returns an error here, it's a hard 
+             * hardware failure (NOMEM/EIO).
+             */
             if (!force_ro) {
-                HN4_LOG_CRIT("Cortex Reconstruction Failed in RW mode. Aborting.");
+                HN4_LOG_CRIT("Cortex Reconstruction Failed (HW Error). Aborting.");
                 goto cleanup;
             }
             HN4_LOG_WARN("Cortex Reconstruction Failed in RO mode. Continuing raw.");
