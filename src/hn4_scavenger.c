@@ -103,8 +103,6 @@ uint64_t hn4_scavenger_lookup_delta(hn4_volume_t* vol, uint64_t logical_lba, uin
     return 0;
 }
 
-
-
 static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba, uint32_t version, uint64_t seed_hash) {
     uint64_t start_idx = _delta_hash(old_lba) & (HN4_DELTA_TABLE_SIZE - 1);
 
@@ -114,14 +112,34 @@ static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba
         uint64_t existing_key = atomic_load_explicit(&vol->redirect.delta_table[idx].old_lba, memory_order_acquire);
         uint64_t existing_seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
         
-        if (existing_key == 0 || (existing_key == old_lba && existing_seed == seed_hash)) {
+        /* FIX: Use CAS to claim the slot ownership */
+        if (existing_key == 0) {
+            uint64_t expected = 0;
+            /* Tentatively claim slot with the Key using CAS */
+            if (!atomic_compare_exchange_strong_explicit(
+                &vol->redirect.delta_table[idx].old_lba, 
+                &expected, 
+                old_lba, 
+                memory_order_acq_rel, 
+                memory_order_acquire)) 
+            {
+                /* CAS failed: Slot was taken by another thread. Re-evaluate loop. */
+                continue; 
+            }
+            /* We own the slot now. Proceed to fill data. */
+            existing_key = old_lba;
+        }
+
+        /* Update payload if we own the slot (or claimed it above) */
+        if (existing_key == old_lba) {
+            uint64_t current_seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
             
+            /* If this is a collision with a different file (seed mismatch), keep probing */
+            if (current_seed != 0 && current_seed != seed_hash) continue;
+
             atomic_store_explicit(&vol->redirect.delta_table[idx].new_lba, new_lba, memory_order_relaxed);
             atomic_store_explicit(&vol->redirect.delta_table[idx].version, version, memory_order_relaxed);
-            atomic_store_explicit(&vol->redirect.delta_table[idx].seed_hash, seed_hash, memory_order_relaxed);
-            atomic_fetch_add_explicit(&vol->redirect.delta_table[idx].slot_epoch, 1, memory_order_relaxed);
-            atomic_thread_fence(memory_order_release);
-            atomic_store_explicit(&vol->redirect.delta_table[idx].old_lba, old_lba, memory_order_release);
+            atomic_store_explicit(&vol->redirect.delta_table[idx].seed_hash, seed_hash, memory_order_release);
             return 0; 
         }
     }
@@ -229,13 +247,15 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
         }
 
         /* Issue Single IO for the Range */
+        bool is_zns = (caps->hw_flags & HN4_HW_ZNS_NATIVE);
+
         if (batch->secure_shred && zero_buf) {
             for (uint32_t k = 0; k < merged; k++) {
                 hn4_addr_t target = hn4_addr_add(start, k * sectors_per_blk);
                 hn4_hal_sync_io(dev, HN4_IO_WRITE, target, zero_buf, sectors_per_blk);
             }
-        } else {
-            /* Standard Trim - Single Command */
+        } else if (!is_zns) {
+            /* Standard Trim - Only for Conventional Block Devices */
             hn4_hal_sync_io(dev, HN4_IO_DISCARD, start, NULL, sectors_per_blk * merged);
         }
         

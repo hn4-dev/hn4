@@ -158,12 +158,20 @@ _Check_return_ hn4_result_t hn4_repair_block(
                 /* Clear the 2 bits for this block */
                 uint64_t cleared = old_val & ~(3ULL << shift);
 
+                bool is_physical_failure = (res != HN4_OK && 
+                                res != HN4_ERR_NOMEM && 
+                                res != HN4_ERR_INVALID_ARGUMENT);
+
                 if (res == HN4_OK) {
                     /* REPAIR SUCCESS: Downgrade to BRONZE (01) */
                     new_val = cleared | (1ULL << shift);
-                } else {
+                }  else if (is_physical_failure) {
                     /* REPAIR FAILURE: Downgrade to TOXIC (00) */
                     new_val = cleared; /* 00 */
+                }  else {
+                    new_val = old_val;
+                    success = true; 
+                    break; 
                 }
 
                 success = atomic_compare_exchange_weak_explicit(q_ptr, &old_val, new_val,

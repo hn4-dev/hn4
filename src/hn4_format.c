@@ -537,7 +537,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     
     const hn4_profile_spec_t* spec = &PROFILE_SPECS[pid];
     
-    uint64_t capacity_bytes;
+    hn4_size_t capacity_bytes;
     uint64_t virt_cap = 0;
 
     /*  Careful math order for Virtual Overlays */
@@ -865,11 +865,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     #else
         vcap_check = params->override_capacity_bytes;
     #endif
-    
-        /* 
-         * FIX: Resolve minimum capacity dynamically based on profile.
-         * Default to 100MB for Generic if unspecified, but respect PICO limits.
-         */
+
         uint32_t pid = params->target_profile;
         if (pid >= HN4_MAX_PROFILES) return HN4_ERR_INVALID_ARGUMENT;
         
@@ -902,7 +898,14 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
 
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
         #ifdef HN4_USE_128BIT
-        hn4_u128_t rem = hn4_u128_div_u64(total_cap, caps->zone_size_bytes); // Assuming div returns quotient, we need remainder helper or check logic
+
+        hn4_u128_t zone_sz_128 = hn4_u128_from_u64(caps->zone_size_bytes);
+        hn4_u128_t rem = hn4_u128_mod(total_cap, zone_sz_128);
+        
+        if (rem.lo != 0 || rem.hi != 0) {
+            HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
+            return HN4_ERR_ALIGNMENT_FAIL;
+        }
         #else
         if (total_cap % caps->zone_size_bytes != 0) {
             HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
@@ -1176,7 +1179,6 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         p[0] = HN4_POISON_PATTERN;        
         p[last_idx] = HN4_POISON_PATTERN; 
 
-        /* Fix: Calculate CRC for the poison block so it is structurally valid (but semantic poison) */
         disk_view = (hn4_superblock_t*)sb_buf;
         disk_view->raw.sb_crc = 0;
         crc = hn4_crc32(0, disk_view, HN4_SB_SIZE - 4);
@@ -1192,7 +1194,6 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
                 if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
             }
 
-            /* Fix: Barrier is critical between retries to drain controller queue */
             if (w_res == HN4_OK) {
                 if (hn4_hal_barrier(dev) == HN4_OK) break;
             } else {

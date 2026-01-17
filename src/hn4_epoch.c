@@ -167,7 +167,7 @@ static const hn4_result_t _drift_err_map[] = {
 _Check_return_ hn4_result_t hn4_epoch_check_ring(
     HN4_IN hn4_hal_device_t* dev, 
     HN4_IN const hn4_superblock_t* sb, 
-    HN4_IN uint64_t vol_cap
+    HN4_IN hn4_size_t vol_cap
 )
 {
     const hn4_hal_caps_t* caps;

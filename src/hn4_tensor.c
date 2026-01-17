@@ -268,7 +268,8 @@ hn4_result_t hn4_tensor_read(
     
     /* Clamp Read Length to EOF (Allow Short Read) */
     uint64_t read_len = len;
-    if ((global_offset + len) > ctx->total_size_bytes) {
+    
+    if ((UINT64_MAX - global_offset) < len || (global_offset + len) > ctx->total_size_bytes) {
         read_len = ctx->total_size_bytes - global_offset;
     }
 

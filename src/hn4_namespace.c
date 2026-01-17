@@ -97,17 +97,17 @@ static uint64_t _ns_generate_tag_mask(const char* tag, size_t len)
  */
 static uint64_t _ns_parse_hex_u64(const char* s, size_t len) 
 {
-    static const int8_t hex_lut[256] = {
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-         0,  1,  2,  3,  4,  5,  6,  7,  8,  9, -1, -1, -1, -1, -1, -1, /* 0-9 */
-        -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* A-F */
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        -1, 10, 11, 12, 13, 14, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, /* a-f */
-        -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
-        /* Remainder initialized to -1 implicitly or via static rules */
-    };
+    static int8_t hex_lut[256];
+    static atomic_bool init_done = false;
+
+    if (HN4_UNLIKELY(!atomic_load_explicit(&init_done, memory_order_acquire))) {
+        /* Initialize Safe Defaults */
+        for (int i=0; i<256; i++) hex_lut[i] = -1;
+        for (int i='0'; i<='9'; i++) hex_lut[i] = i - '0';
+        for (int i='A'; i<='F'; i++) hex_lut[i] = i - 'A' + 10;
+        for (int i='a'; i<='f'; i++) hex_lut[i] = i - 'a' + 10;
+        atomic_store_explicit(&init_done, true, memory_order_release);
+    }
 
     uint64_t val = 0;
     for (size_t i = 0; i < len; i++) {
@@ -119,6 +119,7 @@ static uint64_t _ns_parse_hex_u64(const char* s, size_t len)
     }
     return val;
 }
+
 
 /**
  * _ns_verify_extension_ptr

@@ -163,6 +163,7 @@ static bool _imp_safe_add_signed(int64_t base, int64_t offset, int64_t* res) {
 #define HN4_INLINE_NAME_MAX 24
 #define HN4_FLAG_IS_DIRECTORY  (1ULL << 63)
 #define HN4_EXT_TYPE_TETHER     0x03 
+#define HN4_FLAG_EXTENDED       (1ULL << 23)
 
 typedef struct {
     hn4_anchor_t    cached_anchor;
@@ -256,48 +257,104 @@ static int _resolve_path(hn4_volume_t* vol, const char* path, hn4_lookup_ctx_t* 
     if (*check != '\0') return -HN4_ENOENT; /* Subdirs forbidden */
     
     if (name_len == 0) return -HN4_ENOENT;
-    if (*end == '/') ctx->trailing_slash = true; /* Mark intent */
+    if (*end == '/') ctx->trailing_slash = true;
 
-    if (name_len >= HN4_INLINE_NAME_MAX) return -HN4_ENAMETOOLONG;
-    _imp_memcpy(ctx->name, p, name_len);
-    ctx->name[name_len] = '\0';
-
-    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-    _imp_memory_barrier();
+    char search_name[HN4_MAX_PATH];
+    if (name_len >= HN4_MAX_PATH) return -HN4_ENAMETOOLONG;
+    
+    _imp_memcpy(search_name, p, name_len);
+    search_name[name_len] = '\0';
 
     hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
     size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
 
     for (size_t i = 0; i < count; i++) {
-        hn4_anchor_t* a = &anchors[i];
+
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
         
-        uint64_t dclass = _imp_atomic_load_u64(&a->data_class);
+        hn4_anchor_t cand = anchors[i]; /* Stack Snapshot */
+        
+        uint64_t dclass = _imp_atomic_load_u64(&anchors[i].data_class); // Use volatile source for checks
         dclass = hn4_le64_to_cpu(dclass);
 
-        if (!(dclass & HN4_FLAG_VALID)) continue;
-        if (dclass & HN4_FLAG_TOMBSTONE) continue;
+        /* Skip Invalid entries immediately */
+        if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
+            continue;
+        }
 
-        char tmp[HN4_INLINE_NAME_MAX + 1];
-        _imp_memcpy(tmp, a->inline_buffer, HN4_INLINE_NAME_MAX);
-        tmp[HN4_INLINE_NAME_MAX] = '\0';
+        bool match = false;
 
-        if (_imp_strcmp(tmp, ctx->name) == 0) {
-            ctx->anchor = *a;
-            ctx->slot_idx = i;
-            ctx->found = true;
+        if (dclass & HN4_FLAG_EXTENDED) {
+            /* 
+             * SLOW PATH: Extended Attributes
+             * We must drop the lock to perform I/O resolution.
+             */
             hn4_hal_spinlock_release(&vol->locking.l2_lock);
             
-            /* Directory Flag Check */
-            if (ctx->trailing_slash) {
-                if (!(dclass & HN4_FLAG_IS_DIRECTORY)) return -HN4_ENOTDIR;
+            char resolved_name[HN4_MAX_PATH];
+            if (hn4_ns_get_name(vol, &cand, resolved_name, sizeof(resolved_name)) == HN4_OK) {
+                if (_imp_strcmp(resolved_name, search_name) == 0) {
+                    match = true;
+                }
             }
-            return 0;
+            
+            if (match) {
+                /* Re-verify ownership (Race Condition check) */
+                hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+                
+                /* Check if slot changed while we were doing I/O */
+                if (anchors[i].seed_id.lo == cand.seed_id.lo && 
+                    anchors[i].seed_id.hi == cand.seed_id.hi &&
+                    anchors[i].write_gen == cand.write_gen) 
+                {
+                    /* Confirmed Match */
+                    ctx->anchor = cand;
+                    ctx->slot_idx = i;
+                    ctx->found = true;
+                    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                    goto check_dir;
+                }
+                
+                /* Slot changed, our match is invalid. Continue loop. */
+                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                continue; 
+            }
+        } 
+        else {
+            /* 
+             * FAST PATH: Inline Name
+             * Safe to compare inside spinlock.
+             */
+            char tmp[HN4_INLINE_NAME_MAX + 1];
+            _imp_memcpy(tmp, cand.inline_buffer, HN4_INLINE_NAME_MAX);
+            tmp[HN4_INLINE_NAME_MAX] = '\0';
+
+            if (_imp_strcmp(tmp, search_name) == 0) {
+                ctx->anchor = cand;
+                ctx->slot_idx = i;
+                ctx->found = true;
+                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                goto check_dir;
+            }
+            
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
         }
     }
 
-    hn4_hal_spinlock_release(&vol->locking.l2_lock);
     return -HN4_ENOENT;
+
+check_dir:
+    /* Directory Flag Check */
+    {
+        uint64_t dc = hn4_le64_to_cpu(ctx->anchor.data_class);
+        if (ctx->trailing_slash) {
+            if (!(dc & HN4_FLAG_IS_DIRECTORY)) return -HN4_ENOTDIR;
+        }
+    }
+    return 0;
 }
+
 
 static int _find_free_slot(hn4_volume_t* vol, uint64_t* slot_idx) {
     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);

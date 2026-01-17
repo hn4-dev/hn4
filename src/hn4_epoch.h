@@ -46,7 +46,7 @@ hn4_result_t hn4_epoch_write_genesis(hn4_hal_device_t* dev, const hn4_superblock
 hn4_result_t hn4_epoch_check_ring(
     hn4_hal_device_t* dev, 
     const hn4_superblock_t* sb, 
-    uint64_t vol_cap
+    hn4_size_t vol_cap
 );
 
 /**

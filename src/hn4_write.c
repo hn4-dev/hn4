@@ -999,15 +999,22 @@ retry_transaction:;
         HN4_LOG_WARN("WRITE_ATOMIC: Race detected. Expected Gen %u, Found %u. Retrying.", 
                      current_gen, hn4_le32_to_cpu(expected_gen_le));
 
-         if (_bitmap_op(vol, target_lba, BIT_CLEAR, NULL) != HN4_OK) {
-             /* If we can't free the orphan, we must panic to prevent leak accumulation */
-             atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+        bool is_zns = (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE);
+
+        if (!is_zns) {
+            /* Standard Block Device: Safe to reuse LBA */
+            if (_bitmap_op(vol, target_lba, BIT_CLEAR, NULL) != HN4_OK) {
+                atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+            }
+        } else {
+            /* ZNS: Cannot rollback Write Pointer. Leak block and mark dirty. 
+               The Scavenger/Evacuator will eventually reclaim the hole. */
+            HN4_LOG_WARN("ZNS Race: Leaking LBA %llu to preserve WP alignment.", 
+                         (unsigned long long)target_lba);
+            atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
         }
 
-        /* Cleanup memory before jumping back */
         hn4_hal_mem_free(io_buf);
-
-        /* Backoff and Retry */
         hn4_hal_micro_sleep(100);
         goto retry_transaction;
     }

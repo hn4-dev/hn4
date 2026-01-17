@@ -451,6 +451,9 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
 #else
         chunk_bytes = (remaining > SAFE_CHUNK_CAP) ? SAFE_CHUNK_CAP : (uint64_t)remaining;
 #endif
+        if (chunk_bytes >= block_size) {
+            chunk_bytes = (chunk_bytes / block_size) * block_size;
+        }
 
         /* 3. Convert to Blocks */
         uint32_t chunk_blocks = (uint32_t)(chunk_bytes / block_size);
@@ -470,20 +473,25 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
         if (res != HN4_OK) return res;
 
         /* 5. Advance State */
+        const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+        uint32_t ss = caps->logical_block_size;
+        if (ss == 0) ss = 512; /* Safety fallback */
+
+        /* Calculate Sectors Per Block for address scaling */
+        uint32_t spb = block_size / ss;
         uint64_t bytes_transferred = (uint64_t)chunk_blocks * block_size;
 
         /* Advance Buffer */
         buf_cursor += bytes_transferred;
 
-        /* Advance LBA */
-        current_lba = hn4_addr_add(current_lba, chunk_blocks);
+        current_lba = hn4_addr_add(current_lba, chunk_blocks * spb);
 
         /* Decrement Remaining */
-#ifdef HN4_USE_128BIT
-        remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(bytes_transferred));
-#else
-        remaining -= bytes_transferred;
-#endif
+        #ifdef HN4_USE_128BIT
+            remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(bytes_transferred));
+        #else
+            remaining -= bytes_transferred;
+        #endif
 
         /* Yield on large transfers to prevent watchdog timeouts */
         if (chunk_blocks > 1024) HN4_YIELD();

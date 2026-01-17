@@ -1132,10 +1132,23 @@ static hn4_result_t _load_qmask_resources(HN4_IN hn4_hal_device_t* dev, HN4_INOU
 
     uint32_t sect_sz = caps->logical_block_size;
     uint32_t bs = vol->vol_block_size;
+    uint64_t total_data_blocks;
+#ifdef HN4_USE_128BIT
+    /* Use primitive division for u128 / u64 */
+    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
+    hn4_u128_t blks_128 = hn4_u128_div_u64(cap_128, bs);
+    
+    /* 
+     * Safety: Q-Mask size calculation.
+     * 2 bits per block. If blocks > 2^63, the qmask size overflows size_t.
+     * We clamp or check bounds. Realistically, RAM limit hits first.
+     */
+    if (blks_128.hi > 0) return HN4_ERR_NOMEM; 
+    total_data_blocks = blks_128.lo;
+#else
     uint64_t cap = vol->vol_capacity_bytes;
-
-    /* 1. Calculate Size */
-    uint64_t total_data_blocks = cap / bs;
+    total_data_blocks = cap / bs;
+#endif
     uint64_t qmask_bytes_needed = (total_data_blocks * 2 + 7) / 8;
     
     size_t alloc_sz = HN4_ALIGN_UP(qmask_bytes_needed, 8);

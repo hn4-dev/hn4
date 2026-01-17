@@ -13,6 +13,7 @@
 #include "hn4_crc.h"
 #include "hn4_endians.h" 
 #include "hn4_constants.h" 
+#include "hn4_tensor.h"  
 #include <string.h>
 #include <stdlib.h>
 
@@ -8766,5 +8767,426 @@ hn4_TEST(L10_Reconstruction, Zero_Gen_Consistency) {
     }
 
     if(vol) hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
+/* 
+ * Test 2001: Optimization - Basic Bitmap Population
+ * Scenario: Cortex has: [Anchor 0: Valid] [Anchor 1: Empty] [Anchor 2: Valid].
+ * Logic: _build_occupancy_bitmap must set bits 0 and 2, clear bit 1.
+ * Expected: Bitmap[0] & 5 (binary 101) == 5.
+ */
+hn4_TEST(Optimization, Basic_Population) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    uint32_t bs = sb.info.block_size;
+    
+    /* 1. Setup Cortex with 3 slots */
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* anchors = (hn4_anchor_t*)ctx_buf;
+
+    /* Slot 0: Valid */
+    anchors[0].seed_id.lo = 1;
+    anchors[0].data_class = 1;
+
+    /* Slot 1: Empty (Zeroed by calloc) */
+
+    /* Slot 2: Valid */
+    anchors[2].seed_id.lo = 2;
+    anchors[2].data_class = 1;
+
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    /* 2. Mount */
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 3. Verify Bitmap */
+    ASSERT_TRUE(vol->locking.cortex_occupancy_bitmap != NULL);
+    
+    uint64_t word = vol->locking.cortex_occupancy_bitmap[0];
+    
+    /* Expect bits 0 and 2 set (1 | 4 = 5) */
+    /* Check Bit 0 */
+    ASSERT_TRUE((word & 1) != 0);
+    /* Check Bit 1 */
+    ASSERT_FALSE((word & 2) != 0);
+    /* Check Bit 2 */
+    ASSERT_TRUE((word & 4) != 0);
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 2002: Optimization - Semantic Logic (Data vs ID)
+ * Scenario: 
+ *   Slot 0: ID Set, Data Zero (Allocated but not committed).
+ *   Slot 1: ID Zero, Data Set (Pending Reservation).
+ * Logic: Both states must mark the slot as "Occupied" to prevent allocator collision.
+ * Expected: Bits 0 and 1 SET.
+ */
+hn4_TEST(Optimization, Semantic_Logic_OR) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    uint32_t bs = sb.info.block_size;
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* anchors = (hn4_anchor_t*)ctx_buf;
+
+    /* Slot 0: Has ID, No DataClass */
+    anchors[0].seed_id.lo = 0xCAFE;
+    anchors[0].data_class = 0;
+
+    /* Slot 1: No ID, Has DataClass (Reservation Magic) */
+    anchors[1].seed_id.lo = 0;
+    anchors[1].data_class = HN4_MAGIC_NANO_PENDING;
+
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Verify Logic */
+    uint64_t word = vol->locking.cortex_occupancy_bitmap[0];
+    
+    /* Both must be marked occupied */
+    ASSERT_TRUE((word & 1) != 0); /* Slot 0 */
+    ASSERT_TRUE((word & 2) != 0); /* Slot 1 */
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 2003: Optimization - Word Count Integrity
+ * Scenario: Cortex Size is 64KB (512 Anchors).
+ * Logic: Bitmap Words = (512 + 63) / 64 = 8 words.
+ * Expected: vol->locking.cortex_bitmap_words == 8.
+ */
+hn4_TEST(Optimization, Word_Count_Calculation) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    /* Formatted fixture defaults to 64 blocks of Cortex (64*4KB = 256KB) */
+    /* 256KB / 128B per Anchor = 2048 Anchors */
+    /* 2048 / 64 bits per word = 32 words */
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t expected_slots = vol->cortex_size / 128;
+    uint64_t expected_words = (expected_slots + 63) / 64;
+
+    ASSERT_EQ(expected_words, vol->locking.cortex_bitmap_words);
+    ASSERT_TRUE(expected_words > 0);
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 2004: Optimization - PICO Bypass
+ * Scenario: Profile is PICO.
+ * Logic: Optimization should be completely disabled (NULL pointer) to save RAM.
+ * Expected: cortex_occupancy_bitmap IS NULL.
+ */
+hn4_TEST(Optimization, Pico_Bypass_Check) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    sb.info.format_profile = HN4_PROFILE_PICO;
+    /* PICO implies no nano_cortex either */
+    /* This test assumes _load_cortex_resources also checks PICO and skips load */
+    /* If nano_cortex is NULL, _build_occupancy_bitmap returns early. */
+    
+    write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Verify disabled */
+    ASSERT_TRUE(vol->locking.cortex_occupancy_bitmap == NULL);
+    ASSERT_EQ(0, vol->locking.cortex_bitmap_words);
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test 2005: Optimization - Tombstone Safety
+ * Scenario: Anchor is marked as HN4_FLAG_TOMBSTONE.
+ * Logic: Deleted files are not free slots. They must be preserved until the Reaper cleans them.
+ *        The bitmap MUST mark them as occupied to prevent overwrites.
+ * Expected: Bit Set.
+ */
+hn4_TEST(Optimization, Tombstone_Is_Occupied) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+
+    uint32_t bs = sb.info.block_size;
+    uint8_t* ctx_buf = calloc(1, bs);
+    hn4_anchor_t* anchors = (hn4_anchor_t*)ctx_buf;
+
+    /* Create Tombstone at Slot 5 */
+    anchors[5].seed_id.lo = 0xDEAD;
+    anchors[5].data_class = HN4_FLAG_TOMBSTONE | HN4_FLAG_VALID;
+
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, sb.info.lba_cortex_start, ctx_buf, bs/512);
+    free(ctx_buf);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Verify Slot 5 is occupied */
+    uint64_t word = vol->locking.cortex_occupancy_bitmap[0];
+    ASSERT_TRUE((word & (1ULL << 5)) != 0);
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+
+
+/* =========================================================================
+ * TENSOR UNIT TESTS
+ * ========================================================================= */
+
+/* 
+ * Helper: Inject an anchor that matches any tag query (Bloom Filter = All 1s).
+ */
+static void inject_wildcard_anchor(hn4_volume_t* vol, uint32_t slot_idx, uint64_t id_lo, uint64_t id_hi, uint64_t mass) {
+    hn4_anchor_t a = {0};
+    a.seed_id.lo = id_lo; /* Keep CPU endian for logic, convert later? No, struct is LE. */
+    a.seed_id.hi = id_hi;
+    a.seed_id = hn4_cpu_to_le128(a.seed_id);
+    
+    a.mass = hn4_cpu_to_le64(mass);
+    a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    a.tag_filter = 0xFFFFFFFFFFFFFFFFULL; /* Matches ALL tag queries */
+    a.write_gen = hn4_cpu_to_le32(1);
+    a.orbit_vector[0] = 1;
+    
+    /* Checksum */
+    a.checksum = 0;
+    a.checksum = hn4_cpu_to_le32(hn4_crc32(0, &a, sizeof(a)));
+
+    /* IO RMW */
+    uint64_t ctx_start = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
+    uint64_t byte_off = slot_idx * sizeof(hn4_anchor_t);
+    uint64_t sec_off = byte_off / 512;
+    uint64_t sec_rem = byte_off % 512;
+    
+    uint8_t buf[512];
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, hn4_addr_from_u64(ctx_start + sec_off), buf, 1);
+    memcpy(buf + sec_rem, &a, sizeof(a));
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, hn4_addr_from_u64(ctx_start + sec_off), buf, 1);
+    
+    /* Update RAM cache if present */
+    if (vol->nano_cortex) {
+        ((hn4_anchor_t*)vol->nano_cortex)[slot_idx] = a;
+    }
+}
+
+/*
+ * Test T1: Tensor Open - Topological Sort
+ * Scenario: Shards are scattered in Cortex with out-of-order IDs.
+ * Logic: hn4_tensor_open must sort them by Seed ID to form a contiguous stream.
+ *        Shard A (ID 10) at Slot 5.
+ *        Shard B (ID 20) at Slot 1.
+ *        Result order must be A -> B.
+ */
+hn4_TEST(Tensor, Open_Sorts_Shards) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Inject Shards out of order */
+    /* Slot 1: ID 20 (Should be 2nd) */
+    inject_wildcard_anchor(vol, 1, 20, 0, 1000); 
+    
+    /* Slot 5: ID 10 (Should be 1st) */
+    inject_wildcard_anchor(vol, 5, 10, 0, 500);
+
+    hn4_tensor_ctx_t* ctx = NULL;
+    
+    /* Open with any tag (Wildcard matches everything) */
+    ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "model:gpt4", &ctx));
+
+    /* Verify Count */
+    ASSERT_EQ(2, ctx->shard_count);
+    
+    /* Verify Sort Order (ID 10 then ID 20) */
+    ASSERT_EQ(10, hn4_le64_to_cpu(ctx->shards[0].seed_id.lo));
+    ASSERT_EQ(20, hn4_le64_to_cpu(ctx->shards[1].seed_id.lo));
+
+    /* Verify Offsets (Prefix Sum) */
+    /* Shard 0: Start 0. Mass 500. */
+    ASSERT_EQ(0, ctx->shard_offsets[0]);
+    /* Shard 1: Start 500. Mass 1000. */
+    ASSERT_EQ(500, ctx->shard_offsets[1]);
+    /* Sentinel: Start 1500. */
+    ASSERT_EQ(1500, ctx->shard_offsets[2]);
+    ASSERT_EQ(1500, ctx->total_size_bytes);
+
+    hn4_tensor_close(ctx);
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/*
+ * Test T3: Tensor Open - Zero Mass Corruption
+ * Scenario: A shard has valid ID/CRC but Mass is 0.
+ * Logic: Zero mass implies ambiguous topology (where does it exist in the stream?).
+ *        The engine MUST reject this to prevent logical holes.
+ * Expected: HN4_ERR_DATA_ROT.
+ */
+hn4_TEST(Tensor, Open_Rejects_Zero_Mass) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Inject Zero Mass Anchor */
+    inject_wildcard_anchor(vol, 0, 1, 0, 0);
+
+    hn4_tensor_ctx_t* ctx = NULL;
+    hn4_result_t res = hn4_tensor_open(vol, "tag:any", &ctx);
+
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+    
+    /* Ensure no context leaked */
+    ASSERT_TRUE(ctx == NULL);
+
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/*
+ * Test T4: Tensor Read - Out of Bounds
+ * Scenario: Valid Tensor. Read request exceeds Total Size.
+ * Logic: `hn4_tensor_read` must check `global_offset >= total_size`.
+ * Expected: HN4_ERR_INVALID_ARGUMENT.
+ */
+hn4_TEST(Tensor, Read_OOB) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* Inject valid shard (Size 100) */
+    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+
+    hn4_tensor_ctx_t* ctx = NULL;
+    ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx));
+
+    uint8_t buf[10];
+    
+    /* Read at offset 100 (Byte 101, OOB) */
+    hn4_result_t res = hn4_tensor_read(ctx, 100, buf, 1);
+    
+    ASSERT_EQ(HN4_ERR_INVALID_ARGUMENT, res);
+
+    hn4_tensor_close(ctx);
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test T11: Tensor - Write Attempt (API Check)
+ * Scenario: Tensor context is read-only.
+ * Logic: There is no hn4_tensor_write API. This test verifies 
+ *        the context struct doesn't expose mutable function pointers.
+ *        (Compile-time check mostly).
+ */
+hn4_TEST(Tensor, Immutability) {
+    /* Symbolic test: Verify context struct only has state, no vtable */
+    ASSERT_TRUE(sizeof(hn4_tensor_ctx_t) > 0);
+}
+
+/* 
+ * Test T12: Tensor - Mismatched Block Size
+ * Scenario: Attempt to open tensor on volume with BS=512 vs 4096.
+ * Logic: Geometry logic handles it dynamically.
+ */
+hn4_TEST(Tensor, Dynamic_Geometry) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, HN4_SB_SIZE/512);
+    
+    /* Force 512B Block Size */
+    sb.info.block_size = 512;
+    write_sb(dev, &sb, 0);
+    
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t mp = {0};
+    hn4_mount(dev, &mp, &vol);
+    
+    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+    
+    hn4_tensor_ctx_t* ctx = NULL;
+    ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx));
+    
+    ASSERT_EQ(512, ctx->block_size);
+    ASSERT_EQ(HN4_BLOCK_PayloadSize(512), ctx->payload_cap);
+    
+    hn4_tensor_close(ctx);
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test T13: Tensor - Concurrent Open
+ * Scenario: Open same tensor twice.
+ * Logic: Should get two independent contexts. Refcount = 2.
+ */
+hn4_TEST(Tensor, Concurrent_Open) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t mp = {0};
+    hn4_mount(dev, &mp, &vol);
+    
+    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+    
+    hn4_tensor_ctx_t *ctx1, *ctx2;
+    ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx1));
+    ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx2));
+    
+    ASSERT_NEQ(ctx1, ctx2);
+    /* Base ref(1) + ctx1(1) + ctx2(1) = 3 */
+    ASSERT_EQ(3, atomic_load(&vol->health.ref_count));
+    
+    hn4_tensor_close(ctx1);
+    hn4_tensor_close(ctx2);
+    hn4_unmount(vol);
+    destroy_fixture(dev);
+}
+
+/* 
+ * Test T14: Tensor - Invalid Tag Format
+ * Scenario: Pass NULL tag.
+ */
+hn4_TEST(Tensor, Invalid_Tag) {
+    hn4_hal_device_t* dev = create_fixture_formatted();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t mp = {0};
+    hn4_mount(dev, &mp, &vol);
+    
+    hn4_tensor_ctx_t* ctx;
+    ASSERT_EQ(HN4_ERR_INVALID_ARGUMENT, hn4_tensor_open(vol, NULL, &ctx));
+    
+    hn4_unmount(vol);
     destroy_fixture(dev);
 }

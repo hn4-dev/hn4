@@ -466,11 +466,9 @@ static inline uint8_t* _tcc_write_varint(uint8_t* p, const uint8_t* oend, uint32
 /* LEXICON: Scan Only (Read-Only, O(1)) */
 static int _tcc_scan_lexicon(const uint8_t* ip, const uint8_t* iend) {
     size_t avail = (size_t)(iend - ip);
-    
-    /* Bug #24: Filter out lexicon entries shorter than 4 in scan to save CPU */
+
     if (avail < 4) return -1;
 
-    /* Bug #1: Heuristic bucket filter (Fast Fail) */
     /* Checks first char against common buckets in _hn4_lexicon_table */
     uint8_t c = ip[0];
     switch (c) {
@@ -480,6 +478,7 @@ static int _tcc_scan_lexicon(const uint8_t* ip, const uint8_t* iend) {
         case '0': case '\\': case 'F':          /* Numeric/Binary */
         case 'd': case 'r': case 'e': case 'i': /* misc */
         case 'p': case 'a': case 'j': case 'b': /* misc */
+        case ' ': case '1': case 'w': case 'm': /* misc */
             break; 
         default: 
             return -1;
@@ -519,12 +518,10 @@ static uint32_t _tcc_scan_manifold(const uint8_t* ip, const uint8_t* iend, uint3
     
     for (uint32_t i = stride; i < check; i++) {
         uint8_t pred = (ip[i-1] + ip[i-stride]) >> 1;
-        /* Bug #25: Use int for deterministic subtraction */
         int delta = (int)ip[i] - (int)pred;
         if (delta >= -4 && delta <= 4) score++;
     }
     
-    /* Bug #13: Stricter threshold (75%) to prevent false positives on random data */
     if (score < (int)((check * 3) / 4)) return 0;
     
     /* Calculate actual run length */
@@ -532,13 +529,14 @@ static uint32_t _tcc_scan_manifold(const uint8_t* ip, const uint8_t* iend, uint3
     const uint32_t MAX_LOOKAHEAD = 256; 
     uint32_t limit = (avail > MAX_LOOKAHEAD) ? MAX_LOOKAHEAD : (uint32_t)avail;
 
-    for (; len < limit; len++) {
-        if (len + 4 < limit) {
-            uint32_t val;
-            memcpy(&val, ip + len, 4);
-            if (val == 0) break;
-        }
-    }
+   for (; len < limit; len++) {
+    /* Safety: Ensure we have 4 bytes remaining relative to IP */
+    if (len + 4 > (uint32_t)avail) break;
+
+    uint32_t val;
+    memcpy(&val, ip + len, 4);
+    if (val == 0) break;
+}
     
     return len;
 }
