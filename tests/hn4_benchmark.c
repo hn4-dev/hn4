@@ -318,40 +318,40 @@ static void _bench_read_atomic(void) {
     printf("[Read] Reading %d blocks (x%d passes) with memcmp...\n", WRITE_COUNT, READ_ITERS);
     
     double start = _get_time_sec();
-    int success_cnt = 0;
-    
-    /* Prevent compiler from optimizing out the loop or the result */
-    volatile int total_valid = 0;
 
-    for (int pass = 0; pass < READ_ITERS; pass++) {
-        for (int i = 0; i < WRITE_COUNT; i++) {
-            /* 
-             * Sync Generation for Read Test:
-             * Writes incremented anchor gen to i+2 (1 init + 1 next).
-             * We must use a temp anchor with matching gen to pass verification.
-             */
-            hn4_anchor_t temp_anchor = anchor;
-            temp_anchor.write_gen = hn4_cpu_to_le32(i + 2);
+int op_cnt = 0;
+int success_cnt = 0;
+volatile int total_valid = 0;
 
-            hn4_result_t res = hn4_read_block_atomic(vol, &temp_anchor, i, read_buf, payload_len, 0);
-            
-            if (HN4_LIKELY(res == HN4_OK)) {
-                if (memcmp(read_buf, payload, payload_len) == 0) success_cnt++;
-                else if (i==0) printf("!! Data Mismatch Block 0\n");
-            } else if (i==0 && pass==0) {
-                printf("!! Read Failed Block 0: %d\n", res);
-            }
+for (int pass = 0; pass < READ_ITERS; pass++) {
+    for (int i = 0; i < WRITE_COUNT; i++) {
+
+        hn4_anchor_t temp_anchor = anchor;
+        temp_anchor.write_gen = hn4_cpu_to_le32(1);   // ✅ match actual write gen
+
+        hn4_result_t res = hn4_read_block_atomic(vol, &temp_anchor, i,
+                                                 read_buf, payload_len, 0);
+
+        op_cnt++;                                    // ✅ count every read
+
+        if (res == HN4_OK) {
+            if (memcmp(read_buf, payload, payload_len) == 0)
+                success_cnt++;                       // integrity counter only
         }
     }
-    
-    total_valid = success_cnt; (void)total_valid;
+}
 
-    double end = _get_time_sec();
-    double d = HN4_SAFE_DURATION(end - start);
-    double mb_sec = HN4_SAFE_DIV((double)success_cnt * payload_len, 1024.0 * 1024.0) / d;
+total_valid = success_cnt;
 
-    printf("[Read] Time: %.6f sec | IOPS: %.0f | BW: %.2f MB/s\n", 
-           d, HN4_SAFE_DIV(success_cnt, d), mb_sec);
+double end = _get_time_sec();
+double d = HN4_SAFE_DURATION(end - start);
+
+double iops = HN4_SAFE_DIV(op_cnt, d);
+double bw   = HN4_SAFE_DIV((double)op_cnt * payload_len,
+                           1024.0 * 1024.0) / d;
+
+printf("[Read] Time: %.6f sec | IOPS: %.0f | BW: %.2f MB/s | OK: %d/%d\n",
+       d, iops, bw, success_cnt, op_cnt);
 
     hn4_hal_mem_free(payload);
     hn4_hal_mem_free(read_buf);
@@ -494,11 +494,19 @@ static void _bench_tensor_scatter(void) {
 
     double start = _get_time_sec();
     int success_cnt = 0;
-    uint64_t lfsr = 0xACE1u;
+    
+    /* FIX: Replaced 16-bit LFSR with 64-bit Xorshift to cover full memory range */
+    uint64_t rng_state = 0xACE1u; 
 
     for (int i = 0; i < READ_OPS; i++) {
-        lfsr = (lfsr >> 1) ^ (-(lfsr & 1u) & 0xB400u);
-        uint64_t offset = lfsr % (global_acc - BS);
+        /* Xorshift64 */
+        rng_state ^= rng_state << 13;
+        rng_state ^= rng_state >> 7;
+        rng_state ^= rng_state << 17;
+        
+        /* Modulo against the full 64MB size */
+        uint64_t offset = rng_state % (global_acc - BS);
+        
         hn4_result_t res = hn4_tensor_read(ctx, offset, buf, BS);
         /* Expect failures since data isn't written, checking logic overhead */
         if (res == HN4_OK || res == HN4_ERR_HEADER_ROT || res == HN4_ERR_PHANTOM_BLOCK) success_cnt++;
@@ -602,6 +610,383 @@ static void _bench_namespace_lookup(void) {
 }
 
 /* =========================================================================
+ * BENCHMARK 8: SCAVENGER STRESS
+ * ========================================================================= */
+static void _bench_scavenger_stress(void) {
+    const int ANCHOR_COUNT = 100000;
+    const int TOMBSTONE_RATIO = 20; /* 20% Tombstones */
+    
+    /* Create mock volume with only RAM Cortex */
+    hn4_volume_t* vol = _bench_create_mock_vol(4096, 1ULL << 30);
+    if (!vol) return;
+
+    size_t cortex_sz = ANCHOR_COUNT * sizeof(hn4_anchor_t);
+    vol->nano_cortex = hn4_hal_mem_alloc(cortex_sz);
+    if (!vol->nano_cortex) {
+        _bench_destroy_mock_vol(vol);
+        _bench_free_ram_disk();
+        return;
+    }
+    vol->cortex_size = cortex_sz;
+    
+    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+    hn4_time_t now = hn4_hal_get_time_ns();
+
+    /* Populate Cortex */
+    int dead_cnt = 0;
+    for (int i = 0; i < ANCHOR_COUNT; i++) {
+        anchors[i].seed_id.lo = i + 1;
+        anchors[i].write_gen = hn4_cpu_to_le32(1);
+        
+        if ((i % 100) < TOMBSTONE_RATIO) {
+            /* Mark as Dead, expired grace period */
+            uint64_t dclass = HN4_FLAG_TOMBSTONE | HN4_FLAG_VALID;
+            anchors[i].data_class = hn4_cpu_to_le64(dclass);
+            anchors[i].mod_clock = hn4_cpu_to_le64(now - (25ULL * 3600 * 1000000000)); /* 25h ago */
+            dead_cnt++;
+        } else {
+            /* Live */
+            anchors[i].data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+        }
+    }
+
+    printf("[Scavenger] Scanning %d anchors (%d%% Tombstones)...\n", ANCHOR_COUNT, TOMBSTONE_RATIO);
+    
+    /* 
+     * FIX: Calculate pulses needed to cover cortex exactly once per pass.
+     * Scavenger scans 64 items per pulse.
+     */
+    int pulses_per_pass = (ANCHOR_COUNT + 63) / 64;
+
+    double start = _get_time_sec();
+    
+    /* Run 100 full passes to get stable timing */
+    int passes = 100;
+    for (int p = 0; p < passes; p++) {
+        /* Reset cursor to start for consistent linear scan simulation */
+        vol->alloc.scavenger_cursor = 0;
+        
+        /* 
+         * FIX: Use fixed count loop instead of checking cursor < COUNT,
+         * because cursor wraps around via modulo arithmetic in the driver.
+         */
+        for (int k = 0; k < pulses_per_pass; k++) {
+            hn4_scavenger_pulse(vol);
+        }
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    
+    /* Total anchors scanned = Count * Passes */
+    double total_scanned = (double)ANCHOR_COUNT * passes;
+    
+    printf("[Scavenger] Time: %.6f sec | Scan Rate: %.2f M-Anchors/sec\n", 
+           d, total_scanned / d / 1e6);
+
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* =========================================================================
+ * BENCHMARK 11: EPOCH ROTATION
+ * ========================================================================= */
+static void _bench_epoch_rotation(void) {
+    const int ROTATIONS = 10000;
+    const uint32_t BS = 4096;
+    /* Reduce to 128MB to be safe on RAM */
+    hn4_volume_t* vol = _bench_create_mock_vol(BS, 128ULL * 1024 * 1024);
+    if (!vol) return;
+
+    /* 
+     * FIX: Geometry Calculation for 4Kn Sectors.
+     * Mock HAL SS = 4096. BS = 4096. Ratio = 1.
+     */
+    uint64_t ring_start_blk = 100;
+    uint32_t ss = 4096;
+    uint32_t spb = BS / ss; /* 1 */
+    
+    vol->sb.info.lba_epoch_start = hn4_lba_from_blocks(ring_start_blk * spb);
+    vol->sb.info.epoch_ring_block_idx = hn4_addr_from_u64(ring_start_blk); 
+    vol->sb.info.copy_generation = 1;
+
+    /* Zero the ring region */
+    uint8_t* zeros = hn4_hal_mem_alloc(BS * 256);
+    if (zeros) {
+        memset(zeros, 0, BS * 256);
+        /* length in sectors */
+        hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, vol->sb.info.lba_epoch_start, zeros, (BS * 256) / ss);
+        hn4_hal_mem_free(zeros);
+    }
+
+    printf("[Epoch] Performing %d ring rotations...\n", ROTATIONS);
+    
+    double start = _get_time_sec();
+    
+    int success_cnt = 0;
+    for (int i = 0; i < ROTATIONS; i++) {
+        uint64_t new_id = 0;
+        hn4_addr_t new_ptr;
+        
+        hn4_result_t res = hn4_epoch_advance(
+            vol->target_device, 
+            &vol->sb, 
+            false,
+            &new_id, 
+            &new_ptr
+        );
+        
+        if (HN4_LIKELY(res == HN4_OK)) {
+            vol->sb.info.current_epoch_id = new_id;
+            vol->sb.info.epoch_ring_block_idx = new_ptr;
+            success_cnt++;
+        } else {
+            printf("!! Epoch Fail %d: %d\n", i, res);
+            break;
+        }
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    printf("[Epoch] Time: %.6f sec | Rate: %.2f K-Rotations/sec\n", d, (double)success_cnt / d / 1e3);
+
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+
+
+/* =========================================================================
+ * BENCHMARK 9: SWIZZLE MATH THROUGHPUT
+ * ========================================================================= */
+static void _bench_swizzle_throughput(void) {
+    const int ITERATIONS = 10000000;
+    
+    hn4_volume_t* vol = _bench_create_mock_vol(4096, 1ULL << 30);
+    if (!vol) return;
+
+    /* Setup Physics Constants */
+    uint64_t G = 1000;
+    uint64_t V = 0x1234567890ABCDEF;
+    uint16_t M = 0; /* 4KB Scale */
+    
+    printf("[Swizzle] Computing %d ballistic trajectories...\n", ITERATIONS);
+    
+    double start = _get_time_sec();
+    
+    volatile uint64_t sink = 0;
+    for (int i = 0; i < ITERATIONS; i++) {
+        /* 
+         * Simulate typical collision pattern:
+         * 90% k=0, 10% k=1..3
+         */
+        uint8_t k = (i % 10 == 0) ? (i % 4) : 0;
+        
+        /* Calc LBA for Block Index 'i' */
+        uint64_t lba = _calc_trajectory_lba(vol, G, V, i, M, k);
+        sink ^= lba;
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    
+    printf("[Swizzle] Time: %.6f sec | Rate: %.2f M-Calcs/sec\n", 
+           d, (double)ITERATIONS / d / 1e6);
+           
+    (void)sink;
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* =========================================================================
+ * BENCHMARK 10: CHRONICLE BURST
+ * ========================================================================= */
+static void _bench_chronicle_burst(void) {
+    const int EVENTS = 20000;
+    const uint32_t BS = 4096;
+    
+    hn4_volume_t* vol = _bench_create_mock_vol(BS, 128ULL * 1024 * 1024);
+    if (!vol) return;
+
+    /* Setup pointers */
+    vol->sb.info.journal_start = hn4_lba_from_blocks(1000);
+    vol->sb.info.journal_ptr = vol->sb.info.journal_start; 
+    vol->sb.info.lba_horizon_start = hn4_lba_from_blocks(20000); 
+    vol->sb.info.last_journal_seq = 0;
+
+    /* [FIX] Ensure SB Capacity is set for wrap-around calc */
+#ifdef HN4_USE_128BIT
+    vol->sb.info.total_capacity.lo = 128ULL * 1024 * 1024;
+#else
+    vol->sb.info.total_capacity = 128ULL * 1024 * 1024;
+#endif
+
+    /* Zero the journal area */
+    uint32_t journal_sz = 1024 * BS; 
+    uint8_t* zeros = hn4_hal_mem_alloc(journal_sz);
+    if (zeros) {
+        memset(zeros, 0, journal_sz);
+        hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, vol->sb.info.journal_start, zeros, journal_sz / 4096);
+        hn4_hal_mem_free(zeros);
+    }
+
+    printf("[Chronicle] Appending %d audit events...\n", EVENTS);
+    
+    double start = _get_time_sec();
+    int success_cnt = 0;
+
+    for (int i = 0; i < EVENTS; i++) {
+        hn4_result_t res = hn4_chronicle_append(
+            vol->target_device, 
+            vol, 
+            HN4_CHRONICLE_OP_SNAPSHOT,
+            hn4_lba_from_blocks(i), 
+            hn4_lba_from_blocks(i+1), 
+            0xCAFEBABE
+        );
+        
+        if (HN4_UNLIKELY(res != HN4_OK)) {
+            printf("!! Chronicle Fail %d: %d\n", i, res);
+            break;
+        }
+        success_cnt++;
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    printf("[Chronicle] Time: %.6f sec | Rate: %.2f K-Events/sec\n", d, (double)success_cnt / d / 1e3);
+
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* =========================================================================
+ * BENCHMARK 12: SHADOW HOP LATENCY
+ * ========================================================================= */
+static void _bench_shadow_hop(void) {
+    const int OPS = 50000;
+    const uint32_t BS = 4096;
+    
+    hn4_volume_t* vol = _bench_create_mock_vol(BS, 128ULL * 1024 * 1024);
+    if (!vol) return;
+
+    /* Setup Anchor */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 1;
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_SOVEREIGN);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    /* Setup Data */
+    uint8_t* buf = hn4_hal_mem_alloc(BS);
+    memset(buf, 0xAA, BS);
+    uint32_t payload_len = HN4_BLOCK_PayloadSize(BS);
+
+    printf("[Shadow] Performing %d atomic overwrites (Shadow Hops)...\n", OPS);
+    
+    double start = _get_time_sec();
+    
+    for (int i = 0; i < OPS; i++) {
+        /* Write to Block 0 repeatedly. Each write triggers a new allocation (Hop). */
+        hn4_result_t res = hn4_write_block_atomic(
+            vol, &anchor, 0, buf, payload_len, 0
+        );
+        
+        if (res != HN4_OK) {
+            printf("!! Shadow Hop Fail %d: %d\n", i, res);
+            break;
+        }
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    
+    printf("[Shadow] Time: %.6f sec | Rate: %.2f K-Hops/sec | Latency: %.2f us\n", 
+           d, (double)OPS / d / 1e3, (d / OPS) * 1e6);
+
+    hn4_hal_mem_free(buf);
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* =========================================================================
+ * BENCHMARK 13: METADATA SCAN RATE
+ * ========================================================================= */
+static void _bench_metadata_scan(void) {
+    const int ANCHORS = 500000;
+    
+    hn4_volume_t* vol = _bench_create_mock_vol(4096, 1ULL << 30);
+    if (!vol) return;
+
+    size_t ctx_size = ANCHORS * sizeof(hn4_anchor_t);
+    vol->nano_cortex = hn4_hal_mem_alloc(ctx_size);
+    vol->cortex_size = ctx_size;
+    
+    hn4_anchor_t* arr = (hn4_anchor_t*)vol->nano_cortex;
+    
+    /* Populate with mixed data */
+    for(int i=0; i<ANCHORS; i++) {
+        arr[i].seed_id.lo = i;
+        if (i % 2 == 0) arr[i].data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+        else arr[i].data_class = hn4_cpu_to_le64(HN4_FLAG_TOMBSTONE | HN4_FLAG_VALID);
+    }
+
+    printf("[Meta] Scanning %d anchors for Tombstones (linear memory sweep)...\n", ANCHORS);
+    
+    double start = _get_time_sec();
+    
+    volatile int count = 0;
+    /* Run 100 passes to heat cache and measure raw throughput */
+    for(int k=0; k<100; k++) {
+        for(int i=0; i<ANCHORS; i++) {
+            if (hn4_le64_to_cpu(arr[i].data_class) & HN4_FLAG_TOMBSTONE) {
+                count++;
+            }
+        }
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    double total_items = (double)ANCHORS * 100;
+    
+    printf("[Meta] Time: %.6f sec | Rate: %.2f M-Anchors/sec\n", 
+           d, total_items / d / 1e6);
+
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* =========================================================================
+ * BENCHMARK 14: CRC THROUGHPUT
+ * ========================================================================= */
+static void _bench_crc_throughput(void) {
+    const size_t BUF_SIZE = 16 * 1024 * 1024; /* 16 MB Buffer */
+    const int ITERATIONS = 100;
+    
+    uint8_t* buf = hn4_hal_mem_alloc(BUF_SIZE);
+    if (!buf) return;
+    
+    /* Fill with random data to prevent zero-optimization bias */
+    for(size_t i=0; i<BUF_SIZE; i+=8) {
+        *(uint64_t*)(buf + i) = hn4_hal_get_random_u64();
+    }
+
+    printf("[CRC] Hashing %zu MB buffer x %d iterations...\n", BUF_SIZE / (1024*1024), ITERATIONS);
+    
+    double start = _get_time_sec();
+    volatile uint32_t sink = 0;
+    
+    for(int i=0; i<ITERATIONS; i++) {
+        sink ^= hn4_crc32(0, buf, BUF_SIZE);
+    }
+    
+    double d = HN4_SAFE_DURATION(_get_time_sec() - start);
+    double total_bytes = (double)BUF_SIZE * ITERATIONS;
+    double gb_sec = (total_bytes / d) / (1024.0 * 1024.0 * 1024.0);
+    
+    printf("[CRC] Time: %.6f sec | Throughput: %.2f GB/s\n", d, gb_sec);
+    
+    hn4_hal_mem_free(buf);
+}
+
+
+
+
+/* =========================================================================
  * REGISTRY
  * ========================================================================= */
 
@@ -615,11 +1000,18 @@ typedef struct {
 static benchmark_entry_t REGISTRY[] = {
     { "allocator_ballistic", _bench_allocator_ballistic },
     { "write_atomic",        _bench_write_atomic },
-    { "read_atomic",         _bench_read_atomic },
+    { "write_read_atomic",         _bench_read_atomic },
     { "mount_cycle",         _bench_mount_cycle },
     { "tensor_scatter",      _bench_tensor_scatter },
     { "compression_tcc",     _bench_compression_tcc },
     { "namespace_lookup",    _bench_namespace_lookup },
+    { "epoch_rotation",      _bench_epoch_rotation },
+    { "scavenger_stress",    _bench_scavenger_stress },
+    { "swizzle_throughput",  _bench_swizzle_throughput },
+    { "chronicle_burst",     _bench_chronicle_burst },
+    { "shadow_hop_latency",  _bench_shadow_hop },
+    { "metadata_scan",       _bench_metadata_scan },
+    { "crc_throughput",      _bench_crc_throughput },
     { NULL, NULL }
 };
 

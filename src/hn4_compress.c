@@ -2,7 +2,7 @@
     * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
     * MODULE:      Ballistic Tensor-Core Engine (TCC)
     * SOURCE:      hn4_compress.c
-    * STATUS:      FIXED / HARDENED (v60.3)
+    * STATUS:      HARDENED (v60.3)
     * AUTHOR:      Core Engineering - Storage Virtualization Group
     * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
     *
@@ -52,14 +52,11 @@
     */
     #define HN4_BLOCK_LIMIT         (1UL << 30) 
 
-    /* Wire Format Opcodes */
     #define HN4_OP_LITERAL          0x00
     #define HN4_OP_ISOTOPE          0x40
     #define HN4_OP_GRADIENT         0x80
-    #define HN4_OP_RESERVED         0xC0
-    #define HN4_OP_LITERAL          0x00
-    #define HN4_OP_ISOTOPE          0x40
-    #define HN4_OP_GRADIENT         0x80
+    #define HN4_TSM_GRANULARITY     4    /* 4 bytes (uint32_t) per bit */
+    #define HN4_TSM_MIN_SAVINGS     4    /* Minimum bytes saved to justify op */
     #define HN4_OP_BITMASK          0xC0 /* Tensor Sparse Mask */
     #define HN4_OP_MASK             0xC0
     #define HN4_LEN_MASK            0x3F
@@ -81,7 +78,6 @@
     * Note: A remainder byte of 255 would constitute a 33rd extension, which is illegal.
     * Therefore, 8223 is the strict mathematical limit of this header format.
     * 
-    * FIX 1: Removed erroneous "+ 254" double count.
     */
     #define HN4_VARINT_MAX_BYTES    32
     #define HN4_MAX_HEADER_SIZE     (1 + HN4_VARINT_MAX_BYTES + 1)
@@ -89,6 +85,48 @@
 
     /* Error Sentinels */
     #define HN4_SIZE_INVALID        SIZE_MAX
+
+    /* --- EXTENSION PROTOCOL (HN4 v61.0) --- */
+    #define HN4_EXT_ESCAPE          0x00 
+    #define HN4_EXT_OP_LEXICON      0x01
+    #define HN4_EXT_OP_MANIFOLD     0x02
+
+typedef struct {
+    const char* str;
+    size_t      len;
+} hn4_lexicon_entry_t;
+
+/* Optimized Table (Pre-calculated lengths) */
+#define HN4_LEXICON_COUNT 64
+
+static const hn4_lexicon_entry_t _hn4_lexicon_table[HN4_LEXICON_COUNT] = {
+    /* --- TIER 0: Structural --- */
+    { "{\"id\":", 6 },       { "http://", 7 },        { "https://", 8 },       { "error", 5 },
+    { "false", 5 },          { "true", 4 },           { "null", 4 },           { "value", 5 },
+    { "timestamp", 9 },      { " <div class=\"", 13 },{ "background", 10 },    { "function", 8 },
+    { "return", 6 },         { "success", 7 },        { "jsonrpc", 7 },        { "application", 11 },
+
+    /* --- TIER 1: JSON & API Metadata --- */
+    { "\":\"", 3 },          { "\",\"", 3 },          { "{\"name\":", 8 },     { "{\"type\":", 8 },
+    { "content-type", 12 },  { "authorization", 13 }, { "bearer ", 7 },        { "user-agent", 10 },
+    { "response", 8 },       { "status", 6 },         { "message", 7 },        { "token", 5 },
+    { "created_at", 10 },    { "updated_at", 10 },    { "const ", 6 },         { "struct ", 7 },
+
+    /* --- TIER 2: Systems & Logs --- */
+    { "localhost", 9 },      { "127.0.0.1", 9 },      { "192.168.", 8 },       { "[INFO] ", 7 },
+    { "[WARN] ", 7 },        { "[ERROR] ", 8 },       { "[DEBUG] ", 8 },       { "exception", 9 },
+    { "stacktrace", 10 },    { "undefined", 9 },      { "timeout", 7 },        { "connection", 10 },
+    { "database", 8 },       { "server", 6 },         { "client", 6 },         { "password", 8 },
+
+    /* --- TIER 3: Binary & Code Artifacts (Moved Numerics Here) --- */
+    { "00000000", 8 },       { "ffffff", 6 },         { "0000000000000000", 16 }, { "FFFFFFFFFFFFFFFF", 16 },
+    { "\\u00", 4 },          { "0x", 2 },             { "class ", 6 },         { "import ", 7 },
+    { "public ", 7 },        { "private ", 8 },       { "void ", 5 },          { "string", 6 },
+    { "uint64_t", 8 },       { "uint32_t", 8 },       { "<tbody>", 7 },        { "</span>", 7 }
+};
+
+_Static_assert(sizeof(_hn4_lexicon_table) / sizeof(hn4_lexicon_entry_t) == HN4_LEXICON_COUNT, 
+               "HN4: Lexicon table size mismatch");
 
     /* =========================================================================
     * 1. LOW-LEVEL INTRINSICS & OPTIMIZATIONS
@@ -155,58 +193,58 @@
     * Prevents cache pollution when writing to persistent memory (DAX/pmem).
     */
     static void _hn4_nvm_stream_copy(void* dst, const void* src, size_t len) {
-        uint8_t* d = (uint8_t*)dst;
-        const uint8_t* s = (const uint8_t*)src;
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
 
-        /* 
-        * FIX 1: Relative Alignment Check
-        * If src and dst are misaligned relative to each other (e.g. dst is 0x10, src is 0x11),
-        * aligning dst will make src unaligned. In this case, SIMD helps less or risks faults.
-        * Fallback to optimized memcpy/clflush logic or handle strictly.
-        */
-        if ((((uintptr_t)d ^ (uintptr_t)s) & 15) != 0) {
-            /* Misaligned relative streams - fallback to safe copy */
-            memcpy(dst, src, len);
-            hn4_hal_nvm_persist(dst, len); /* Use HAL fence instead of stream store */
-            return;
-        }
-
-        /* Align destination (Source will naturally align due to check above) */
-       /* 
-     * Relative Alignment Check
-     * Check if src and dst have the SAME offset relative to 16-byte alignment.
-     * If they differ (XOR & 15 != 0), aligning 'd' will misalign 's'.
-     * In that case, we cannot use aligned load intrinsics.
+    /* 
+     * RELATIVE ALIGNMENT CHECK
+     * If the offset of dst from a 16-byte boundary differs from src,
+     * we cannot align both simultaneously. Fallback to standard copy.
      */
     if ((((uintptr_t)d ^ (uintptr_t)s) & 15) != 0) {
-        /* Fallback: Standard copy + Persistent Commit */
-        memmove(dst, src, len);
+        memcpy(dst, src, len);
         hn4_hal_nvm_persist(dst, len);
         return;
     }
 
-    /* Align destination (Source will naturally align due to relative check above) */
+    /* Align destination (and source implicitly via relative check) */
     while (((uintptr_t)d & 15) && len > 0) {
         *d++ = *s++;
         len--;
     }
 
-    /* Stream main body */
+    /* Stream main body using Non-Temporal Stores */
     while (len >= 16) {
-        /* NOW safe to use aligned load because we verified relative offset */
+        /* Safe: Relative check + dst alignment loop guarantees s is aligned */
         __m128i val = _mm_load_si128((const __m128i*)s); 
         _mm_stream_si128((__m128i*)d, val);
         s += 16;
         d += 16;
         len -= 16;
     }
-        
-        /* Tail */
-        while (len > 0) {
-            *d++ = *s++;
-            len--;
-        }
+
+    /* 
+     * FENCE: Ensure all WC (Write-Combining) buffers are drained 
+     * before we issue the persistence barrier on the tail. 
+     */
+    #if defined(__x86_64__) || defined(_M_X64)
+    _mm_sfence();
+    #endif
+
+    /* Handle Tail */
+    while (len > 0) {
+        *d++ = *s++;
+        len--;
     }
+    
+    /* 
+     * Final Persistence Barrier 
+     * Note: _mm_stream writes bypass cache, but we still ensure 
+     * durability of the unaligned head/tail bytes.
+     */
+    hn4_hal_nvm_persist(dst, (size_t)(d - (uint8_t*)dst));
+}
+
 
 
     /* =========================================================================
@@ -217,11 +255,9 @@
      * _tcc_write_token
      * Calculates size and emits token if buffer has space.
      * 
-     * FIX 3: Validates count against HN4_MAX_TOKEN_LEN.
      */
     static inline uint8_t* _tcc_write_token(uint8_t* p, const uint8_t* oend, uint8_t tag, uint32_t count) 
     {
-        /* FIX 3: Grammar limit check */
         if (HN4_UNLIKELY(count > HN4_MAX_TOKEN_LEN)) return NULL;
 
         tag &= HN4_OP_MASK;
@@ -268,196 +304,474 @@
     * 3. COMPRESSION ENGINE (ENCODER)
     * ========================================================================= */
 
+    
+    /*
+ * _tcc_attempt_bitmask
+ * Scans for sparse data patterns.
+ * Returns bytes consumed from src if successful, or 0 if failed/inefficient.
+ *
+ * Layout on Wire:
+ * [Token Header (Len)] [Bitmask (Len/32 bytes)] [Compacted Data...]
+ */
+static uint32_t _tcc_attempt_bitmask(
+    uint8_t** op_ptr, const uint8_t* oend,
+    const uint8_t* ip, const uint8_t* iend
+) 
+{
+    if (((uintptr_t)ip & 3) != 0) return 0;
+
+    size_t avail = (size_t)(iend - ip);
+    size_t max_scan = avail & ~(HN4_TSM_GRANULARITY - 1);
+    
+    if (max_scan > HN4_MAX_TOKEN_LEN) {
+        max_scan = HN4_MAX_TOKEN_LEN & ~(HN4_TSM_GRANULARITY - 1);
+    }
+    
+    if (max_scan < 32) return 0;
+
+    /* PASS 1: Analysis */
+    uint32_t non_zero_words = 0;
+    uint32_t total_words = (uint32_t)(max_scan / HN4_TSM_GRANULARITY);
+    
+    /* 
+     * Optimization: Use aligned access. 
+     * Caller guarantees ip is 4-byte aligned via `((uintptr_t)ip & 3) == 0`.
+     */
+    const uint32_t* word_ptr = (const uint32_t*)ip;
+    
+    for (uint32_t i = 0; i < total_words; i++) {
+        if (word_ptr[i] != 0) non_zero_words++;
+    }
+    
+    /* 
+     * Profitability Logic (Relaxed):
+     * Previous 3:1 density requirement (non_zero * 4 < total) was too aggressive.
+     * We revert to a safer check: Ensure we aren't expanding or barely breaking even.
+     * We require non-zero words to be less than 87.5% of total to ensure *some* sparsity.
+     */
+    if (non_zero_words * 8 > total_words * 7) return 0;
+
+    /* Calculate Header Size */
+    uint32_t header_sz = 1;
+    if (max_scan >= HN4_LEN_MASK) {
+        uint32_t temp = (uint32_t)max_scan - HN4_LEN_MASK;
+        while (temp >= HN4_VARINT_MARKER) {
+            header_sz++;
+            temp -= HN4_VARINT_MARKER;
+        }
+        header_sz++; /* Remainder byte */
+    }
+
+    uint32_t mask_bytes = (total_words + 7) / 8;
+    uint32_t data_bytes = non_zero_words * HN4_TSM_GRANULARITY;
+    uint32_t total_out  = header_sz + mask_bytes + data_bytes;
+    
+    /* Strict savings check: Must save at least 4 bytes to justify opcode switch */
+    if (total_out >= max_scan || (max_scan - total_out) < 4) return 0;
+
+    /* Emit */
+    uint8_t* op = *op_ptr;
+    if ((op + total_out) > oend) return 0;
+
+    op = _tcc_write_token(op, oend, HN4_OP_BITMASK, (uint32_t)max_scan);
+    if (!op) return 0;
+    
+    uint8_t* mask_out = op;
+    uint8_t* data_out = op + mask_bytes;
+    
+    memset(mask_out, 0, mask_bytes);
+    
+    /* PASS 2: Encoding */
+    for (uint32_t i = 0; i < total_words; i++) {
+        uint32_t val = word_ptr[i];
+        
+        if (val != 0) {
+            mask_out[i / 8] |= (1 << (i % 8));
+            memcpy(data_out, ip + (i * 4), 4);
+            data_out += 4;
+        }
+    }
+
+    *op_ptr = data_out;
+    return (uint32_t)max_scan;
+}
+
+
     /**
      * _flush_literal_buffer
      * Flushes pending literals.
      * Handles NVM Optimization if hw_flags & HN4_HW_NVM is set.
      */
     static inline hn4_result_t _flush_literal_buffer(
-        uint8_t** op_ptr, const uint8_t* oend, 
-        const uint8_t* lit_start, size_t lit_len,
-        uint64_t hw_flags
-    ) {
-        if (lit_len == 0) return HN4_OK;
+    uint8_t** op_ptr, const uint8_t* oend, 
+    const uint8_t* lit_start, size_t lit_len,
+    uint64_t hw_flags
+) {
+    if (lit_len == 0) return HN4_OK;
+    if (lit_len > UINT32_MAX) return HN4_ERR_INVALID_ARGUMENT;
+
+    uint8_t* op = *op_ptr;
+    
+    /* 
+     * SAFETY CONTRACT: 
+     * Caller must ensure [lit_start, lit_len] does not overlap with [op, op+lit_len].
+     * TCC design separates Source and Dest buffers entirely.
+     */
+#ifdef HN4_DEBUG
+    if ((lit_start >= op && lit_start < op + lit_len) ||
+        (op >= lit_start && op < lit_start + lit_len)) {
+        return HN4_ERR_INTERNAL_FAULT; /* Overlap detected */
+    }
+#endif
+
+    uint32_t len = (uint32_t)lit_len;
+
+    while (len > 0) {
+        uint32_t chunk = (len > HN4_MAX_TOKEN_LEN) ? HN4_MAX_TOKEN_LEN : len;
         
-        /* Explicit check against 4GB limit for API safety */
-        if (lit_len > UINT32_MAX) return HN4_ERR_INVALID_ARGUMENT;
-
-        uint8_t* op = *op_ptr;
-        uint32_t len = (uint32_t)lit_len;
-
-        while (len > 0) {
-            /* Chunk clamped to correct MAX_TOKEN_LEN (8223) */
-            uint32_t chunk = (len > HN4_MAX_TOKEN_LEN) ? HN4_MAX_TOKEN_LEN : len;
-            
-            /* Emit Header */
-            uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_LITERAL, chunk);
-            if (!next_op) return HN4_ERR_ENOSPC;
-            
-            /* Check Data Space */
-            if ((size_t)(oend - next_op) < chunk) return HN4_ERR_ENOSPC;
-            
-            op = next_op;
-            
-            /* HW_NVM check determines copy strategy (Standard vs Stream) */
-            if (HN4_UNLIKELY(hw_flags & HN4_HW_NVM)) {
-                _hn4_nvm_stream_copy(op, lit_start, chunk);
-            } else {
-                memmove(op, lit_start, chunk);
-            }
-            
-            op += chunk;
-            lit_start += chunk;
-            len -= chunk;
+        uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_LITERAL, chunk);
+        if (!next_op) return HN4_ERR_ENOSPC;
+        
+        if ((size_t)(oend - next_op) < chunk) return HN4_ERR_ENOSPC;
+        
+        op = next_op;
+        
+        if (HN4_UNLIKELY(hw_flags & HN4_HW_NVM)) {
+            _hn4_nvm_stream_copy(op, lit_start, chunk);
+        } else {
+            memcpy(op, lit_start, chunk);
         }
+        
+        op += chunk;
+        lit_start += chunk;
+        len -= chunk;
+    }
 
-        *op_ptr = op;
+    *op_ptr = op;
+    return HN4_OK;
+}
+
+/* Helper: Write Raw VarInt (For Extended Ops) */
+static inline uint8_t* _tcc_write_varint(uint8_t* p, const uint8_t* oend, uint32_t val) {
+    while (val >= HN4_VARINT_MARKER) {
+        if (p >= oend) return NULL;
+        *p++ = HN4_VARINT_MARKER;
+        val -= HN4_VARINT_MARKER;
+    }
+    if (p >= oend) return NULL;
+    *p++ = (uint8_t)val;
+    return p;
+}
+
+/* LEXICON: Scan Only (Read-Only, O(1)) */
+static int _tcc_scan_lexicon(const uint8_t* ip, const uint8_t* iend) {
+    size_t avail = (size_t)(iend - ip);
+    
+    /* Bug #24: Filter out lexicon entries shorter than 4 in scan to save CPU */
+    if (avail < 4) return -1;
+
+    /* Bug #1: Heuristic bucket filter (Fast Fail) */
+    /* Checks first char against common buckets in _hn4_lexicon_table */
+    uint8_t c = ip[0];
+    switch (c) {
+        case '"': case '<': case '{': case '[': /* Structural */
+        case 'h': case 'c': case 'u': case 's': /* Common Keywords */
+        case 'f': case 't': case 'n': case 'v': /* JSON bools/null */
+        case '0': case '\\': case 'F':          /* Numeric/Binary */
+        case 'd': case 'r': case 'e': case 'i': /* misc */
+        case 'p': case 'a': case 'j': case 'b': /* misc */
+            break; 
+        default: 
+            return -1;
+    }
+
+    /* Linear scan of HN4_LEXICON_COUNT (64) */
+    for (int i = 0; i < HN4_LEXICON_COUNT; i++) {
+        size_t len = _hn4_lexicon_table[i].len;
+        if (avail >= len) {
+            if (memcmp(ip, _hn4_lexicon_table[i].str, len) == 0) return i;
+        }
+    }
+    return -1;
+}
+
+
+
+/* LEXICON: Emit (Write Only) */
+static uint8_t* _tcc_emit_lexicon(uint8_t* op, const uint8_t* oend, int idx) {
+    /* Need 3 bytes: ESC + OP + IDX */
+    if (op + 3 > oend) return NULL;
+    
+    *op++ = HN4_EXT_ESCAPE;     /* 0x00 */
+    *op++ = HN4_EXT_OP_LEXICON; /* 0x01 */
+    *op++ = (uint8_t)idx;       /* Full byte index (0-255) */
+    
+    return op;
+}
+
+/* MANIFOLD: Scan Only (Heuristic check) */
+static uint32_t _tcc_scan_manifold(const uint8_t* ip, const uint8_t* iend, uint32_t stride) {
+    size_t avail = (size_t)(iend - ip);
+    if (avail < stride * 2 || stride == 0) return 0;
+    
+    uint32_t check = (avail > 64) ? 64 : (uint32_t)avail;
+    int score = 0;
+    
+    for (uint32_t i = stride; i < check; i++) {
+        uint8_t pred = (ip[i-1] + ip[i-stride]) >> 1;
+        /* Bug #25: Use int for deterministic subtraction */
+        int delta = (int)ip[i] - (int)pred;
+        if (delta >= -4 && delta <= 4) score++;
+    }
+    
+    /* Bug #13: Stricter threshold (75%) to prevent false positives on random data */
+    if (score < (int)((check * 3) / 4)) return 0;
+    
+    /* Calculate actual run length */
+    uint32_t len = stride;
+    const uint32_t MAX_LOOKAHEAD = 256; 
+    uint32_t limit = (avail > MAX_LOOKAHEAD) ? MAX_LOOKAHEAD : (uint32_t)avail;
+
+    for (; len < limit; len++) {
+        if (len + 4 < limit) {
+            uint32_t val;
+            memcpy(&val, ip + len, 4);
+            if (val == 0) break;
+        }
+    }
+    
+    return len;
+}
+
+/* MANIFOLD: Emit (Write Only) */
+static uint8_t* _tcc_emit_manifold(uint8_t* op, const uint8_t* oend, 
+                                   const uint8_t* ip, uint32_t len, uint32_t stride) 
+{
+    /* Header: ESC + OP + STRIDE + VARINT_LEN */
+    if (op + 3 + HN4_VARINT_MAX_BYTES > oend) return NULL;
+    
+    *op++ = HN4_EXT_ESCAPE;
+    *op++ = HN4_EXT_OP_MANIFOLD; /* No packed index here */
+    *op++ = (uint8_t)stride;
+    
+    op = _tcc_write_varint(op, oend, len);
+    if (!op) return NULL;
+
+    if ((size_t)(oend - op) < len) return NULL;
+
+    /* Row 0: Raw Copy */
+    memcpy(op, ip, stride);
+    op += stride;
+    
+    /* Row 1..N: Spatial Delta */
+    for (size_t i = stride; i < len; i++) {
+        uint8_t pred = (ip[i-1] + ip[i-stride]) >> 1;
+        *op++ = ip[i] - pred; /* Implicit unsigned wrap is standard */
+    }
+    
+    return op;
+}
+
+
+  _Check_return_
+hn4_result_t hn4_compress_block(
+    HN4_IN  const void* src_void,
+    HN4_IN  uint32_t    src_len,
+    HN4_OUT void*       dst_void,
+    HN4_IN  uint32_t    dst_capacity,
+    HN4_OUT uint32_t*   out_size,
+    HN4_IN  uint32_t    device_type,
+    HN4_IN  uint64_t    hw_flags
+)
+{
+    if (HN4_UNLIKELY(!src_void || !dst_void || !out_size)) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(src_void == dst_void)) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(src_len > HN4_BLOCK_LIMIT)) return HN4_ERR_INVALID_ARGUMENT;
+
+    const uint8_t* ip     = (const uint8_t*)src_void;
+    const uint8_t* iend   = ip + src_len;
+    const uint8_t* anchor = ip; 
+    
+    /* Safety margin for lookahead */
+    const uint8_t* ilimit = (src_len >= 8) ? iend - 8 : ip;
+
+    uint8_t*       op     = (uint8_t*)dst_void;
+    const uint8_t* oend   = op + dst_capacity;
+    
+    /* Fast path for tiny buffers */
+    if (src_len < HN4_TENSOR_MIN_SPAN) {
+        hn4_result_t res = _flush_literal_buffer(&op, oend, ip, src_len, hw_flags);
+        if (res != HN4_OK) return res;
+        *out_size = (uint32_t)(op - (uint8_t*)dst_void);
         return HN4_OK;
     }
 
-    _Check_return_
-    hn4_result_t hn4_compress_block(
-        HN4_IN  const void* src_void,
-        HN4_IN  uint32_t    src_len,
-        HN4_OUT void*       dst_void,
-        HN4_IN  uint32_t    dst_capacity,
-        HN4_OUT uint32_t*   out_size,
-        HN4_IN  uint32_t    device_type, /* HN4_DEV_HDD, etc. */
-        HN4_IN  uint64_t    hw_flags     /* HN4_HW_NVM, etc.  */
-    )
-    {
-        if (HN4_UNLIKELY(!src_void || !dst_void || !out_size)) return HN4_ERR_INVALID_ARGUMENT;
-        if (HN4_UNLIKELY(src_void == dst_void)) return HN4_ERR_INVALID_ARGUMENT;
-        if (HN4_UNLIKELY(src_len > HN4_BLOCK_LIMIT)) return HN4_ERR_INVALID_ARGUMENT;
-
-        const uint8_t* ip     = (const uint8_t*)src_void;
-        const uint8_t* iend   = ip + src_len;
-        const uint8_t* anchor = ip; 
-        /* Scan until 8 bytes from end to avoid over-read during detection */
-        const uint8_t* ilimit = (src_len >= 8) ? iend - 8 : ip;
-
-        uint8_t*       op     = (uint8_t*)dst_void;
-        const uint8_t* oend   = op + dst_capacity;
+    while (ip <= ilimit) {
         
-        /* Fast path for tiny buffers */
-        if (src_len < HN4_TENSOR_MIN_SPAN) {
-            hn4_result_t res = _flush_literal_buffer(&op, oend, ip, src_len, hw_flags);
-            if (res != HN4_OK) return res;
-            *out_size = (uint32_t)(op - (uint8_t*)dst_void);
-            return HN4_OK;
+        /* Auto-flush literal buffer to prevent overflow of token length */
+        if ((size_t)(ip - anchor) >= HN4_MAX_TOKEN_LEN) {
+            if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK) 
+                return HN4_ERR_ENOSPC;
+            anchor = ip;
         }
 
-        /* 
-        * MAIN COMPRESSION LOOP
-        */
-        while (ip <= ilimit) {
+        /* --- PRIORITY 1: ISOTOPE (Constant Run) --- */
+
+        if (HN4_UNLIKELY(ip + 8 > iend)) break;
+
+        uint64_t qword = _tcc_load64(ip);
+        uint64_t pattern = (uint64_t)ip[0] * 0x0101010101010101ULL;
+        
+        if (HN4_UNLIKELY(qword == pattern)) {
+            const uint8_t* run = ip + 8;
+            while (run < iend && *run == ip[0]) run++;
+            size_t run_len = (size_t)(run - ip);
             
-            /* Check literal buffer accumulation */
-            size_t pending_lit = (size_t)(ip - anchor);
-            if (pending_lit >= HN4_MAX_TOKEN_LEN) {
-                if (_flush_literal_buffer(&op, oend, anchor, pending_lit, hw_flags) != HN4_OK) 
-                    return HN4_ERR_ENOSPC;
-                anchor = ip;
+            if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK) 
+                return HN4_ERR_ENOSPC;
+
+            while (run_len >= HN4_TENSOR_MIN_SPAN) {
+                uint32_t max_enc = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
+                uint32_t chunk = (run_len > max_enc) ? max_enc : (uint32_t)run_len;
+                uint32_t count = chunk - HN4_TENSOR_MIN_SPAN;
+
+                uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_ISOTOPE, count);
+                if (!next_op || next_op >= oend) return HN4_ERR_ENOSPC;
+                
+                op = next_op;
+                *op++ = ip[0];
+                run_len -= chunk;
+                ip += chunk;
+            }
+            anchor = ip;
+            continue;
+        }
+
+        /* --- PRIORITY 2: GRADIENT (Linear Progression) --- */
+        int8_t slope = _tcc_detect_linear_gradient(ip, iend, device_type);
+        if (HN4_UNLIKELY(slope != 0)) {
+            const uint8_t* run = ip + 1;
+            int16_t expected = (int16_t)ip[0] + slope;
+
+            while (run < iend) {
+                if (expected < 0 || expected > 255) break; 
+                if (*run != (uint8_t)expected) break;
+                run++;
+                expected += slope;
             }
 
-            /* --- PRIORITY 1: ISOTOPE (Constant Run) --- */
-            uint64_t qword = _tcc_load64(ip);
-            uint64_t pattern = (uint64_t)ip[0] * 0x0101010101010101ULL;
+            size_t run_len = (size_t)(run - ip);
             
-            if (HN4_UNLIKELY(qword == pattern)) {
-                const uint8_t* run = ip + 8;
-                /* Extend match */
-                while (run < iend && *run == ip[0]) run++;
-
-                size_t run_len = (size_t)(run - ip);
-                
-                /* Commit pending literals */
+            if (run_len >= HN4_TENSOR_MIN_SPAN) {
                 if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK) 
                     return HN4_ERR_ENOSPC;
 
-                /* Emit Isotopes */
                 while (run_len >= HN4_TENSOR_MIN_SPAN) {
-                    /* Chunk clamp to correct limit */
-                    uint32_t max_encodable_span = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
-                    uint32_t chunk = (run_len > max_encodable_span) ? max_encodable_span : (uint32_t)run_len;
-                    
+                    uint32_t max_enc = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
+                    uint32_t chunk = (run_len > max_enc) ? max_enc : (uint32_t)run_len;
                     uint32_t count = chunk - HN4_TENSOR_MIN_SPAN;
 
-                    uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_ISOTOPE, count);
-                    if (!next_op || next_op >= oend) return HN4_ERR_ENOSPC;
-                    
+                    uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_GRADIENT, count);
+                    if (!next_op || (size_t)(oend - next_op) < 2) return HN4_ERR_ENOSPC;
                     op = next_op;
-                    *op++ = ip[0]; /* Payload: The constant byte */
-
+                    
+                    *op++ = ip[0];
+                    *op++ = (uint8_t)slope;
                     run_len -= chunk;
                     ip += chunk;
                 }
-                
                 anchor = ip;
                 continue;
             }
+        }
 
-            /* --- PRIORITY 2: GRADIENT (Linear Progression) --- */
-            /* Pass device_type for Deep Scan optimization */
-            int8_t slope = _tcc_detect_linear_gradient(ip, iend, device_type);
-            
-            if (HN4_UNLIKELY(slope != 0)) {
-                const uint8_t* run = ip + 1;
-                int16_t expected = (int16_t)ip[0] + slope;
-
-                /* Extend match */
-                while (run < iend) {
-                    if (expected < 0 || expected > 255) break; 
-                    if (*run != (uint8_t)expected) break;
-                    run++;
-                    expected += slope;
-                }
-
-                size_t run_len = (size_t)(run - ip);
-                
-                if (run_len >= HN4_TENSOR_MIN_SPAN) {
+        /* --- PRIORITY 3: BITMASK (Sparse Data) --- */
+        if (((uintptr_t)ip & 3) == 0) {
+            uint32_t w0, w1;
+            memcpy(&w0, ip, 4);
+            memcpy(&w1, ip + 4, 4);
+            if (w0 == 0 || w1 == 0) {
+                if (ip > anchor) {
                     if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK) 
                         return HN4_ERR_ENOSPC;
-
-                    while (run_len >= HN4_TENSOR_MIN_SPAN) {
-                        uint32_t max_encodable_span = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
-                        uint32_t chunk = (run_len > max_encodable_span) ? max_encodable_span : (uint32_t)run_len;
-
-                        uint32_t count = chunk - HN4_TENSOR_MIN_SPAN;
-
-                        uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_GRADIENT, count);
-                        if (!next_op || (size_t)(oend - next_op) < 2) return HN4_ERR_ENOSPC;
-                        op = next_op;
-                        
-                        *op++ = ip[0];          /* Start Value */
-                        *op++ = (uint8_t)slope; /* Delta */
-
-                        run_len -= chunk;
-                        ip += chunk;
-                    }
-
-                    /* Same Anchor Logic as Isotope */
+                    anchor = ip;
+                }
+                
+                uint32_t consumed = _tcc_attempt_bitmask(&op, oend, ip, iend);
+                if (consumed > 0) {
+                    ip += consumed;
                     anchor = ip;
                     continue;
                 }
             }
-
-            ip++;
         }
 
-        /* --- TAIL FLUSH --- */
-        if (_flush_literal_buffer(&op, oend, anchor, (size_t)(iend - anchor), hw_flags) != HN4_OK) 
-            return HN4_ERR_ENOSPC;
+        /* --- PRIORITY 4: LEXICON (Extended Dictionary) --- */
+        int lex_idx = _tcc_scan_lexicon(ip, iend);
+        if (lex_idx >= 0) {
+            size_t match_len = _hn4_lexicon_table[lex_idx].len;
 
-        *out_size = (uint32_t)(op - (uint8_t*)dst_void);
-        return HN4_OK;
+            /* 
+             * PROFITABILITY CHECK:
+             * The token uses 3 bytes (ESC + OP + IDX).
+             * We only emit if the matched string is LONGER than 3 bytes.
+             * Otherwise, we let it fall through to Literals (no expansion).
+             */
+            if (match_len > 3) {
+                if (ip > anchor) {
+                    if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK)
+                        return HN4_ERR_ENOSPC;
+                    anchor = ip;
+                }
+                
+                op = _tcc_emit_lexicon(op, oend, lex_idx);
+                if (!op) return HN4_ERR_ENOSPC;
+                
+                ip += match_len;
+                anchor = ip;
+                continue;
+            }
+        }
+
+        /* --- PRIORITY 5: MANIFOLD (2D Delta) --- */
+        /* Check bounds for ip[1] before access to prevent OOB near buffer end */
+        if ((device_type == HN4_DEV_SSD) && (ip + 1 < iend) && (ip[0] != 0 && ip[1] != 0)) {
+            uint32_t stride = 64; 
+            uint32_t m_len = _tcc_scan_manifold(ip, iend, stride);
+            
+            if (m_len > 0) {
+                if (ip > anchor) {
+                     if (_flush_literal_buffer(&op, oend, anchor, (size_t)(ip - anchor), hw_flags) != HN4_OK) 
+                       return HN4_ERR_ENOSPC;
+                     anchor = ip;
+                }
+                
+                op = _tcc_emit_manifold(op, oend, ip, m_len, stride);
+                if (!op) return HN4_ERR_ENOSPC;
+                
+                ip += m_len;
+                anchor = ip;
+                continue;
+            }
+        }
+
+        ip++;
     }
+
+    /* --- TAIL FLUSH --- */
+    if (_flush_literal_buffer(&op, oend, anchor, (size_t)(iend - anchor), hw_flags) != HN4_OK) 
+        return HN4_ERR_ENOSPC;
+
+    *out_size = (uint32_t)(op - (uint8_t*)dst_void);
+    return HN4_OK;
+}
+
 
     /* =========================================================================
     * 4. DECOMPRESSION ENGINE (DECODER)
     * ========================================================================= */
 
-    _Check_return_
+   _Check_return_
 hn4_result_t hn4_decompress_block(
     HN4_IN  const void* src_void,
     HN4_IN  uint32_t    src_len,
@@ -473,83 +787,115 @@ hn4_result_t hn4_decompress_block(
     uint8_t*       op     = (uint8_t*)dst_void;
     uint8_t*       ostart = op;
     uint8_t*       oend   = op + dst_capacity;
+    
+    uint64_t cost_counter = 0; 
+    const uint64_t cost_limit = (uint64_t)src_len * 16 + 1024;
 
     while (ip < iend) {
-        /* 1. Fetch Token */
+        if (++cost_counter > cost_limit) return HN4_ERR_DATA_ROT;
+
         uint8_t raw_token = *ip++;
         uint8_t tag = raw_token & HN4_OP_MASK;
         uint32_t len = raw_token & HN4_LEN_MASK;
 
-        if (HN4_UNLIKELY(tag == HN4_OP_RESERVED)) return HN4_ERR_DATA_ROT;
-
-        /* 
-         * 2. VarInt Decode Logic
-         * If len == 63 (Mask), reading extension bytes.
-         */
-        if (len == HN4_LEN_MASK) {
-            uint32_t extensions = 0;
-            uint8_t s = 255;
+        /* EXTENSION PROTOCOL: LITERAL with LEN=0 acts as ESCAPE */
+        if (tag == HN4_OP_LITERAL && len == 0) {
+            if (ip >= iend) return HN4_ERR_DATA_ROT;
             
+            uint8_t ext_sig = *ip++;
+            
+            /* -- DECODE LEXICON (0x01) -- */
+            if (ext_sig == HN4_EXT_OP_LEXICON) {
+                /* Read Index Byte */
+                if (ip >= iend) return HN4_ERR_DATA_ROT;
+                uint8_t idx = *ip++;
+
+                if (idx >= HN4_LEXICON_COUNT) return HN4_ERR_DATA_ROT;
+                
+                const char* word = _hn4_lexicon_table[idx].str;
+                size_t wlen      = _hn4_lexicon_table[idx].len;
+                
+                if ((size_t)(oend - op) < wlen) return HN4_ERR_DATA_ROT;
+                memcpy(op, word, wlen);
+                op += wlen;
+                continue;
+            }
+            
+            /* -- DECODE MANIFOLD (0x02) -- */
+            if (ext_sig == HN4_EXT_OP_MANIFOLD) {
+                if (ip >= iend) return HN4_ERR_DATA_ROT;
+                uint32_t stride = *ip++;
+                if (stride == 0) return HN4_ERR_DATA_ROT;
+
+                if (stride > (size_t)(op - ostart)) return HN4_ERR_DATA_ROT;
+
+                /* Read VarInt Length */
+                uint64_t m_len_64 = 0;
+                uint8_t s = 255;
+                while (s == 255) {
+                    if (ip >= iend) return HN4_ERR_DATA_ROT;
+                    s = *ip++;
+                    m_len_64 += s;
+                    if (m_len_64 > HN4_MAX_TOKEN_LEN) return HN4_ERR_DATA_ROT;
+                }
+                uint32_t m_len = (uint32_t)m_len_64;
+                
+                if ((size_t)(oend - op) < m_len) return HN4_ERR_DATA_ROT;
+                if ((size_t)(iend - ip) < m_len) return HN4_ERR_DATA_ROT;
+                
+                /* Stride must fit within the decoded chunk (cannot reference past start of chunk) */
+                if (stride > m_len) return HN4_ERR_DATA_ROT;
+
+                /* Row 0: Literal Copy */
+                memcpy(op, ip, stride);
+                op += stride; ip += stride;
+                
+                /* Row 1..N: Decode 2D Spatial Delta */
+                size_t rem = m_len - stride;
+                while (rem--) {
+                    /* Pred = Avg(Left, Top) */
+                    uint8_t pred = (op[-1] + op[-(int)stride]) >> 1;
+                    *op++ = *ip++ + pred; 
+                }
+                continue;
+            }
+            
+            /* Unknown Extension */
+            return HN4_ERR_DATA_ROT; 
+        }
+
+        /* VARINT DECODING (Standard Tokens) */
+        if (len == HN4_LEN_MASK) {
+            uint8_t s = HN4_VARINT_MARKER;
             while (s == HN4_VARINT_MARKER) {
                 if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
                 s = *ip++;
-                
-                /* Overflow protection */
                 if (len > (UINT32_MAX - s)) return HN4_ERR_DATA_ROT;
                 len += s;
-                
-                /* 
-                 * HN4_VARINT_MAX_BYTES defines strict recursion limit.
-                 */
-                if (s == HN4_VARINT_MARKER) {
-                    extensions++;
-                    if (extensions > HN4_VARINT_MAX_BYTES) return HN4_ERR_DATA_ROT;
-                }
             }
         }
 
-        /* 
-         * 3. Semantic Limit Check
-         * Ensure the encoded length is valid within the grammar.
-         */
         if (len > HN4_MAX_TOKEN_LEN) return HN4_ERR_DATA_ROT;
-
-        /* 
-         * 4. Apply Token Bias (Unpack logical length) 
-         * Compressed ops (Isotope/Gradient) encode length - MIN_SPAN.
-         */
-        if (tag != HN4_OP_LITERAL) {
+        
+        /* Adjust for Tensor Min Span if algorithmic token */
+        if (tag == HN4_OP_ISOTOPE || tag == HN4_OP_GRADIENT) {
             if (len > (HN4_BLOCK_LIMIT - HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
             len += HN4_TENSOR_MIN_SPAN;
-            
-            /* Post-Bias Check */
-            if (len > (HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN)) return HN4_ERR_DATA_ROT;
         }
 
-        /* 
-         * 5. Output Bounds Check 
-         * Strict pointer arithmetic check preventing wrap-around.
-         */
-        size_t rem_space = (size_t)(oend - op);
-        if (HN4_UNLIKELY(len > rem_space)) {
-            return HN4_ERR_DATA_ROT; /* Buffer overrun attempt */
-        }
+        if (HN4_UNLIKELY(len > (size_t)(oend - op))) return HN4_ERR_DATA_ROT; 
 
-        /* 6. Execute Opcode */
+        /* STANDARD OPCODE DISPATCH */
         switch (tag) {
             case HN4_OP_LITERAL:
-                /* Input Bounds Check */
                 if (HN4_UNLIKELY((size_t)(iend - ip) < len)) return HN4_ERR_DATA_ROT;
-                
-                memmove(op, ip, len);
+                memcpy(op, ip, len);
                 op += len;
                 ip += len;
                 break;
 
             case HN4_OP_ISOTOPE:
-                /* Input Bounds Check (Need 1 byte for pattern) */
                 if (HN4_UNLIKELY(ip >= iend)) return HN4_ERR_DATA_ROT;
-                
                 memset(op, *ip++, len);
                 op += len;
                 break;
@@ -557,21 +903,15 @@ hn4_result_t hn4_decompress_block(
             case HN4_OP_GRADIENT:
             {
                 if (HN4_UNLIKELY(ip + 2 > iend)) return HN4_ERR_DATA_ROT;
-                
                 uint8_t val = *ip++;
                 int8_t slope = (int8_t)*ip++; 
-                
                 if (slope == 0 || slope == -128) return HN4_ERR_DATA_ROT;
-
-                /* FIX: Return error on invalid length to prevent underflow */
                 if (len == 0) return HN4_ERR_DATA_ROT;
 
                 int64_t total_delta = (int64_t)(len - 1) * (int64_t)slope;
                 int64_t final_val   = (int64_t)val + total_delta;
-
                 if (final_val < 0 || final_val > 255) return HN4_ERR_DATA_ROT;
 
-                /* Execute Gradient Fill */
                 int32_t acc = val;
                 while (len--) {
                     *op++ = (uint8_t)acc;
@@ -579,10 +919,60 @@ hn4_result_t hn4_decompress_block(
                 }
                 break;
             }
+
+            case HN4_OP_BITMASK: 
+            {
+                if (HN4_UNLIKELY(len % HN4_TSM_GRANULARITY != 0)) return HN4_ERR_DATA_ROT;
+                if (HN4_UNLIKELY(len == 0)) return HN4_ERR_DATA_ROT;
+                
+                uint32_t total_words = len / HN4_TSM_GRANULARITY;
+                uint32_t mask_bytes = (total_words + 7) / 8;
+                
+                if (HN4_UNLIKELY((size_t)(iend - ip) < mask_bytes)) return HN4_ERR_DATA_ROT;
+                const uint8_t* mask_base = ip;
+                
+                /* Validation: Check unused bits in last mask byte are zero */
+                if (total_words % 8 != 0) {
+                    uint8_t last_byte = mask_base[mask_bytes - 1];
+                    if (last_byte >> (total_words % 8)) return HN4_ERR_DATA_ROT;
+                }
+
+                ip += mask_bytes;
+                if (op + len > oend) return HN4_ERR_DATA_ROT;
+
+                /* Calculate required input bytes via population count */
+                uint32_t set_bits = 0;
+                for (uint32_t i = 0; i < mask_bytes; i++) {
+                    uint8_t b = mask_base[i];
+                    /* 
+                     * Correct Popcount: Explicitly mask garbage bits in last byte 
+                     * even though we validated them, to ensure calculation consistency.
+                     */
+                    if (i == mask_bytes - 1 && (total_words % 8) != 0) {
+                        b &= (1 << (total_words % 8)) - 1;
+                    }
+                    /* Kernighan's method */
+                    for (; b; set_bits++) b &= b - 1; 
+                }
+                
+                if (HN4_UNLIKELY((size_t)(iend - ip) < (set_bits * 4))) return HN4_ERR_DATA_ROT;
+
+                for (uint32_t i = 0; i < total_words; i++) {
+                    if ((mask_base[i / 8] >> (i % 8)) & 1) {
+                        memcpy(op, ip, 4);
+                        ip += 4;
+                    } else {
+                        memset(op, 0, 4);
+                    }
+                    op += 4;
+                }
+                break;
+            }
+            default:
+                return HN4_ERR_DATA_ROT;
         }
     }
 
-    /* Verify stream consumed exactly */
     if (HN4_UNLIKELY(ip != iend)) return HN4_ERR_DATA_ROT;
 
     *out_size = (uint32_t)(op - ostart);
@@ -594,16 +984,18 @@ hn4_result_t hn4_decompress_block(
     * ========================================================================= */
 
     uint32_t hn4_compress_bound(uint32_t isize) 
-    {
-        /* 
-        * Safety Formula: isize + (isize >> 7) + 256.
-        * Worst case overhead is ~0.79% (1 byte per 127 bytes + headers).
-        * (isize >> 7) approximates 0.78%.
-        * +256 provides ample margin for small buffers and alignment padding.
-        */
-        uint64_t safe_size = (uint64_t)isize;
-        safe_size += (safe_size >> 7) + 256;
-        
-        if (safe_size > UINT32_MAX) return UINT32_MAX;
-        return (uint32_t)safe_size;
-    }
+{
+    /* 
+     * Safety Formula: isize + (isize >> 6) + 384.
+     * Increased overhead allowance (~1.5%) to account for:
+     * 1. VarInt headers (up to 33 bytes).
+     * 2. Bitmask Token Overhead (Header + Mask Bytes).
+     * 3. Alignment padding.
+     */
+    uint64_t safe_size = (uint64_t)isize;
+    safe_size += (safe_size >> 6) + 384;
+    
+    if (safe_size > UINT32_MAX) return UINT32_MAX;
+    return (uint32_t)safe_size;
+}
+
