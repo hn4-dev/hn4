@@ -654,6 +654,11 @@ typedef struct {
         _Atomic uint64_t    last_alloc_g;
         uint64_t            cortex_search_head;
         uint64_t            scavenger_cursor; 
+         uint64_t            cache_limit_genesis; /* 90% Limit */
+        uint64_t            cache_limit_update;  /* 95% Limit */
+        uint64_t            cache_limit_recover; /* 85% Limit */
+        uint64_t            cached_flux_start;   /* Block Index of Flux Start */
+        uint64_t            cached_total_blocks; /* Total Blocks in Volume */
     } alloc;
 
     /* --- HOT ZONE B: HEALTH & RECOVERY (Scavenger/Monitor Path) --- */
@@ -689,17 +694,11 @@ typedef struct {
     /* --- HIGH-THROUGHPUT LOCKING ZONE --- */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
         
-        /* OPTIMIZATION 1: Sharded Swarm Locks */
-        /* Replaces single l2_lock with 64 isolated locks (~4KB footprint) */
         hn4_shard_lock_t    shards[HN4_CORTEX_SHARDS];
- hn4_spinlock_t      l2_lock;     
-        /* Existing L2 Summary (for Block Allocation) */
+        hn4_spinlock_t      l2_lock;     
         uint64_t*           l2_summary_bitmap; 
-
-        /* OPTIMIZATION 3: Cortex Occupancy Bitmap */
-        /* Dense bitmask tracking used Anchor slots. 1 bit per 128-byte slot. */
-        /* Allows finding free inodes via bit-scan instead of linear probe. */
-        uint64_t*           cortex_occupancy_bitmap;
+        uint64_t            cortex_bitmap_words; 
+        _Atomic(uint64_t*)  cortex_occupancy_bitmap;
 
         bool                in_eviction_path; 
     } locking;

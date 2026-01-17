@@ -1808,6 +1808,105 @@ static hn4_result_t _load_cortex_resources(HN4_IN hn4_hal_device_t* dev, HN4_INO
     return HN4_OK;
 }
 
+static void _build_occupancy_bitmap(hn4_volume_t* vol) {
+    /* 1. Pre-flight Checks */
+    if (!vol->nano_cortex) return;
+
+    /* Integrity: Pointer Alignment */
+    if (((uintptr_t)vol->nano_cortex % _Alignof(hn4_anchor_t)) != 0) {
+        HN4_LOG_CRIT("Mount: Nano-Cortex memory misalignment. Bitmap disabled.");
+        return;
+    }
+
+    /* Integrity: Size Modulo */
+    if ((vol->cortex_size % sizeof(hn4_anchor_t)) != 0) {
+        HN4_LOG_CRIT("Mount: Cortex size corruption (%zu). Bitmap build aborted.", 
+                     vol->cortex_size);
+        return;
+    }
+
+    /* 2. Calculation & Allocation (Zero Lock) */
+    size_t total_slots = vol->cortex_size / sizeof(hn4_anchor_t);
+    size_t bitmap_words = (total_slots + 63) / 64;
+
+    /* Integer Overflow Protection */
+    if (bitmap_words > (SIZE_MAX / sizeof(uint64_t))) {
+        HN4_LOG_CRIT("Mount: Bitmap size overflows addressable memory.");
+        return;
+    }
+
+    size_t alloc_bytes = bitmap_words * sizeof(uint64_t);
+    uint64_t* new_bitmap = hn4_hal_mem_alloc(alloc_bytes);
+    
+    if (!new_bitmap) {
+        HN4_LOG_WARN("Mount: OOM building acceleration bitmap. Disabling optimization.");
+        
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        uint64_t* stale_ptr = atomic_load_explicit(&vol->locking.cortex_occupancy_bitmap, memory_order_relaxed);
+        
+        /* Disable optimization */
+        atomic_store_explicit(&vol->locking.cortex_occupancy_bitmap, NULL, memory_order_release);
+        vol->locking.cortex_bitmap_words = 0;
+        
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+        if (stale_ptr) hn4_hal_mem_free(stale_ptr);
+        return;
+    }
+
+    /* Zero (Safe Init) */
+    memset(new_bitmap, 0, alloc_bytes);
+    
+    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+
+    /* 3. Populate (Offline Scan - O(N)) */
+    for (size_t i = 0; i < total_slots; i++) {
+        if (anchors[i].seed_id.lo != 0 || 
+            anchors[i].seed_id.hi != 0 || 
+            anchors[i].data_class != 0) 
+        {
+            size_t word_idx = i / 64;
+            size_t bit_idx  = i % 64;
+            new_bitmap[word_idx] |= (1ULL << bit_idx);
+        }
+    }
+
+    /* 
+     * 4. ATOMIC COMMIT (O(1) Swap)
+     */
+    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+
+    /* Capture old pointer for deferred free */
+    uint64_t* old_bitmap = atomic_load_explicit(
+        &vol->locking.cortex_occupancy_bitmap, 
+        memory_order_relaxed
+    );
+
+    vol->locking.cortex_bitmap_words = bitmap_words;
+    
+    /* 
+     * RELEASE STORE
+     * Publishes 'new_bitmap' AND 'bitmap_words'.
+     */
+    atomic_store_explicit(
+        &vol->locking.cortex_occupancy_bitmap, 
+        new_bitmap, 
+        memory_order_release
+    );
+
+    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+    /* 
+     * 5. SAFE CLEANUP
+     * Relies on System Quiescence contract.
+     */
+    if (old_bitmap) {
+        memset(old_bitmap, 0xDD, alloc_bytes);
+        hn4_hal_mem_free(old_bitmap);
+    }
+}
+
+
 /* =========================================================================
  * 6. MAIN MOUNT ENTRY POINT
  * ========================================================================= */
@@ -2114,6 +2213,8 @@ hn4_result_t hn4_mount(
     res = _load_cortex_resources(dev, vol);
     if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_WARN("Cortex Load Failed. Continuing degraded.");
+    } else {
+        _build_occupancy_bitmap(vol);
     }
 
     res = _load_bitmap_resources(dev, vol);
