@@ -849,8 +849,10 @@ hn4_result_t hn4_decompress_block(
                 op += stride; ip += stride;
                 
                 /* Row 1..N: Decode 2D Spatial Delta */
-                size_t rem = m_len - stride;
+               size_t rem = m_len - stride;
                 while (rem--) {
+                    if ((size_t)(op - ostart) < stride) return HN4_ERR_DATA_ROT;
+
                     /* Pred = Avg(Left, Top) */
                     uint8_t pred = (op[-1] + op[-(int)stride]) >> 1;
                     *op++ = *ip++ + pred; 

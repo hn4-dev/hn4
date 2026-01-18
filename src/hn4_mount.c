@@ -1471,9 +1471,8 @@ static hn4_result_t _verify_and_heal_root_anchor(
 
     HN4_LOG_WARN("Healing Root Anchor (Genesis Repair)...");
 
-    /* Re-initialize buffer with clean state */
-    memset(io_buf, 0, alloc_sz);
     root = (hn4_anchor_t*)io_buf;
+    memset(root, 0, sizeof(hn4_anchor_t)); 
 
     /* Restore Standard Root Values */
     root->seed_id.lo = 0xFFFFFFFFFFFFFFFFULL;

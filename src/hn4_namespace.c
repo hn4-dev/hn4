@@ -214,19 +214,16 @@ hn4_result_t _ns_scan_cortex_slot(
 
         for (uint32_t i = 0; i < HN4_NS_MAX_PROBES; i++) {
             uint64_t curr_slot = (start_slot + i) % total_slots;
-            
-            /* PIPELINE: Prefetch future data into L1 */
-            uint64_t next_slot = (start_slot + i + LOOKAHEAD) % total_slots;
-            const hn4_anchor_t* next_ptr = &ram_base[next_slot];
-            HN4_PREFETCH(next_ptr);              /* Cache Line 1: IDs */
-            HN4_PREFETCH((const uint8_t*)next_ptr + 64); /* Cache Line 2: Gen/CRC */
+            hn4_anchor_t stack_copy;
+            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+            memcpy(&stack_copy, &ram_base[curr_slot], sizeof(hn4_anchor_t));
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
-            const hn4_anchor_t* raw = &ram_base[curr_slot];
+            /* Use local copy for all checks */
+            const hn4_anchor_t* raw = &stack_copy;
             
-            /* Check Data Class (Validity) */
             uint64_t dclass_le = raw->data_class;
             
-            /* The "Wall": Empty slot stops linear probe */
             if (HN4_UNLIKELY(raw->seed_id.lo == 0 && raw->seed_id.hi == 0 && dclass_le == 0)) {
                 break; 
             }

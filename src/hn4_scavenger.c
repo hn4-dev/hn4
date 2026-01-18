@@ -452,7 +452,7 @@ static hn4_result_t _reap_tombstone(
     
     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
     /* Anchor should be zeroed (data_class == 0) if Step 5 succeeded. */
-    if (hn4_le64_to_cpu(anchor->data_class) == 0) {
+    if (hn4_le64_to_cpu(anchor->data_class) & HN4_FLAG_TOMBSTONE) {
         safe_to_flush = true;
     }
     hn4_hal_spinlock_release(&vol->locking.l2_lock);

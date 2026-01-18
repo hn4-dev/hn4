@@ -1136,6 +1136,9 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     lba_s = hn4_lba_from_sectors(south_bytes / ss);
     
     write_south = (cap_bytes >= ((uint64_t)write_sz * 16));
+
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) write_south = false;
+
 #endif
 
     res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);

@@ -61,16 +61,16 @@ static uint64_t _calc_expected_marker(uint32_t header_crc) {
 static bool _is_sector_valid(const void* buf, uint32_t ss, hn4_addr_t expected_lba) {
     const hn4_chronicle_header_t* h = (const hn4_chronicle_header_t*)buf;
     
-    if (hn4_le64_to_cpu(h->magic) != HN4_CHRONICLE_MAGIC) return false;
+    if (HN4_UNLIKELY(hn4_le64_to_cpu(h->magic) != HN4_CHRONICLE_MAGIC)) return false;
 
     /* Convert on-disk LBA to CPU format */
     hn4_addr_t stored_lba = hn4_addr_to_cpu(h->self_lba);
 
     /* Compare using 128-bit safe logic */
 #ifdef HN4_USE_128BIT
-    if (hn4_u128_cmp(stored_lba, expected_lba) != 0) return false;
+     if (HN4_UNLIKELY(hn4_u128_cmp(stored_lba, expected_lba) != 0)) return false;
 #else
-    if (stored_lba != expected_lba) return false;
+   if (HN4_UNLIKELY(stored_lba != expected_lba)) return false;
 #endif
 
     uint32_t stored_crc = hn4_le32_to_cpu(h->entry_header_crc);
@@ -132,12 +132,12 @@ hn4_result_t hn4_chronicle_append(
     uint64_t principal_hash
 )
 {
-    if (!dev || !vol) return HN4_ERR_INVALID_ARGUMENT;
-    if (vol->read_only) return HN4_ERR_ACCESS_DENIED;
+     if (HN4_UNLIKELY(!dev || !vol || vol->read_only))
+    return (!dev || !vol) ? HN4_ERR_INVALID_ARGUMENT : HN4_ERR_ACCESS_DENIED;
 
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
     uint32_t ss = caps->logical_block_size;
-    if (ss < (sizeof(hn4_chronicle_header_t) + 8)) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(ss < (sizeof(hn4_chronicle_header_t) + 8))) return HN4_ERR_GEOMETRY;
 
     /* 
      * Use Abstract Address Types.
@@ -204,7 +204,7 @@ hn4_result_t hn4_chronicle_append(
     /* prev_lba is already the correct type, pass directly */
     hn4_result_t read_res = hn4_hal_sync_io(dev, HN4_IO_READ, prev_lba, io_buf, 1);
     
-    if (read_res == HN4_OK) {
+    if (HN4_LIKELY(read_res == HN4_OK)) {
         /* 
          * Use shared helper to check if LBA fits in u64 for validation.
          * The validation function _is_sector_valid currently expects u64.
@@ -216,13 +216,13 @@ hn4_result_t hn4_chronicle_append(
             hn4_chronicle_header_t* prev = (hn4_chronicle_header_t*)io_buf;
             uint64_t prev_seq_val = hn4_le64_to_cpu(prev->sequence);
 
-            if (prev_seq_val == UINT64_MAX) {
+            if (HN4_UNLIKELY(prev_seq_val == UINT64_MAX)) {
                 HN4_LOG_CRIT("Chronicle: Sequence Overflow. Volume Locked.");
                 vol->sb.info.state_flags |= HN4_VOL_LOCKED;
                 hn4_hal_mem_free(io_buf);
                 return HN4_ERR_GEOMETRY;
             }
-            if (prev_seq_val == 0) {
+            if (HN4_UNLIKELY(prev_seq_val == 0)) {
                  HN4_LOG_CRIT("Chronicle: Invalid zero sequence in chain.");
                  vol->sb.info.state_flags |= HN4_VOL_PANIC;
                  hn4_hal_mem_free(io_buf);
@@ -292,7 +292,7 @@ hn4_result_t hn4_chronicle_append(
 
     /* 3. Commit to Media */
     /* Use 'head' directly, do not convert from sectors as it is already an address */
-    if (hn4_hal_sync_io(dev, HN4_IO_WRITE, head, io_buf, 1) != HN4_OK) {
+    if (HN4_UNLIKELY(hn4_hal_sync_io(dev, HN4_IO_WRITE, head, io_buf, 1) != HN4_OK)) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_HW_IO;
     }
@@ -339,6 +339,8 @@ hn4_result_t hn4_chronicle_verify_integrity(
     hn4_volume_t* vol
 )
 {
+     if( HN4_UNLIKELY(!dev || !vol)) return HN4_ERR_INVALID_ARGUMENT;
+
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
     uint32_t ss = caps->logical_block_size;
 
@@ -523,9 +525,8 @@ hn4_result_t hn4_chronicle_verify_integrity(
     uint64_t tip_seq = hn4_le64_to_cpu(tip->sequence);
     uint64_t sb_seq  = vol->sb.info.last_journal_seq;
 
-    /* [NEW] STEP 5: Time Travel Detection */
     /* Only check if SB has a recorded sequence (non-zero) */
-    if (sb_seq > 0 && tip_seq < sb_seq) {
+    if (sb_seq > 0 && HN4_UNLIKELY(tip_seq < sb_seq)) {
         _log_ratelimited(vol, "SECURITY: Time-Travel Detected! Log Seq < SB Seq", tip_seq);
         
         atomic_fetch_add(&vol->health.trajectory_collapse_counter, HN4_ERR_TAMPERED);
@@ -577,7 +578,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
         prev_lba = (c_val == s_val) ? (e_val - 1) : (c_val - 1);
     #endif
 
-        if (hn4_hal_sync_io(dev, HN4_IO_READ, prev_lba, prev_buf, 1) != HN4_OK) {
+        if (HN4_UNLIKELY(hn4_hal_sync_io(dev, HN4_IO_READ, prev_lba, prev_buf, 1) != HN4_OK)) {
             status = HN4_ERR_HW_IO;
             break;
         }
@@ -593,7 +594,7 @@ hn4_result_t hn4_chronicle_verify_integrity(
         }
 
         /* Verify Hash Link - Only if valid */
-        if (_calc_sector_link_crc(prev_buf, ss) != expected_prev_hash) {
+        if (HN4_UNLIKELY(_calc_sector_link_crc(prev_buf, ss) != expected_prev_hash)) {
             uint64_t prev_lba_u64 = hn4_addr_to_u64(prev_lba);
             HN4_LOG_ERR("Chronicle: Hash Mismatch at LBA %llu", prev_lba_u64);
             status = HN4_ERR_TAMPERED;

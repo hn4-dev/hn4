@@ -394,6 +394,18 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
     uint64_t next_relative_idx = (relative_idx + 1) % ring_len_blks;
     uint64_t write_blk_idx = ring_start_blk_idx + next_relative_idx;
 
+    /* ZNS requires Zone Reset when wrapping or entering new zone */
+    if (sb->info.hw_caps_flags & HN4_HW_ZNS_NATIVE) {
+        /* Check if we wrapped to start OR crossed a zone boundary */
+        /* Simplified: Reset if we wrapped to 0. (Assuming ring size aligns with zones for v1) */
+        if (next_relative_idx == 0) {
+             hn4_addr_t reset_lba = start_sect_lba; /* Start of ring */
+             /* Reset the zone containing the ring start */
+             hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, reset_lba, NULL, 0);
+             hn4_hal_barrier(dev);
+        }
+    }
+
     hn4_addr_t target_lba;
     uint32_t io_sectors;
 
@@ -418,6 +430,8 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
         if (out_new_id) *out_new_id = sb->info.current_epoch_id;
         if (out_new_ptr) *out_new_ptr = sb->info.epoch_ring_block_idx;
     }
+
+    if (res == HN4_OK) hn4_hal_barrier(dev);
 
     hn4_hal_mem_free(io_buf);
     return res;

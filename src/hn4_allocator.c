@@ -1704,6 +1704,13 @@ hn4_alloc_nano(
      */
 rollback_reservation:
     if (res == HN4_ERR_NOMEM) {
+        if (vol->nano_cortex) {
+            hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+            for (uint32_t k = 0; k < slots_needed; k++) {
+                atomic_store((_Atomic uint64_t*)&anchors[start_slot + k].data_class, 0);
+            }
+        }
+
         /* 
          * Manual Rollback for NOMEM:
          * We cannot reuse `io_buf` here as it failed allocation. We must alloc 
@@ -2125,14 +2132,16 @@ hn4_alloc_genesis(
 
         uint64_t S = 1ULL << fractal_scale;
         uint64_t total_blocks;
+        hn4_addr_t end_marker = vol->sb.info.lba_horizon_start;
+
     #ifdef HN4_USE_128BIT
-            hn4_u128_t limit_addr = vol->sb.info.lba_horizon_start;
-        hn4_u128_t res = hn4_u128_div_u64(limit_addr, (bs / ss)); /* Convert Sector LBA -> Block Index */
+        hn4_u128_t res = hn4_u128_div_u64(end_marker, sec_per_blk); /* Convert Sector LBA -> Block Index */
     
         if (res.hi > 0) return HN4_ERR_GEOMETRY; 
         total_blocks = res.lo;
     #else
-        total_blocks = vol->sb.info.lba_horizon_start / sec_per_blk;
+        /* Cast strictly to u64 as hn4_addr_t might be u64 */
+        total_blocks = (uint64_t)end_marker / sec_per_blk;
     #endif
         uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
         uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;

@@ -223,19 +223,21 @@ uint64_t _resolve_residency_verified(
      * If the file is flagged as Horizon, data is sequential starting at G.
      * ===================================================================== */
     if (dclass & HN4_HINT_HORIZON) {
-        uint64_t stride = (1ULL << M);
+            /* Horizon files use V=1 (stride=1) implicitly if M=0, but use M for scaling */
+            uint64_t stride_blocks = (1ULL << M);
+        
+            const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+            uint32_t spb = vol->vol_block_size / caps->logical_block_size;
 
-        /* Check 1: Multiplication Overflow */
-        if (block_idx < (UINT64_MAX / stride)) {
-            uint64_t offset = block_idx * stride;
+            if (block_idx < (UINT64_MAX / stride_blocks)) {
+                uint64_t offset_sectors = (block_idx * stride_blocks) * spb;
             
-            /* Ensure G + offset does not wrap UINT64_MAX */
-            if ((UINT64_MAX - G) >= offset) {
+                if ((UINT64_MAX - G) >= offset_sectors) {
                 
-                uint64_t linear_lba = G + offset;
+                    uint64_t linear_lba = G + offset_sectors;
                 
-                bool in_bounds = false;
-#ifdef HN4_USE_128BIT
+                    bool in_bounds = false;
+    #ifdef HN4_USE_128BIT
                 /* 
                  * We can safely assume linear_lba (u64) fits in capacity 
                  * if capacity.hi > 0 or capacity.lo is large enough.
@@ -875,8 +877,12 @@ retry_transaction:;
                                                          sectors);
                         if (r_res == HN4_OK) {
                         size_t p_off = offsetof(hn4_block_header_t, payload);
-                        
-                        if (memcmp((uint8_t*)io_buf + p_off, (uint8_t*)rescue_buf + p_off, payload_cap) == 0) {
+                        hn4_block_header_t* r_hdr = (hn4_block_header_t*)rescue_buf;
+
+                        /* Verify Generation to prevent resurrecting stale phantom blocks */
+                        bool gen_match = (hn4_le64_to_cpu(r_hdr->generation) == next_gen);
+
+                        if (gen_match && memcmp((uint8_t*)io_buf + p_off, (uint8_t*)rescue_buf + p_off, payload_cap) == 0) {
                             HN4_LOG_WARN("WRITE_ATOMIC: Rescue Successful! Latent write confirmed.");
                             rescued = true;
                             io_res = HN4_OK; /* Clear Error */

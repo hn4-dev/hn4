@@ -983,6 +983,129 @@ static void _bench_crc_throughput(void) {
     hn4_hal_mem_free(buf);
 }
 
+/* =========================================================================
+ * BENCHMARK 15: DELETE / UNDELETE LIFECYCLE
+ * ========================================================================= */
+static void _bench_lifecycle_tombstone(void) {
+    const int COUNT = 50000;
+    const uint32_t BS = 4096;
+    
+    /* Setup 256MB Volume to hold bitmaps + blocks */
+    hn4_volume_t* vol = _bench_create_mock_vol(BS, 256ULL * 1024 * 1024);
+    if (!vol) return;
+
+    /* Setup RAM Cortex (Required for Namespace Scans) */
+    size_t cortex_bytes = COUNT * sizeof(hn4_anchor_t) * 2; /* 2x Load Factor */
+    vol->nano_cortex = hn4_hal_mem_alloc(cortex_bytes);
+    if (!vol->nano_cortex) {
+        _bench_destroy_mock_vol(vol);
+        return;
+    }
+    vol->cortex_size = cortex_bytes;
+    memset(vol->nano_cortex, 0, cortex_bytes);
+    
+    hn4_anchor_t* ram_slots = (hn4_anchor_t*)vol->nano_cortex;
+    size_t slot_count = cortex_bytes / sizeof(hn4_anchor_t);
+
+    /* Scratch buffer for physical block writes (Pulse Check requirement) */
+    void* blk_buf = hn4_hal_mem_alloc(BS);
+    if (!blk_buf) {
+        _bench_destroy_mock_vol(vol);
+        return;
+    }
+
+    printf("[Lifecycle] Pre-populating %d files (Write + RAM Inject + Phys Block)...\n", COUNT);
+
+    /* 1. POPULATE */
+    for (int i = 0; i < COUNT; i++) {
+        hn4_anchor_t anchor = {0};
+        char name[32];
+        snprintf(name, 32, "%x", i); /* Simple Hex Name */
+        
+        anchor.seed_id.lo = i + 1;
+        anchor.seed_id.hi = 0;
+        anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+        anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+        anchor.write_gen = hn4_cpu_to_le32(1);
+        anchor.gravity_center = hn4_cpu_to_le64(100 + i); /* G offset to avoid SB */
+        anchor.orbit_vector[0] = 1; /* V=1 (Sequential) */
+        strncpy((char*)anchor.inline_buffer, name, 23);
+
+        /* Write Anchor to Disk (updates CRC internally) */
+        hn4_write_anchor_atomic(vol, &anchor);
+
+        /* Inject into RAM (Simulate Mount Scan) */
+        hn4_u128_t seed = hn4_le128_to_cpu(anchor.seed_id);
+        uint64_t h = seed.lo ^ seed.hi;
+        h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+        
+        size_t start_slot = h % slot_count;
+        size_t s = start_slot;
+        while(1) {
+            if (ram_slots[s].seed_id.lo == 0) {
+                ram_slots[s] = anchor;
+                break;
+            }
+            s = (s + 1) % slot_count;
+            if (s == start_slot) break;
+        }
+
+        /* 
+         * Write Valid Physical Block
+         * Required for hn4_undelete() integrity check (The Pulse Check)
+         */
+        hn4_block_header_t* hdr = (hn4_block_header_t*)blk_buf;
+        memset(hdr, 0, BS);
+        hdr->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+        hdr->well_id = anchor.seed_id;
+        hdr->generation = hn4_cpu_to_le64(1);
+        hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, hdr, offsetof(hn4_block_header_t, header_crc)));
+        
+        /* LBA Calc: G + (Index * V) = (100+i) + (0 * 1) = 100+i */
+        uint64_t lba_idx = 100 + i;
+        uint32_t spb = BS / 4096; /* Mock is 4K/4K = 1 */
+        hn4_addr_t lba_phys = hn4_lba_from_blocks(lba_idx * spb);
+        
+        hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, lba_phys, blk_buf, spb);
+        
+        /* Set Bitmap so Undelete sees "Allocated" (Not Reaped) */
+        _bitmap_op(vol, lba_idx, BIT_SET, NULL);
+    }
+
+    /* 2. BENCHMARK DELETE */
+    printf("[Lifecycle] Deleting %d files...\n", COUNT);
+    double start = _get_time_sec();
+    
+    for (int i = 0; i < COUNT; i++) {
+        char name[32];
+        snprintf(name, 32, "%x", i);
+        hn4_delete(vol, name);
+    }
+    
+    double t_del = HN4_SAFE_DURATION(_get_time_sec() - start);
+    printf("[Lifecycle] Delete Rate: %.2f K-Ops/sec\n", (double)COUNT / t_del / 1e3);
+
+    /* 3. BENCHMARK UNDELETE */
+    printf("[Lifecycle] Undeleting %d files (includes IO verify)...\n", COUNT);
+    start = _get_time_sec();
+    
+    volatile int success_cnt = 0;
+    for (int i = 0; i < COUNT; i++) {
+        char name[32];
+        snprintf(name, 32, "%x", i);
+        if (hn4_undelete(vol, name) == HN4_OK) success_cnt++;
+    }
+    
+    double t_undel = HN4_SAFE_DURATION(_get_time_sec() - start);
+    printf("[Lifecycle] Undelete Rate: %.2f K-Ops/sec (Success: %d/%d)\n", 
+           (double)COUNT / t_undel / 1e3, success_cnt, COUNT);
+
+    hn4_hal_mem_free(blk_buf);
+    _bench_destroy_mock_vol(vol);
+    _bench_free_ram_disk();
+}
+
+/* Add to REGISTRY array: */
 
 
 
@@ -1012,6 +1135,7 @@ static benchmark_entry_t REGISTRY[] = {
     { "shadow_hop_latency",  _bench_shadow_hop },
     { "metadata_scan",       _bench_metadata_scan },
     { "crc_throughput",      _bench_crc_throughput },
+    { "lifecycle_tombstone", _bench_lifecycle_tombstone },
     { NULL, NULL }
 };
 

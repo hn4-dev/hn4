@@ -454,11 +454,6 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         if (!(flags & HN4_O_CREAT)) return -HN4_ENOENT;
         if (vol->read_only) return -HN4_EROFS;
 
-        /* 
-         * FIX: PROBABILISTIC SLOT ALLOCATION 
-         * Instead of a linear scan, we must find a UUID that hashes to a free slot.
-         * This aligns the Disk Location (Hash Based) with the RAM Location.
-         */
         hn4_anchor_t* ram_base = (hn4_anchor_t*)vol->nano_cortex;
         size_t cortex_cnt = vol->cortex_size / sizeof(hn4_anchor_t);
         uint64_t target_slot = 0;
@@ -700,10 +695,18 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
         _imp_memory_barrier();
         
-        /* Range check the index to prevent OOB if cortex resized (unlikely but safe) */
         size_t max_slots = vol->cortex_size / sizeof(hn4_anchor_t);
         if (fh->anchor_idx < max_slots) {
-            fh->cached_anchor = ((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+            hn4_anchor_t* live = &((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+            
+            if (live->seed_id.lo != fh->cached_anchor.seed_id.lo ||
+                live->seed_id.hi != fh->cached_anchor.seed_id.hi) 
+            {
+                hn4_hal_spinlock_release(&vol->locking.l2_lock);
+                return -HN4_EBADF; /* Handle is dead */
+            }
+
+            fh->cached_anchor = *live;
         }
         
         hn4_hal_spinlock_release(&vol->locking.l2_lock);
@@ -783,9 +786,6 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
 
         /* 
          * C. ATOMIC WRITE (THE SHADOW HOP)
-         * FIX: We must pass a pointer to the GLOBAL anchor (or as close as possible)
-         * to ensure the CAS loop inside hn4_write_block_atomic operates on the
-         * Source of Truth, not a thread-local copy.
          */
         uint32_t valid_len = payload;
         
@@ -1047,6 +1047,12 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
         hn4_posix_unlink(vol, newpath);
     }
 
+    if (vol->nano_cortex) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        src.anchor = ((hn4_anchor_t*)vol->nano_cortex)[src.slot_idx];
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    }
+
     _imp_memset(src.anchor.inline_buffer, 0, HN4_INLINE_NAME_MAX);
     _imp_strncpy_safe((char*)src.anchor.inline_buffer, p, HN4_INLINE_NAME_MAX);
     
@@ -1055,8 +1061,21 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
     if (hn4_write_anchor_atomic(vol, &src.anchor) != HN4_OK) return -HN4_EIO;
 
     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-    ((hn4_anchor_t*)vol->nano_cortex)[src.slot_idx] = src.anchor;
-    _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[src.slot_idx], sizeof(hn4_anchor_t));
+    
+    /* Verify we still own the slot before overwriting RAM */
+    hn4_anchor_t* current_slot = &((hn4_anchor_t*)vol->nano_cortex)[src.slot_idx];
+    if (current_slot->seed_id.lo == src.anchor.seed_id.lo && 
+        current_slot->seed_id.hi == src.anchor.seed_id.hi) 
+    {
+        *current_slot = src.anchor;
+        _imp_dcache_flush(current_slot, sizeof(hn4_anchor_t));
+    }
+    else {
+        /* Slot was reused/changed. We successfully renamed on disk, but RAM is now desync.
+           Mark volume dirty to force reload or fail gracefully. */
+        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+    }
+
     hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
     return 0;
