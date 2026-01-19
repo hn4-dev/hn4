@@ -241,6 +241,9 @@ typedef uint8_t  hn4_byte_t;
 /* Add to On-Disk Structures */
 #define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" - Magic for data slots */
 
+#define HN4_DEV_STAT_OFFLINE    0
+#define HN4_DEV_STAT_ONLINE     1
+
 /* Format Profiles (sb.format_profile) */
 #define HN4_PROFILE_GENERIC     0
 #define HN4_PROFILE_GAMING      1
@@ -249,9 +252,17 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_PROFILE_PICO        4
 #define HN4_PROFILE_SYSTEM      5
 #define HN4_PROFILE_USB         6  
+#define HN4_PROFILE_HYPER_CLOUD 7
 
 #define HN4_MAX_REPLICAS        4
 #define HN4_QUORUM_THRESHOLD    3
+
+#define HN4_ARRAY_MODE_SINGLE    0
+#define HN4_ARRAY_MODE_MIRROR    1  /* 30.1 Gravity Well Entanglement */
+#define HN4_ARRAY_MODE_SHARD     2  /* 30.2 Ballistic Sharding */
+#define HN4_ARRAY_MODE_PARITY    3  /* 30.3 Parity Constellation */
+
+#define HN4_MAX_ARRAY_DEVICES    16
 
 /* Device Types (sb.device_type_tag) */
 #define HN4_DEV_SSD             0
@@ -611,6 +622,22 @@ typedef struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
     uint8_t        pad[HN4_CACHE_LINE_SIZE - sizeof(hn4_spinlock_t)];
 } hn4_shard_lock_t;
 
+typedef struct {
+    void*       dev_handle;      /* HAL Device Handle */
+    uint32_t    status;          /* 0=Offline, 1=Online */
+    uint64_t    usage_counter;   /* For load balancing */
+} hn4_drive_t;
+
+typedef struct {
+    uint32_t    mode;            /* HN4_ARRAY_MODE_* */
+    uint32_t    count;           /* Active devices */
+    hn4_drive_t devices[HN4_MAX_ARRAY_DEVICES];
+    
+    /* Aggregated Geometry */
+    hn4_size_t  total_pool_capacity;
+} hn4_array_ctx_t;
+
+
 
 /* Runtime Volumfe Handle */
 typedef struct {
@@ -627,6 +654,9 @@ typedef struct {
     
     hn4_size_t          vol_capacity_bytes;
     uint32_t            vol_block_size;
+
+   /* --- SPATIAL ARRAY ZONE --- */
+    hn4_array_ctx_t array; 
 
     /* Memory Structures */
     hn4_armored_word_t* void_bitmap;    /* Physical Allocator Bitmap (L1) */
