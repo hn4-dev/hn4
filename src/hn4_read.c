@@ -444,7 +444,14 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
              */
             memset(io_buf, 0xCC, 64);
 
-            io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_sector, io_buf, sectors);
+            io_res = _hn4_spatial_router(
+                vol, 
+                HN4_IO_READ, 
+                phys_sector, 
+                io_buf, 
+                sectors, 
+                well_id
+            );
 
             if (HN4_LIKELY(io_res == HN4_OK)) {
                 hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen, dclass);
@@ -519,17 +526,32 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 winner_idx = i;
                 deep_error = decomp_res;
 
-                if (HN4_UNLIKELY(profile == HN4_PROFILE_GAMING)) {
+                /* 
+                 * PREFETCH OPTIMIZATION:
+                 * - GAMING: Prefetch for asset streaming.
+                 * - HYPER_CLOUD: Prefetch for database table scans / blob streaming.
+                 */
+                if (profile == HN4_PROFILE_GAMING || profile == HN4_PROFILE_HYPER_CLOUD) {
                     uint8_t next_k = 0;
                     uint64_t next_cluster = (block_idx + 1) >> 4;
+                    
                     if (next_cluster < 16) {
                         uint32_t h = hn4_le32_to_cpu(anchor.orbit_hints);
                         next_k = (h >> (next_cluster * 2)) & 0x3;
                     }
                     
+                    /* Calculate next logical block */
                     uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, next_k);
+                    
                     if (next_lba != HN4_LBA_INVALID && next_lba < max_blocks) {
-                         hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
+                         #ifdef HN4_USE_128BIT
+                             hn4_u128_t blk_128 = hn4_u128_from_u64(next_lba);
+                             hn4_addr_t pf_phys = hn4_u128_mul_u64(blk_128, sectors);
+                         #else
+                             hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
+                         #endif
+                         
+                         /* Issue Non-Blocking Hint to Hardware */
                          hn4_hal_prefetch(vol->target_device, pf_phys, sectors);
                     }
                 }

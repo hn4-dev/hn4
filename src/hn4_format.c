@@ -122,7 +122,14 @@ static const hn4_profile_spec_t PROFILE_SPECS[] = {
     { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   1, "SYSTEM"  },
     
     /* [6] USB (Portable) */
-    { 128 * HN4_SZ_MB,  2  * HN4_SZ_TB,  65536,    65536,           1, "USB"     }
+    { 128 * HN4_SZ_MB,  2  * HN4_SZ_TB,  65536,    65536,           1, "USB"     },
+    
+    /* [7] HYPER_CLOUD (Server) 
+     * - 64KB Blocks: Optimal for checksum overhead vs throughput.
+     * - 1MB Align: RAID/Cloud stripe friendly.
+     * - Unlimited Cap: Ready for Quettabytes.
+     */
+    { 100 * HN4_SZ_GB,  HN4_CAP_UNLIMITED, 65536,  1 * HN4_SZ_MB,   1, "HYPER_CLOUD" }
 };
 
 
@@ -398,7 +405,7 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
 #ifdef HN4_USE_128BIT
     if (byte_len.lo == 0 && byte_len.hi == 0) return HN4_OK;
     
-    /* Alignment Check for 128-bit: Mask check low bits */
+    /* Alignment Check */
     hn4_u128_t q = hn4_u128_div_u64(byte_len, block_size);
     hn4_u128_t recon = hn4_u128_mul_u64(q, block_size);
     
@@ -415,6 +422,19 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     
     if (!HN4_IS_ALIGNED(block_size, ss)) return HN4_ERR_ALIGNMENT_FAIL;
 
+    hn4_size_t phys_cap = caps->total_capacity_bytes;
+    hn4_addr_t phys_limit_lba;
+
+#ifdef HN4_USE_128BIT
+    phys_limit_lba = hn4_u128_div_u64(phys_cap, ss);
+    
+    /* If start is already beyond physical, we are in virtual space. No-op. */
+    if (hn4_u128_cmp(start_lba, phys_limit_lba) >= 0) return HN4_OK;
+#else
+    phys_limit_lba = phys_cap / ss;
+    if (start_lba >= phys_limit_lba) return HN4_OK;
+#endif
+
     void* buffer = NULL;
     uint32_t buf_sz = 0;
 
@@ -428,12 +448,10 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     }
     
     if (!buffer) return HN4_ERR_NOMEM;
-   memset(buffer, 0, buf_sz);
+    memset(buffer, 0, buf_sz);
     
-    /* Manual loop to reuse the small zeroed buffer */
     hn4_size_t remaining = byte_len;
     hn4_addr_t current_lba = start_lba;
-    uint32_t sectors_per_chunk = buf_sz / ss; // ss loaded from caps previously
     
     hn4_result_t res = HN4_OK;
 
@@ -454,13 +472,49 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
 #endif
         
         /* IO must be block aligned */
-       uint32_t io_bytes = (chunk / ss) * ss;
-    
-    if (io_bytes == 0) break; /* Genuine progress failure */
+        uint32_t io_bytes = (chunk / ss) * ss;
+        if (io_bytes == 0) break;
 
-    res = hn4_hal_sync_io(dev, HN4_IO_WRITE, current_lba, buffer, (io_bytes / ss));
+        uint32_t io_sectors = io_bytes / ss;
+        hn4_addr_t end_lba = hn4_addr_add(current_lba, io_sectors);
 
-        current_lba = hn4_addr_add(current_lba, (io_bytes / ss));
+#ifdef HN4_USE_128BIT
+        if (hn4_u128_cmp(end_lba, phys_limit_lba) > 0) {
+            /* 
+             * Partial write at the edge. 
+             * Calculate sectors remaining until cliff. 
+             */
+            hn4_u128_t diff = hn4_u128_sub(phys_limit_lba, current_lba);
+            /* If we are exactly at edge or past, stop. */
+            if (diff.hi == 0 && diff.lo == 0) break;
+            
+            /* If remaining space is smaller than intended IO, shrink IO */
+            if (diff.hi == 0 && diff.lo < io_sectors) {
+                io_sectors = (uint32_t)diff.lo;
+                io_bytes = io_sectors * ss;
+            } else {
+                /* Should not happen if logic above is correct, but break to be safe */
+                break;
+            }
+        }
+#else
+        if (end_lba > phys_limit_lba) {
+            uint64_t diff = phys_limit_lba - current_lba;
+            if (diff == 0) break;
+            if (diff < io_sectors) {
+                io_sectors = (uint32_t)diff;
+                io_bytes = io_sectors * ss;
+            }
+        }
+#endif
+        /* If we clamped to 0, we are done */
+        if (io_bytes == 0) break;
+
+        res = hn4_hal_sync_io(dev, HN4_IO_WRITE, current_lba, buffer, io_sectors);
+        if (res != HN4_OK) break;
+
+        current_lba = hn4_addr_add(current_lba, io_sectors);
+
 #ifdef HN4_USE_128BIT
         remaining = hn4_u128_sub(remaining, hn4_u128_from_u64(io_bytes));
 #else
@@ -471,6 +525,7 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     hn4_hal_mem_free(buffer);
     return res;
 }
+
 
 
 /**
@@ -697,12 +752,25 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
      */
       uint64_t cortex_sz;
     
-    /* Overflow Guard: Check if Cap * 2 fits in u64 */
-    if (capacity_bytes > (UINT64_MAX / 2)) {
-        cortex_sz = (capacity_bytes / 100) * 2; /* Must divide first */
-    } else {
-        cortex_sz = (capacity_bytes * 2) / 100; /* Multiply first for precision */
-    }
+    #ifdef HN4_USE_128BIT
+        /* 128-bit math for cortex size calculation */
+        hn4_u128_t cap_128 = capacity_bytes;
+    
+        /* 2% Logic: (Cap / 100) * 2 */
+        hn4_u128_t one_pct = hn4_u128_div_u64(cap_128, 100);
+        hn4_u128_t two_pct = hn4_u128_mul_u64(one_pct, 2);
+    
+        /* Clamp to u64 for metadata region size (practical limit) */
+        if (two_pct.hi > 0) cortex_sz = UINT64_MAX;
+        else cortex_sz = two_pct.lo;
+    #else
+        /* Standard 64-bit Logic */
+        if (capacity_bytes > (UINT64_MAX / 2)) {
+            cortex_sz = (capacity_bytes / 100) * 2;
+        } else {
+            cortex_sz = (capacity_bytes * 2) / 100;
+        }
+    #endif
     
     /* PICO on Floppy (1.44MB) needs minimal Cortex to save space for data */
     if (pid == HN4_PROFILE_PICO && capacity_bytes < 100 * HN4_SZ_MB) {
@@ -894,30 +962,55 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     if (HN4_UNLIKELY(res != HN4_OK)) return res;
 
     /* --- STEP 2: SANITIZE (THE NUKE) --- */
-    hn4_size_t total_cap = sb_cpu.info.total_capacity;
+    hn4_size_t sb_cap = sb_cpu.info.total_capacity;
+    hn4_size_t phys_cap = caps->total_capacity_bytes;
+    hn4_size_t wipe_cap;
+
+    /* 
+     * Spatial Array / Virtual Capacity Safety:
+     * If the FS geometry (sb_cap) exceeds physical storage (phys_cap),
+     * we must only sanitize what physically exists to avoid HAL/Hardware errors.
+     */
+#ifdef HN4_USE_128BIT
+    if (hn4_u128_cmp(sb_cap, phys_cap) > 0) {
+        wipe_cap = phys_cap;
+    } else {
+        wipe_cap = sb_cap;
+    }
+#else
+    wipe_cap = (sb_cap > phys_cap) ? phys_cap : sb_cap;
+#endif
 
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
         #ifdef HN4_USE_128BIT
 
         hn4_u128_t zone_sz_128 = hn4_u128_from_u64(caps->zone_size_bytes);
-        hn4_u128_t rem = hn4_u128_mod(total_cap, zone_sz_128);
         
+        /* Check alignment of the Logical SB Capacity */
+        hn4_u128_t rem = hn4_u128_mod(sb_cap, zone_sz_128);
         if (rem.lo != 0 || rem.hi != 0) {
             HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
             return HN4_ERR_ALIGNMENT_FAIL;
         }
+        
+        /* Ensure wipe_cap is also zone aligned (clamp down if phys_cap is weird) */
+        rem = hn4_u128_mod(wipe_cap, zone_sz_128);
+        if (rem.lo != 0 || rem.hi != 0) {
+             wipe_cap = hn4_u128_sub(wipe_cap, rem);
+        }
+
         #else
-        if (total_cap % caps->zone_size_bytes != 0) {
+        if (sb_cap % caps->zone_size_bytes != 0) {
             HN4_LOG_CRIT("ZNS Format Error: Calculated capacity is not zone-aligned.");
             return HN4_ERR_ALIGNMENT_FAIL;
         }
+        /* Align wipe cap */
+        wipe_cap = HN4_ALIGN_DOWN(wipe_cap, caps->zone_size_bytes);
         #endif
         
-        /* Update _sanitize_zns signature to take hn4_size_t */
-        res = _sanitize_zns(dev, total_cap, caps->zone_size_bytes, caps->logical_block_size);
+        res = _sanitize_zns(dev, wipe_cap, caps->zone_size_bytes, caps->logical_block_size);
     } else {
-        /* Update _sanitize_generic signature to take hn4_size_t */
-        res = _sanitize_generic(dev, total_cap, caps->logical_block_size);
+        res = _sanitize_generic(dev, wipe_cap, caps->logical_block_size);
     }
     
     if (HN4_UNLIKELY(res != HN4_OK)) {
@@ -1028,9 +1121,15 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         if ((end_lba) < (start_lba)) { \
              return HN4_ERR_GEOMETRY; \
         } \
-        uint64_t count_ = (end_lba) - (start_lba); \
-        uint64_t len_ = count_ * ss; \
-        if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
+        uint64_t phys_end_sect_ = caps->total_capacity_bytes / ss; \
+        uint64_t safe_end_ = (end_lba); \
+        if (safe_end_ > phys_end_sect_) safe_end_ = phys_end_sect_; \
+        \
+        if (safe_end_ > (start_lba)) { \
+            uint64_t count_ = safe_end_ - (start_lba); \
+            uint64_t len_ = count_ * ss; \
+            if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
+        } \
     } while(0)
 #endif
 
@@ -1119,7 +1218,10 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
 
 #else
     /* Standard 64-bit Logic */
-    uint64_t cap_bytes = hn4_addr_to_u64(sb_cpu.info.total_capacity);
+     uint64_t cap_bytes = hn4_addr_to_u64(sb_cpu.info.total_capacity);
+    /* Use physical capacity for bounds checking */
+    uint64_t phys_bytes = hn4_addr_to_u64(caps->total_capacity_bytes);
+
     uint64_t east_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 33, bs);
     uint64_t west_bytes = HN4_ALIGN_UP((cap_bytes / 100) * 66, bs);
     uint64_t sb_reservation_sz = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
@@ -1139,6 +1241,14 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
 
     if (caps->hw_flags & HN4_HW_ZNS_NATIVE) write_south = false;
 
+    /* 
+     * If Virtual Layout > Physical Drive, disable mirrors that land in the void.
+     * They will be written later by the Array Controller during expansion/rebalance.
+     */
+    bool write_east = (east_bytes + write_sz <= phys_bytes);
+    bool write_west = (west_bytes + write_sz <= phys_bytes);
+    if (south_bytes + write_sz > phys_bytes) write_south = false;
+
 #endif
 
     res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
@@ -1146,8 +1256,8 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     if (res == HN4_OK) {
         hn4_hal_barrier(dev);
 
-        if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
-        if (res == HN4_OK) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
+        if (res == HN4_OK && write_east) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
+        if (res == HN4_OK && write_west) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
         
         /* Use the boolean calculated above */
         if (res == HN4_OK && write_south) {
@@ -1174,6 +1284,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     }
 
     /* Poison on Failure */
+   /* Poison on Failure */
     if (HN4_UNLIKELY(res != HN4_OK)) {
         HN4_LOG_CRIT("SB Commit Failed. Poisoning geometry.");
         memset(sb_buf, 0xDE, write_sz); 
@@ -1189,9 +1300,17 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         
         for (int i = 0; i < HN4_WRITE_RETRY_LIMIT; i++) {
             hn4_result_t w_res = HN4_OK;
+            
+            /* Always poison North (LBA 0) */
             if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
-            if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
-            if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            
+            if (write_east) {
+                if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            }
+            
+            if (write_west) {
+                if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;
+            }
             
             if (write_south) {
                 if (hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs) != HN4_OK) w_res = HN4_ERR_HW_IO;

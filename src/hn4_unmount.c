@@ -519,6 +519,9 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         _safe_release_mem((void**)&vol->quality_mask, vol->qmask_size, should_zero);
         _safe_release_mem((void**)&vol->locking.l2_summary_bitmap, 0, false); 
         _safe_release_mem((void**)&vol->nano_cortex, vol->cortex_size, should_zero);
+        
+        size_t topo_sz = vol->topo_count * sizeof(*vol->topo_map);
+        _safe_release_mem((void**)&vol->topo_map, topo_sz, false);
 
         if (should_zero) _secure_zero(vol, sizeof(hn4_volume_t));
         hn4_hal_mem_free(vol);

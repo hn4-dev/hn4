@@ -218,8 +218,8 @@ _Check_return_ hn4_result_t hn4_repair_block(
         HN4_LOG_CRIT("[TRIAGE] HEAL FAILED LBA %llu. Code %d. Marked TOXIC.",
                      (unsigned long long)hn4_addr_to_u64(bad_lba), res);
 
-        /* Only increment toxic counter if we actually transitioned state to avoid double-counting */
-        if (transition_to_toxic) {
+        /* Ensure we only count TOXIC transitions for actual media errors */
+        if (transition_to_toxic && res == HN4_ERR_MEDIA_TOXIC) {
             atomic_fetch_add(&vol->health.toxic_blocks, 1);
         }
 

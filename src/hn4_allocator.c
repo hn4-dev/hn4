@@ -69,7 +69,7 @@ static const uint8_t _hn4_prof_policy[8] = {
     [HN4_PROFILE_PICO]    = HN4_POL_SEQ,
     [HN4_PROFILE_SYSTEM]  = 0,
     [HN4_PROFILE_USB]     = HN4_POL_SEQ | HN4_POL_DEEP,
-    [7]                   = 0
+    [HN4_PROFILE_HYPER_CLOUD] = HN4_POL_DEEP
 };
 
 
@@ -503,11 +503,18 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     hn4_u128_t blocks_128;
 
     if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
-        /* Power of 2 optimization: Count Trailing Zeros */
         int shift = __builtin_ctz(vol->vol_block_size);
-        /* Right shift 128-bit value */
-        blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
-        blocks_128.hi = (cap_128.hi >> shift);
+        
+        /* FIX: Handle edge cases where shift is 0 or >= 64 to avoid UB */
+        if (shift == 0) {
+            blocks_128 = cap_128;
+        } else if (shift >= 64) {
+            blocks_128.lo = (cap_128.hi >> (shift - 64));
+            blocks_128.hi = 0;
+        } else {
+            blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
+            blocks_128.hi = (cap_128.hi >> shift);
+        }
     } else {
         blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
     }
@@ -1086,32 +1093,37 @@ static bool _try_reserve_cortex_slots(
 {
     for (uint32_t i = 0; i < count; i++) {
         uint64_t idx = start_idx + i;
-        
-        /* 
-         * CAST SAFETY: 
-         * hn4_anchor_t is 128-byte aligned. data_class is at offset 0x30 (48).
-         * 48 is 8-byte aligned, so atomic u64 access is safe on x64/ARM64.
-         */
         _Atomic uint64_t* dc_ptr = (_Atomic uint64_t*)&anchors[idx].data_class;
         
-        uint64_t expected = 0;
-        uint64_t desired  = HN4_MAGIC_NANO_PENDING;
+        uint64_t expected = atomic_load(dc_ptr);
         
-        /* Optimistic Claim: Transition 0 -> PENDING */
+        bool is_claimable = (expected == 0);
+        
+        if (!is_claimable && expected == HN4_MAGIC_NANO_PENDING) {
+             /* NOTE: In NANO_PENDING state, 'mass' holds the timestamp. */
+             uint64_t ts = anchors[idx].mass; /* Atomic read of u64 aligned is safe */
+             if ((hn4_hal_get_time_ns() - ts) > 30000000000ULL) {
+                 is_claimable = true;
+             }
+        }
+
+        if (!is_claimable) return false;
+
+        uint64_t desired = HN4_MAGIC_NANO_PENDING;
+        
+        /* CAS Loop to handle the specific expected value */
         if (!atomic_compare_exchange_strong(dc_ptr, &expected, desired)) {
-            /* 
-             * COLLISION DETECTED: ROLLBACK.
-             * We must release any slots we successfully claimed in this partial run
-             * to prevent dead/stuck PENDING slots.
-             */
+             /* Failed. Rollback. */
             for (uint32_t k = 0; k < i; k++) {
                 atomic_store((_Atomic uint64_t*)&anchors[start_idx + k].data_class, 0);
             }
             return false; 
         }
+        
+        /* Store timestamp in mass for timeout tracking */
+        atomic_store((_Atomic uint64_t*)&anchors[idx].mass, hn4_hal_get_time_ns());
     }
     
-    /* Memory Fence: Ensure reservation is visible before IO starts */
     atomic_thread_fence(memory_order_acquire);
     return true; 
 }

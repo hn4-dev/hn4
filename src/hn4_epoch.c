@@ -384,13 +384,21 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
 
     uint64_t ring_len_blks = (target_sz + bs - 1) / bs;
     
-    if (HN4_UNLIKELY(ring_curr_blk_idx < ring_start_blk_idx)) {
+    /* SANITY CHECK: Pointer Regression / Corruption */
+    if (ring_curr_blk_idx < ring_start_blk_idx) {
         hn4_hal_mem_free(io_buf);
         return HN4_ERR_DATA_ROT; 
     }
 
     /* Advance Pointer */
     uint64_t relative_idx = ring_curr_blk_idx - ring_start_blk_idx;
+    
+    /* SANITY CHECK: Pointer Out of Bounds */
+    if (relative_idx >= ring_len_blks) {
+        /* Self-heal: Reset to start of ring */
+        relative_idx = 0;
+    }
+
     uint64_t next_relative_idx = (relative_idx + 1) % ring_len_blks;
     uint64_t write_blk_idx = ring_start_blk_idx + next_relative_idx;
 

@@ -353,13 +353,17 @@ static hn4_result_t _reap_tombstone(
     /* Preserve generation to prevent races */
     dead_anchor.write_gen = anchor->write_gen; 
     
+    uint32_t current_gen_check = atomic_load((_Atomic uint32_t*)&anchor->write_gen);
+    if (hn4_le32_to_cpu(current_gen_check) != start_gen) {
+        hn4_hal_mem_free(vbuf);
+        return HN4_ERR_GENERATION_SKEW;
+    }
+
     res = hn4_write_anchor_atomic(vol, &dead_anchor);
 
     if (res == HN4_OK) {
         hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-        /* Guard against resurrection race */
         if (hn4_le32_to_cpu(anchor->write_gen) == start_gen) {
-            /* FIX: Update RAM with Bleached state, do not zero */
             memcpy(anchor, &dead_anchor, sizeof(hn4_anchor_t));
         } else {
             res = HN4_ERR_GENERATION_SKEW;
@@ -585,8 +589,11 @@ static void _evacuate_zns_victim(
     }
 
     hn4_hal_mem_free(io_buf);
-
-    if (evacuated_count == valid_count && valid_count > 0) {
+    /* 
+     * Reset zone if all valid data was moved, OR if the zone contains 
+     * only garbage (valid_count == 0).
+     */
+     if (evacuated_count == valid_count) {
         hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_ZONE_RESET,
                                            hn4_lba_from_sectors(zone_start_lba), NULL, 0);
         if (res == HN4_OK) {
@@ -682,6 +689,11 @@ static void _rollback_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t seed_h
         if (key == old_lba) {
             uint64_t seed = atomic_load(&vol->redirect.delta_table[idx].seed_hash);
             if (seed == seed_hash) {
+                atomic_store_explicit(&vol->redirect.delta_table[idx].new_lba, 0, memory_order_relaxed);
+                atomic_store_explicit(&vol->redirect.delta_table[idx].version, 0, memory_order_relaxed);
+                atomic_store_explicit(&vol->redirect.delta_table[idx].seed_hash, 0, memory_order_relaxed);
+                
+                /* Release Key last to maintain consistency */
                 atomic_store_explicit(&vol->redirect.delta_table[idx].old_lba, 0, memory_order_release);
                 return;
             }
@@ -713,6 +725,8 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
     uint32_t start_gen_native = hn4_le32_to_cpu(anchor->write_gen);
     hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
     uint64_t seed_hash = seed.lo ^ seed.hi;
+    
+    if (seed_hash == 0) seed_hash = 1;
     
     /* Calculate New Vector */
     uint64_t V = 0; 

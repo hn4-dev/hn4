@@ -508,9 +508,12 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
                     return -HN4_EEXIST; /* Race condition: File created between resolve and now */
                 }
 
-                /* Slot Free & Name Unique: RESERVE SLOT */
-                /* Mark as Valid but Empty to hold the lock logic */
-                slot_ptr->seed_id = new_anc.seed_id; /* Set the UUID immediately */
+                memset(slot_ptr->inline_buffer, 0, sizeof(slot_ptr->inline_buffer));
+                slot_ptr->permissions = 0;
+                slot_ptr->gravity_center = 0;
+                slot_ptr->mass = 0;
+                
+                slot_ptr->seed_id = new_anc.seed_id; 
                 slot_ptr->data_class = hn4_cpu_to_le64(HN4_FLAG_VALID); 
                 slot_reserved = true;
 
@@ -1062,7 +1065,7 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
 
     hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
     
-    /* Verify we still own the slot before overwriting RAM */
+   /* Verify we still own the slot before overwriting RAM */
     hn4_anchor_t* current_slot = &((hn4_anchor_t*)vol->nano_cortex)[src.slot_idx];
     if (current_slot->seed_id.lo == src.anchor.seed_id.lo && 
         current_slot->seed_id.hi == src.anchor.seed_id.hi) 
@@ -1071,9 +1074,21 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
         _imp_dcache_flush(current_slot, sizeof(hn4_anchor_t));
     }
     else {
-        /* Slot was reused/changed. We successfully renamed on disk, but RAM is now desync.
-           Mark volume dirty to force reload or fail gracefully. */
-        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        
+        uint64_t new_slot_idx;
+        hn4_result_t find_res = _ns_scan_cortex_slot(vol, hn4_le128_to_cpu(src.anchor.seed_id), NULL, &new_slot_idx);
+        
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        
+        if (find_res == HN4_OK) {
+            /* Found the new location, update it */
+            ((hn4_anchor_t*)vol->nano_cortex)[new_slot_idx] = src.anchor;
+            _imp_dcache_flush(&((hn4_anchor_t*)vol->nano_cortex)[new_slot_idx], sizeof(hn4_anchor_t));
+        } else {
+            /* Total desync: Mark dirty to force eventual reload */
+            atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+        }
     }
 
     hn4_hal_spinlock_release(&vol->locking.l2_lock);

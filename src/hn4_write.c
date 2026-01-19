@@ -58,7 +58,8 @@ static const uint8_t _prof_policy_lut[8] = {
     [HN4_PROFILE_PICO]    = HN4_POL_SEQ,
     [HN4_PROFILE_SYSTEM]  = 0,
     [HN4_PROFILE_USB]     = HN4_POL_SEQ,
-    [7]                   = 0
+     /* HYPER_CLOUD: 0 = Allow Ballistic Scatter (High IOPS) */
+    [HN4_PROFILE_HYPER_CLOUD] = 0 
 };
 
 /* =========================================================================
@@ -469,8 +470,16 @@ retry_transaction:;
     uint32_t final_algo = HN4_COMP_NONE;
     uint32_t stored_len = len;
 
-    bool try_compress = (dclass_check & HN4_HINT_COMPRESSED) ||
-                        (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE);
+    /* OPTIMIZATION: 
+     * - ARCHIVE: Always try to compress.
+     * - HYPER_CLOUD: Never speculate. Only compress if HINT_COMPRESSED is explicitly set.
+     *   (Server workloads are often already compressed/encrypted; avoiding the CPU hit boosts IOPS).
+     */
+    bool try_compress = (dclass_check & HN4_HINT_COMPRESSED);
+    
+    if (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE) {
+        try_compress = true;
+    }
 
     /* 
      * If this is an Overwrite (old_lba valid), do NOT re-compress immediately.
@@ -790,10 +799,6 @@ retry_transaction:;
                     
                     txn_anchor.gravity_center = hn4_cpu_to_le64(new_G);
                     
-                    /* Note: This is safe because we haven't committed the Generation yet. 
-                       If we fail later, the old Generation makes this G update irrelevant/ignored. */
-                    anchor->gravity_center = hn4_cpu_to_le64(new_G);
-                    
                     /* Update Bitmap: Release 'target', Claim 'actual' */
                     _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
                     _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
@@ -812,16 +817,15 @@ retry_transaction:;
                      * We cannot shift G without breaking Blocks 0..N-1.
                      * This indicates a Zone Hole or unauthorized write. Fatal.
                      */
-                    HN4_LOG_CRIT("ZNS Drift Fatal: Mid-file deviation (Blk %llu). Exp %llu Got %llu.",
+                     HN4_LOG_CRIT("ZNS Drift Fatal: Mid-file deviation (Blk %llu). Exp %llu Got %llu.",
                                  (unsigned long long)block_idx, 
                                  (unsigned long long)target_lba, 
                                  (unsigned long long)actual_lba_idx);
 
-                    /* Rollback the bitmap claim on the predicted block */
                     _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
                     
-                    /* Mark the ACTUAL block as dirty/used to prevent future collisions */
                     _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
+                    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
 
                     hn4_hal_mem_free(io_buf);
                     return HN4_ERR_GEOMETRY;
@@ -843,7 +847,14 @@ retry_transaction:;
 
         int tries = 0;
         do {
-            io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, phys_sector, io_buf, sectors);
+            io_res = _hn4_spatial_router(
+                vol, 
+                HN4_IO_WRITE, 
+                phys_sector, 
+                io_buf, 
+                sectors, 
+                hn4_le128_to_cpu(anchor->seed_id)
+            );
             
             if (HN4_UNLIKELY(io_res != HN4_OK)) {
                 if (++tries < max_retries) {
@@ -953,9 +964,25 @@ retry_transaction:;
      * We do not trust the NVM flag alone; the HAL must opt-in to the
      * strict durability contract.
      */
+     bool skip_barrier = false;
+
+    /* NVM Optimization */
     if ((vol->sb.info.hw_caps_flags & HN4_HW_NVM) &&
-        (vol->sb.info.hw_caps_flags & HN4_HW_STRICT_FLUSH))
-    {
+        (vol->sb.info.hw_caps_flags & HN4_HW_STRICT_FLUSH)) {
+        skip_barrier = true;
+    }
+
+    /* 
+     * HYPER_CLOUD OPTIMIZATION:
+     * Server environments typically have battery-backed write caches.
+     * We skip per-block FUA/Flush to maximize IOPS. Durability is 
+     * deferred to the Journal/Epoch flush (Async Consistency).
+     */
+    if (vol->sb.info.format_profile == HN4_PROFILE_HYPER_CLOUD) {
+        skip_barrier = true;
+    }
+
+    if (skip_barrier) {
         io_res = HN4_OK;
     } else {
         /* Default to Safe: Issue explicit flush */
