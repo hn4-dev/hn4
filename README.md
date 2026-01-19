@@ -12,7 +12,7 @@
 
 </div>
 
-**HN4** is a high-speed storage engine built for modern hardware like NVMe SSDs and Zoned Storage (ZNS). It ignores old design rules—like spinning hard drives and folder trees—to achieve **instant access speeds** and **constant performance**.
+**HN4** is a high-speed storage engine built for the physics of modern infrastructure. It optimizes for the specific constraints of the hardware—enforcing strict sequentiality for **Spinning Hard Drives** and **Zoned Storage (ZNS)**, while unleashing ballistic parallelism for **NVMe SSDs**.
 
 If standard file systems are like filing cabinets, HN4 is a teleportation device.
 
@@ -51,8 +51,8 @@ HN4 replaces complex file system structures with simple physics equations.
     *   **$G$** is where you start (e.g., 12 o'clock).
     *   **$V$** is how many hours you jump for every chunk of the file.
     
-    If $V=1$, you write to 12, 1, 2, 3 (Sequential).
-    If $V=5$, you write to 12, 5, 10, 3 (Scattered).
+    If $V=1$, you write to 12, 1, 2, 3 (**Sequential**). This is used for HDDs and ZNS to prevent head thrashing.
+    If $V=5$, you write to 12, 5, 10, 3 (**Scattered**). This is used for SSDs to maximize parallelism.
     
     Because this is pure math, the CPU knows exactly where "Chunk 500" is instantly, without looking it up in a list.
 
@@ -78,17 +78,36 @@ In servers with multiple GPUs, data travel time matters. HN4 checks which GPU is
 
 ---
 
-## 4. Reading and Writing
+## 4. Hyper-Cloud & Spatial Arrays
+
+HN4 includes a native **Spatial Array Router** designed for Enterprise and Cloud environments. This allows HN4 to manage multiple physical disks directly, bypassing legacy RAID controllers.
+
+### 4.1. Gravity Well Entanglement (Mirroring)
+In this mode, HN4 writes data to multiple drives simultaneously for redundancy.
+*   **Read:** Data is read from the drive with the lowest current load or latency.
+*   **Zombie Defense:** If a write fails on one mirror, that drive is instantly marked offline, preventing "stale reads" without pausing the system.
+
+### 4.2. Ballistic Sharding (Striping)
+HN4 distributes data across drives mathematically based on the File ID.
+*   **Deterministic Location:** The driver knows exactly which physical drive holds a specific file without checking a central index.
+*   **Alignment:** Enforces 1MB alignment to ensure writes mesh perfectly with cloud storage stripe sizes.
+
+### 4.3. Battery-Backed Optimization
+When running in the **HYPER_CLOUD** profile, HN4 assumes the presence of battery-backed RAID controllers. It optimizes write throughput by disabling per-block flush commands (FUA), relying instead on Async Consistency for maximum IOPS.
+
+---
+
+## 5. Reading and Writing
 
 HN4 treats Data (Payload) and Metadata (Maps) differently to keep speed high.
 
-### 4.1. Writing Data
+### 5.1. Writing Data
 1.  **Calculate:** To change a file, the driver increments a version counter. This changes the math variables ($G, V$), creating a new path on the disk.
 2.  **Write:** Data is sent to this new path.
 3.  **Confirm:** The driver waits for the hardware to confirm the write.
 4.  **Update:** The file's metadata in memory is updated to the new version.
 
-### 4.2. Reading Data
+### 5.2. Reading Data
 Reading doesn't involve looking up pointers in a table. It involves re-calculating the location.
 
 1.  **Project:** The driver reads the file's metadata to get the math variables ($G, V$).
@@ -99,12 +118,12 @@ Reading doesn't involve looking up pointers in a table. It involves re-calculati
     *   **Version:** Is this the latest version?
 4.  **Retry:** If verification fails (e.g., we found an old version), the driver calculates the next possible location and tries again.
 
-### 4.3. Saving State
+### 5.3. Saving State
 Data is saved immediately. Structure maps are saved during **Sync** or **Unmount**. The metadata is written to 4 physical locations (North, East, West, South) on the disk to ensure the drive remains readable even if parts of it degrade.
 
 ---
 
-## 5. Finding Files (Namespace)
+## 6. Finding Files (Namespace)
 
 HN4 uses a flat list for metadata called the **Cortex**. There are no folders.
 
@@ -115,7 +134,7 @@ To find a file:
 
 ---
 
-## 6. Storage Profiles
+## 7. Storage Profiles
 
 HN4 changes its layout based on the device it is formatting.
 
@@ -126,11 +145,12 @@ HN4 changes its layout based on the device it is formatting.
 | **SYSTEM** | Bootloaders | 4KB | Moves metadata to the middle of the drive for faster access. Reserves space for boot files. |
 | **GAMING** | PC Workstations | 64KB | Forces game assets to the outer edge of hard drives (where read speeds are faster). |
 | **AI** | GPU Clusters | 64KB - 2MB | Uses massive blocks to match GPU memory. Enables location-aware storage. |
-| **ARCHIVE** | Tape / HDD | 64KB+ | **Linear Mode.** Writes data in a strict straight line. Essential for Tape drives or Shingled HDDs that act poorly with random writes. |
+| **ARCHIVE** | Tape / HDD | 64KB+ | **Linear Mode.** Writes data in a strict straight line ($V=1$). Essential for Tape drives or Shingled HDDs that act poorly with random writes. |
+| **HYPER_CLOUD** | Enterprise Arrays | 64KB | **Native Arrays.** Enforces 1MB alignment for striping. Activates Spatial Router. Disables speculative compression to maximize CPU IOPS. |
 
 ---
 
-## 7. Developer Integration
+## 8. Developer Integration
 
 To use HN4 in your OS or firmware:
 
@@ -143,7 +163,7 @@ To use HN4 in your OS or firmware:
 
 ---
 
-## 8. Build & Usage
+## 9. Build & Usage
 
 ### Building for Test (Linux/macOS)
 ```bash
@@ -169,6 +189,7 @@ gcc -std=c11 -O3 -ffreestanding -nostdlib \
     -c src/hn4_read.c \
     -c src/hn4_write.c \
     -c src/hn4_tensor.c \
+    -c src/hn4_io_router.c \
     -I include/ \
     -o hn4_driver.o
 ```
