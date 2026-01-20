@@ -102,9 +102,20 @@ static inline void _atomic_store_u128(hn4_size_t* ptr, hn4_size_t val) {
     }
 
 #if defined(__x86_64__) || defined(_M_X64)
-    __asm__ volatile ("movdqa %1, %0" : "=m"(*ptr) : "x"((__uint128_t)val) : "memory");
+    #ifdef HN4_USE_128BIT
+        unsigned __int128 v_scalar = ((unsigned __int128)val.hi << 64) | val.lo;
+    #else
+        unsigned __int128 v_scalar = (unsigned __int128)val;
+    #endif
+    __asm__ volatile ("movdqa %1, %0" : "=m"(*ptr) : "x"(v_scalar) : "memory");
+
 #elif defined(__aarch64__)
-    __asm__ volatile ("stp %0, %1, [%2]" : : "r"(val.lo), "r"(val.hi), "r"(ptr) : "memory");
+    #ifdef HN4_USE_128BIT
+        __asm__ volatile ("stp %0, %1, [%2]" : : "r"(val.lo), "r"(val.hi), "r"(ptr) : "memory");
+    #else
+        /* Handle 64-bit case for ARM64 if size_t is just u64 */
+        __asm__ volatile ("str %0, [%1]" : : "r"(val), "r"(ptr) : "memory");
+    #endif
 #else
     *ptr = val;
     atomic_thread_fence(memory_order_release);
@@ -344,11 +355,11 @@ hn4_result_t hn4_pool_add_device(
     /* Use Generation ID as version constraint */
     uint64_t gen_id = vol->sb.info.copy_generation;
 
-    hn4_result_t log_res = hn4_chronicle_append(NULL, vol, HN4_CHRONICLE_OP_FORK, 
+    hn4_result_t log_res = hn4_chronicle_append(vol->target_device, vol, HN4_CHRONICLE_OP_FORK, 
                          hn4_lba_from_sectors(old_count), 
                          hn4_lba_from_sectors(gen_id),     /* Log topology version */
                          dev_sig);
-
+        
     if (log_res != HN4_OK) {
         HN4_LOG_CRIT("Pool: Audit Log Failed (%d). Rolling back.", log_res);
         

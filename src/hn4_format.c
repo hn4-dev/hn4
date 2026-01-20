@@ -716,7 +716,13 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     if (ss == 0 || (bs % ss) != 0) return HN4_ERR_ALIGNMENT_FAIL;
 
     sb_out->info.block_size = bs;
+
+#ifdef HN4_USE_128BIT
+    /* Direct struct copy (hn4_size_t -> hn4_addr_t are same types here) */
+    sb_out->info.total_capacity = capacity_bytes;
+#else
     sb_out->info.total_capacity = hn4_addr_from_u64(capacity_bytes);
+#endif
 
     /* Alignment Target from Profile */
     uint32_t align = spec->alignment_target;

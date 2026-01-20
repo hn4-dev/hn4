@@ -1502,13 +1502,29 @@ perform_disk_claim:
          * The Bitmap update below is the critical persistence helper for allocators.
          */
         
-        if (vol->nano_cortex && vol->locking.cortex_occupancy_bitmap) {
-            /* Update Bitmap for ALL slots in the run */
+        if (vol->nano_cortex) {
+            hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
+            /* 
+             * Update Anchors (Primary Truth) 
+             * We behave as if we reserved them via Path A.
+             */
             for (uint32_t k = 0; k < slots_needed; k++) {
-                uint64_t s = current_slot + k;
-                uint64_t w = s / 64;
-                uint64_t b = s % 64;
-                atomic_fetch_or((_Atomic uint64_t*)&vol->locking.cortex_occupancy_bitmap[w], (1ULL << b));
+                /* Store PENDING magic so scanners see it as occupied */
+                atomic_store_explicit(
+                    (_Atomic uint64_t*)&anchors[current_slot + k].data_class, 
+                    HN4_MAGIC_NANO_PENDING, 
+                    memory_order_release
+                );
+            }
+
+            /* Update Bitmap (Acceleration) */
+            if (vol->locking.cortex_occupancy_bitmap) {
+                for (uint32_t k = 0; k < slots_needed; k++) {
+                    uint64_t s = current_slot + k;
+                    uint64_t w = s / 64;
+                    uint64_t b = s % 64;
+                    atomic_fetch_or((_Atomic uint64_t*)&vol->locking.cortex_occupancy_bitmap[w], (1ULL << b));
+                }
             }
         }
 
@@ -1832,7 +1848,20 @@ _calc_trajectory_lba(
     uint64_t S           = 1ULL << M;
 
     /* Calculate Flux Domain Boundaries */
-    uint64_t total_blocks    = vol->vol_capacity_bytes / bs;
+     uint64_t total_blocks;
+
+#ifdef HN4_USE_128BIT
+    /* Use primitive division for 128-bit capacity */
+    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
+    hn4_u128_t blocks_128 = hn4_u128_div_u64(cap_128, bs);
+    
+    /* Trajectory math uses 64-bit indices. If capacity > 18EB (2^64 blocks), we clamp. */
+    if (HN4_UNLIKELY(blocks_128.hi > 0)) total_blocks = UINT64_MAX;
+    else total_blocks = blocks_128.lo;
+#else
+    total_blocks = vol->vol_capacity_bytes / bs;
+#endif
+
     uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
     uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
 

@@ -71,7 +71,7 @@ static inline uint64_t _ns_hash_uuid(hn4_u128_t id)
  * Implements Spec 5.1: "Hash 'Finance' -> 3 bit positions".
  * Maps a string tag to a 64-bit Bloom Filter mask with 3 bits set.
  */
-static uint64_t _ns_generate_tag_mask(const char* tag, size_t len) 
+ uint64_t _ns_generate_tag_mask(const char* tag, size_t len) 
 {
     /* FNV-1a Base */
     uint64_t hash = 0xCBF29CE484222325ULL;

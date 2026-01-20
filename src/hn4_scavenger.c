@@ -112,7 +112,7 @@ static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba
         uint64_t existing_key = atomic_load_explicit(&vol->redirect.delta_table[idx].old_lba, memory_order_acquire);
         uint64_t existing_seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
         
-        /* FIX: Use CAS to claim the slot ownership */
+        /* Use CAS to claim the slot ownership */
         if (existing_key == 0) {
             uint64_t expected = 0;
             /* Tentatively claim slot with the Key using CAS */
@@ -123,11 +123,17 @@ static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba
                 memory_order_acq_rel, 
                 memory_order_acquire)) 
             {
-                /* CAS failed: Slot was taken by another thread. Re-evaluate loop. */
-                continue; 
+                /* CAS failed. Check if it failed because the key matched */
+                if (expected == old_lba) {
+                    existing_key = expected; /* We share ownership now */
+                } else {
+                    /* Slot taken by DIFFERENT key. True collision. */
+                    continue; 
+                }
+            } else {
+                /* We won the CAS. We own the slot. */
+                existing_key = old_lba;
             }
-            /* We own the slot now. Proceed to fill data. */
-            existing_key = old_lba;
         }
 
         /* Update payload if we own the slot (or claimed it above) */
@@ -145,8 +151,6 @@ static int _register_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t new_lba
     }
     return -1; 
 }
-
-
 
 static void _clear_delta(hn4_volume_t* vol, uint64_t old_lba, uint64_t seed_hash) {
     uint64_t start_idx = _delta_hash(old_lba) & (HN4_DELTA_TABLE_SIZE - 1);

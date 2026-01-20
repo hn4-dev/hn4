@@ -418,9 +418,13 @@ static uint32_t _tcc_attempt_bitmask(
      * TCC design separates Source and Dest buffers entirely.
      */
 #ifdef HN4_DEBUG
-    if ((lit_start >= op && lit_start < op + lit_len) ||
-        (op >= lit_start && op < lit_start + lit_len)) {
-        return HN4_ERR_INTERNAL_FAULT; /* Overlap detected */
+   uintptr_t ls = (uintptr_t)lit_start;
+    uintptr_t le = ls + lit_len;
+    uintptr_t os = (uintptr_t)op;
+    uintptr_t oe = os + lit_len;
+
+    if ((ls < oe) && (os < le)) {
+        return HN4_ERR_INTERNAL_FAULT;
     }
 #endif
 

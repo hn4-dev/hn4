@@ -740,32 +740,36 @@ hn4_result_t hn4_hal_zns_append_sync(
 ) {
     if (!dev) return HN4_ERR_INVALID_ARGUMENT;
 
-    /* 
-     * FIX: Allocate context on Heap. 
-     * Stack allocation here is unsafe because a timeout would pop the stack,
-     * leaving the hardware writing to a dangling pointer later.
-     */
+    hn4_io_req_t* req = hn4_hal_mem_alloc(sizeof(hn4_io_req_t));
     _hal_internal_ctx_t* ctx = hn4_hal_mem_alloc(sizeof(_hal_internal_ctx_t));
-    if (!ctx) return HN4_ERR_NOMEM;
 
+    if (!req || !ctx) {
+        if (req) hn4_hal_mem_free(req);
+        if (ctx) hn4_hal_mem_free(ctx);
+        return HN4_ERR_NOMEM;
+    }
+
+    /* Initialize Context */
     ctx->done = false;
     ctx->res = HN4_OK;
 
-    hn4_io_req_t req = {0};
-    req.op_code  = HN4_IO_ZONE_APPEND;
-    req.lba      = zone_start_lba; /* The Zone Handle (Start LBA) */
-    req.buffer   = buffer;
-    req.length   = len_blocks;
-    req.user_ctx = ctx;
+    /* Initialize Request */
+    memset(req, 0, sizeof(hn4_io_req_t));
+    req->op_code  = HN4_IO_ZONE_APPEND;
+    req->lba      = zone_start_lba; /* The Zone Handle (Start LBA) */
+    req->buffer   = buffer;
+    req->length   = len_blocks;
+    req->user_ctx = ctx;
 
     /* Submit to hardware queue */
-    hn4_hal_submit_io(dev, &req, _hal_internal_cb);
+    hn4_hal_submit_io(dev, req, _hal_internal_cb);
 
     /* 
      * THE POLLING LOOP
      */
     hn4_time_t start_ts = hn4_hal_get_time_ns();
 
+    /* Acquire barrier: Ensure we see the write to 'done' from the callback */
     while (!atomic_load_explicit((_Atomic bool*)&ctx->done, memory_order_acquire)) {
         
         hn4_hal_poll(dev);
@@ -774,10 +778,10 @@ hn4_result_t hn4_hal_zns_append_sync(
             HN4_LOG_CRIT("HAL: ZNS Append Timeout. Device Stalled.");
             
             /* 
-             * CRITICAL SAFETY: 
-             * Do NOT free 'ctx'. The hardware/driver still holds a pointer to it.
-             * If we free it and return, the Late Callback will corrupt the heap.
-             * Leaking ~16 bytes is preferable to Kernel Panic / RCE.
+             * CRITICAL SAFETY: INTENTIONAL LEAK
+             * Do NOT free 'ctx' or 'req'. The hardware/driver still holds pointers to them.
+             * If we free them and return, the Late Callback will write to freed memory,
+             * corrupting the heap. Leaking ~80 bytes is preferable to a Kernel Panic / RCE.
              */
             return HN4_ERR_ATOMICS_TIMEOUT;
         }
@@ -785,14 +789,20 @@ hn4_result_t hn4_hal_zns_append_sync(
         HN4_YIELD(); /* Reduce CPU burn */
     }
 
+    /* 
+     * OPERATION COMPLETE
+     * The callback has fired, so we own the memory again.
+     */
+
     /* Capture the resulting LBA provided by the drive (Post-Write) */
     if (ctx->res == HN4_OK && result_lba) {
-        *result_lba = req.result_lba;
+        *result_lba = req->result_lba;
     }
 
     hn4_result_t final_res = ctx->res;
 
-    /* Operation complete, safe to free */
+    /* Safe to free resources */
+    hn4_hal_mem_free(req);
     hn4_hal_mem_free(ctx);
 
     return final_res;

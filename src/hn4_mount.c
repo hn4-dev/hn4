@@ -131,13 +131,14 @@ static hn4_result_t _validate_sb_integrity(HN4_IN const void* buffer)
     /* 1. Magic Check */
     if (HN4_UNLIKELY(safe_magic != HN4_MAGIC_SB)) {
         /* 
-         * Endian Safety.
-         * Normalize disk data (LE) to CPU before comparing with host constant.
+         * Endian Safety Fix:
+         * The poison pattern is written as a raw Host-Endian uint32 array by format.
+         * We compare against the raw memory view, not the LE-decoded view.
          */
-        if (hn4_le32_to_cpu(raw32[0]) == HN4_POISON_PATTERN && 
-            hn4_le32_to_cpu(raw32[1]) == HN4_POISON_PATTERN &&
-            hn4_le32_to_cpu(raw32[2]) == HN4_POISON_PATTERN &&
-            hn4_le32_to_cpu(raw32[3]) == HN4_POISON_PATTERN) {
+        if (raw32[0] == HN4_POISON_PATTERN && 
+            raw32[1] == HN4_POISON_PATTERN &&
+            raw32[2] == HN4_POISON_PATTERN &&
+            raw32[3] == HN4_POISON_PATTERN) {
             HN4_LOG_CRIT("Mount Blocked: Volume contains format poison pattern.");
             return HN4_ERR_WIPE_PENDING;
         }
