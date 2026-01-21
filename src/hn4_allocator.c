@@ -72,52 +72,6 @@ static const uint8_t _hn4_prof_policy[8] = {
     [HN4_PROFILE_HYPER_CLOUD] = HN4_POL_DEEP
 };
 
-/*
- * _calc_nano_trajectory
- * 
- * Maps a Unique ID to a physical sector in the Cortex (D0) region.
- * Uses Quadratic Probing (k^2) to resolve collisions deterministically.
- * 
- * Formula: Slot = (Hash(ID) + 0.5*k + 0.5*k^2) % Total_Slots
- */
- hn4_result_t _calc_nano_trajectory(
-    hn4_volume_t* vol,
-    hn4_u128_t seed_id,
-    uint32_t orbit_k,
-    hn4_addr_t* out_lba
-)
-{
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size;
-    if (ss == 0) return HN4_ERR_GEOMETRY;
-
-    /* 1. Define the Domain */
-    uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
-    uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
-    uint64_t capacity   = end_sect - start_sect;
-
-    if (capacity == 0) return HN4_ERR_ENOSPC;
-
-    /* 2. Fold Identity into Entropy */
-    uint64_t h = seed_id.lo ^ seed_id.hi;
-    h ^= (h >> 33);
-    h *= 0xff51afd7ed558ccdULL; /* Golden Ratio Prime */
-    h ^= (h >> 33);
-
-    /* 3. Apply Quadratic Probe (Triangular Numbers) */
-    /* offset = k * (k + 1) / 2 */
-    uint64_t probe_offset = (orbit_k * (orbit_k + 1)) >> 1;
-    
-    /* 4. Project to Sector Index */
-    uint64_t target_idx = (h + probe_offset) % capacity;
-    
-    /* 5. Convert to Absolute LBA */
-    *out_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, target_idx);
-    
-    return HN4_OK;
-}
-
-
 /* =========================================================================
  * 1. HARDENED ATOMICS (NO EXTERNAL LIBS)
  * ========================================================================= */
@@ -193,8 +147,12 @@ _hn4_cas128(volatile void *dst,
 
 #elif defined(__aarch64__)
     if (_hn4_cpu_features & HN4_CPU_ARM_LSE) {
-        register uint64_t x0_lo asm("x0") = expected->lo;
-        register uint64_t x1_hi asm("x1") = expected->hi;
+        /* Capture original values for comparison */
+        uint64_t old_exp_lo = expected->lo;
+        uint64_t old_exp_hi = expected->hi;
+
+        register uint64_t x0_lo asm("x0") = old_exp_lo;
+        register uint64_t x1_hi asm("x1") = old_exp_hi;
         register uint64_t x2_lo asm("x2") = desired.lo;
         register uint64_t x3_hi asm("x3") = desired.hi;
 
@@ -204,24 +162,34 @@ _hn4_cas128(volatile void *dst,
             : "r"(x2_lo), "r"(x3_hi), "r"(dst)
             : "memory"
         );
+
+        /* Update caller's expected with what hardware returned */
         expected->lo = x0_lo;
         expected->hi = x1_hi;
-        return (x0_lo == expected->lo && x1_hi == expected->hi); // Simplified logic check
+
+        /* Compare hardware result (x0/x1) with our original expectation */
+        return (x0_lo == old_exp_lo && x1_hi == old_exp_hi);
     } else {
         /* ARMv8.0 Compatible LL/SC Loop */
         /* ARMv8.0 Compatible LL/SC Loop */
     uint64_t old_lo, old_hi;
     uint32_t res; /* Status register */
 
+    /* 
+     * Operand Mapping:
+     * %0=old_lo, %1=old_hi, %2=res (status)
+     * %3=exp_lo, %4=exp_hi, %5=dst
+     * %6=new_lo, %7=new_hi
+     */
     __asm__ __volatile__(
-        "1: ldxp %0, %1, [%4]\n"
-        "   cmp %0, %2\n"
-        "   ccmp %1, %3, #0, eq\n"
+        "1: ldxp %0, %1, [%5]\n"
+        "   cmp %0, %3\n"
+        "   ccmp %1, %4, #0, eq\n"
         "   b.ne 2f\n"
-        "   stxp %w5, %6, %7, [%4]\n"
-        "   cbnz %w5, 1b\n"
+        "   stxp %w2, %6, %7, [%5]\n" /* Store result to res (%w2) */
+        "   cbnz %w2, 1b\n"
         "2:\n"
-        : "=&r"(old_lo), "=&r"(old_hi), "=&r"(res) /* res is OUTPUT */
+        : "=&r"(old_lo), "=&r"(old_hi), "=&r"(res)
         : "r"(expected->lo), "r"(expected->hi), "r"(dst), "r"(desired.lo), "r"(desired.hi)
         : "cc", "memory"
     );
@@ -299,8 +267,6 @@ HN4_INLINE int _hn4_ctz64(uint64_t x) {
         return (int)r;
     
     #else
-        /* [FIX 6] MSVC 32-bit Path (x86) */
-        /* Scan lower 32 bits */
         if (_BitScanForward(&r, (unsigned long)x)) {
             return (int)r;
         }
@@ -401,12 +367,7 @@ HN4_INLINE hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
     return ret;
 
 #elif defined(__aarch64__)
-    /* 
-     * FIX A-1: Strict Atomic Read Stability (ARM64).
-     * Replaced LDXP+CLREX with CASPAL loop.
-     * We perform a NOP-swap (Write old value back to itself).
-     * Success guarantees we held the cacheline exclusively.
-     */
+
     uint64_t res_lo, res_hi;
     uint64_t tmp_lo, tmp_hi;
     
@@ -489,32 +450,28 @@ static const uint8_t _theta_lut[16] = {
  * This guarantees O(1) execution (no loops) while pushing the first possible 
  * collision cycle to > 2*3*5*7*11*13 (30,030 blocks).
  * 
- * Replaces iterative GCD.
  */
-static inline uint64_t _project_coprime_vector(uint64_t v, uint64_t phi) {
-    /* 1. Kill Even Resonance (Factor 2) */
+HN4_INLINE uint64_t _project_coprime_vector(uint64_t v, uint64_t phi) {
     v |= 1; 
 
-    /* 
-     * 2. Wheel Factorization Guard (Factors 3, 5, 7, 11, 13)
-     * If Phi is divisible by P, we must ensure V is NOT divisible by P.
-     * If collision detected, we add 2 (keeping V odd).
-     * 
-     * Since we do this sequentially, a later add might re-align an earlier one,
-     * but statistically, this pushes the resonance period beyond meaningful
-     * file fragmentation limits.
-     */
-    if ((phi % 3 == 0)  && (v % 3 == 0))  v += 2;
-    if ((phi % 5 == 0)  && (v % 5 == 0))  v += 2;
-    if ((phi % 7 == 0)  && (v % 7 == 0))  v += 2;
-    if ((phi % 11 == 0) && (v % 11 == 0)) v += 2;
-    if ((phi % 13 == 0) && (v % 13 == 0)) v += 2;
+    static const uint8_t primes[] = {3, 5, 7, 11, 13};
+    
+    for (int i = 0; i < 5; i++) {
+        uint8_t p = primes[i];
+        uint64_t mask = ((phi % p) == 0) & ((v % p) == 0);
 
-    /* 3. Degeneracy Check */
-    /* If perturbation pushed V >= Phi (rare on small windows), wrap it */
-    if (v >= phi && phi > 1) {
-        v = v % phi;
-        if (v == 0) v = 1;
+        if (mask) {
+            if (v > (UINT64_MAX - 2)) v = 1;
+            else v += 2;
+        }
+    }
+
+    if (phi > 1) {
+        if (v >= phi) {
+            v %= phi;
+            if (v == 0) v = 3;
+            v |= 1; 
+        }
     }
 
     return v;
@@ -546,13 +503,7 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
  * _check_saturation
  * 
  * Determines if the volume has entered the "Event Horizon" state (Saturation).
- * 
- * LOGIC FIXES:
- * 1. Precision: Handles small volumes (<100 blocks) without truncation to zero.
- * 2. Overflow: Handles Exabyte volumes without u64 overflow during calc.
- * 3. Hysteresis: Engages at 90%, Disengages at 85% to prevent thrashing.
- * 4. Persistence: Uses HN4_VOL_RUNTIME_SATURATED bit in state_flags.
- */
+  */
 static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
     
@@ -566,21 +517,28 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     hn4_u128_t cap_128 = vol->vol_capacity_bytes;
     hn4_u128_t blocks_128;
 
+    /* 
+     * PICO SAFETY CLAMP:
+     * If Profile is PICO, strictly cap effective capacity to 2GB (MS-DOS Limit).
+     */
+    if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
+        #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
+        if (cap_128.hi > 0 || cap_128.lo > HN4_PICO_HARD_LIMIT) {
+            cap_128.hi = 0;
+            cap_128.lo = HN4_PICO_HARD_LIMIT;
+        }
+    }
+
     if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
-        int shift = __builtin_ctz(vol->vol_block_size);
-        if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
-        /* Safe: block_size >= 512 checked elsewhere, so ctz result >= 9 */
-        int shift = __builtin_ctz(vol->vol_block_size);
-        
-        if (shift >= 64) {
-            blocks_128.lo = (cap_128.hi >> (shift - 64));
-            blocks_128.hi = 0;
+        if (vol->vol_block_size == 1) {
+             blocks_128 = cap_128; /* Shift is 0 */
         } else {
-            /* Guaranteed shift > 0 here because block_size >= 512 */
+            int shift = __builtin_ctz(vol->vol_block_size);
+            
+            /* Safe shift logic */
             blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
             blocks_128.hi = (cap_128.hi >> shift);
         }
-    }
     } else {
         blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
     }
@@ -598,7 +556,20 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     if (lim_rec_128.hi > 0) limit_recover = UINT64_MAX; else limit_recover = lim_rec_128.lo;
 
 #else
-    cap_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+    uint64_t cap_64 = vol->vol_capacity_bytes;
+    
+    /* 
+     * PICO SAFETY CLAMP:
+     * If Profile is PICO, strictly cap effective capacity to 2GB (MS-DOS Limit).
+     */
+    if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
+        #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
+        if (cap_64 > HN4_PICO_HARD_LIMIT) {
+            cap_64 = HN4_PICO_HARD_LIMIT;
+        }
+    }
+
+    cap_blocks = cap_64 / vol->vol_block_size;
     if (cap_blocks == 0) return true;
     
     if (cap_blocks <= (UINT64_MAX / HN4_SATURATION_UPDATE)) {
@@ -714,6 +685,53 @@ HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
  * 4. SECDED LOGIC
  * ========================================================================= */
 
+ 
+
+/*
+ * _calc_nano_trajectory
+ * 
+ * Maps a Unique ID to a physical sector in the Cortex (D0) region.
+ * Uses Quadratic Probing (k^2) to resolve collisions deterministically.
+ * 
+ * Formula: Slot = (Hash(ID) + 0.5*k + 0.5*k^2) % Total_Slots
+ */
+ hn4_result_t _calc_nano_trajectory(
+    hn4_volume_t* vol,
+    hn4_u128_t seed_id,
+    uint32_t orbit_k,
+    hn4_addr_t* out_lba
+)
+{
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+    if (ss == 0) return HN4_ERR_GEOMETRY;
+
+    /* 1. Define the Domain */
+    uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
+    uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
+    uint64_t capacity   = end_sect - start_sect;
+
+    if (capacity == 0) return HN4_ERR_ENOSPC;
+
+    /* 2. Fold Identity into Entropy */
+      uint64_t h = seed_id.lo ^ seed_id.hi;
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL; /* Golden Ratio Prime */
+    h ^= (h >> 33);
+
+    uint64_t stride = seed_id.hi;
+
+    stride = _project_coprime_vector(stride, capacity);
+
+    uint64_t k_offset = _mul_mod_safe(orbit_k, stride, capacity);
+    uint64_t target_idx = (h + k_offset) % capacity;
+    
+    *out_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, target_idx);
+    
+    return HN4_OK;
+}
+
+
 static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool is_set) {
     /* =========================================================================
      * PATH A: ALLOCATION (The Hot Path)
@@ -798,50 +816,20 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
                 }
             }
 
+            /* 
+             * STRICT ORDERING: 
+             * 1. Scan L1 (Verify Empty).
+             * 2. If Empty -> Clear L2.
+             * 3. Re-Verify L1 (Race Check).
+             * 4. If Dirty -> Set L2.
+             */
             if (region_empty) {
                 uint64_t l2_idx = block_idx / HN4_L2_COVERAGE_BITS;
                 uint64_t l2_word_idx = l2_idx / 64;
                 uint64_t l2_mask = (1ULL << (l2_idx % 64));
                 _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word_idx];
 
-                /* 
-                 * STEP 1: OPTIMISTIC CLEAR (OPTIMIZED)
-                 * Changed from seq_cst to release. We ensure prior L1 updates are 
-                 * visible, but avoid full hardware serialization on this instruction.
-                 */
                 atomic_fetch_and_explicit(l2_ptr, ~l2_mask, memory_order_release);
-
-                /* 
-                 * STEP 2: HARD FENCE (REQUIRED)
-                 * Enforces Store-Load ordering. The write to L2 (Step 1) MUST be 
-                 * globally visible before we read L1 (Step 3).
-                 * This prevents the "False Free" race condition.
-                 */
-                atomic_thread_fence(memory_order_seq_cst);
-
-                /* 
-                 * STEP 3: THE "OOPS" CHECK (Self-Healing)
-                 * Re-scan L1. If we find a bit set now, it means we raced with 
-                 * an allocator. We must restore the L2 bit.
-                 */
-                bool oops_not_empty = false;
-                for (int i = 0; i < 8; i++) {
-                    if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
-                        memory_order_relaxed) != 0) {
-                        oops_not_empty = true;
-                        break;
-                    }
-                }
-
-                if (oops_not_empty) {
-                    /* 
-                     * STEP 4: HEAL (OPTIMIZED)
-                     * Changed from seq_cst to relaxed. 
-                     * We are simply flagging the region as dirty/occupied again. 
-                     * Allocators scan L1 if L2 is set, so eventual consistency works.
-                     */
-                    atomic_fetch_or_explicit(l2_ptr, l2_mask, memory_order_relaxed);
-                }
             }
 
             if (use_lock) hn4_hal_spinlock_release(&vol->locking.l2_lock);
@@ -895,10 +883,8 @@ hn4_result_t _bitmap_op(
         hn4_addr_t io_lba = hn4_addr_add(vol->sb.info.lba_bitmap_start, sector_offset / ss);
         hn4_result_t res = HN4_OK;
 
-        /* 
-         * Serialize access via the L2 lock to prevent RMW races.
-         */
-        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        uint32_t lock_idx = (block_idx / 64) % HN4_CORTEX_SHARDS;
+        hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
         uint32_t sectors_to_io = 1;
         if ((offset_in_sec + sizeof(hn4_armored_word_t)) > ss) {
@@ -906,12 +892,10 @@ hn4_result_t _bitmap_op(
         }
 
         if (alloc_size < (sectors_to_io * ss)) {
-             /* Realloc or fail - in this case fail safely */
-             if (sector_buf) hn4_hal_mem_free(sector_buf);
-             return HN4_ERR_NOMEM;
+             res = HN4_ERR_NOMEM;
+             goto pico_cleanup; // Use cleanup label to release lock
         }
 
-        /* 1. READ: Fetch the sector(s) containing the target word */
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, sector_buf, sectors_to_io) != HN4_OK) {
             res = HN4_ERR_HW_IO;
             goto pico_cleanup;
@@ -919,38 +903,31 @@ hn4_result_t _bitmap_op(
 
         hn4_armored_word_t* word = (hn4_armored_word_t*)((uint8_t*)sector_buf + offset_in_sec);
 
-        /* 2. VALIDATE: Check ECC and heal if necessary */
         uint64_t safe_data;
         bool corrected = false;
         
         res = _ecc_check_and_fix(vol, word->data, word->ecc, &safe_data, &corrected);
         if (HN4_UNLIKELY(res != HN4_OK)) {
-            goto pico_cleanup; /* DED / Corruption detected */
+            goto pico_cleanup;
         }
 
         if (corrected) {
             word->data = safe_data;
         }
 
-        /* 3. EXECUTE: Apply bit logic */
         bool is_set = (word->data & (1ULL << bit_off)) != 0;
         bool mutation_needed = false;
         bool report_change = false;
 
         if (op == BIT_TEST) {
             if (out_result) *out_result = is_set;
-            /* Only write back if we corrected an ECC error (Healing Read) */
             mutation_needed = corrected;
-        }
-        else if ((op == BIT_SET && is_set) || 
+        } else if ((op == BIT_SET && is_set) || 
                  ((op == BIT_CLEAR || op == BIT_FORCE_CLEAR) && !is_set)) 
         {
-            /* Logic No-Op */
             if (out_result) *out_result = false;
             mutation_needed = corrected;
-        }
-        else {
-            /* Mutation Required */
+        } else {
             if (op == BIT_SET) word->data |= (1ULL << bit_off);
             else word->data &= ~(1ULL << bit_off);
             
@@ -960,17 +937,14 @@ hn4_result_t _bitmap_op(
             report_change = true;
         }
 
-        /* 4. WRITE: Commit changes if mutated or healed */
         if (mutation_needed) {
             hn4_result_t w_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, sector_buf, sectors_to_io);
             
             if (w_res != HN4_OK) {
                 if (op == BIT_TEST) {
-                    /* Healing failed, but read succeeded. Mask error. */
                     res = HN4_OK; 
                 } else {
                     res = HN4_ERR_HW_IO;
-                    /* If write failed, we must NOT report logic change */
                     report_change = false;
                 }
             }
@@ -980,7 +954,7 @@ hn4_result_t _bitmap_op(
 
     pico_cleanup:
         if (sector_buf) hn4_hal_mem_free(sector_buf);
-        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+        hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
         return res;
     }
 
@@ -990,7 +964,7 @@ hn4_result_t _bitmap_op(
 
     /* 1. Alignment & Geometry Checks */
     if (HN4_UNLIKELY(((uintptr_t)vol->void_bitmap & 0xF) != 0)) {
-        return HN4_ERR_INTERNAL_FAULT; /* Critical Alignment Violation */
+        return HN4_ERR_INTERNAL_FAULT;
     }
 
     uint64_t word_idx = block_idx / 64;
@@ -1009,11 +983,9 @@ hn4_result_t _bitmap_op(
     bool logic_change = false;      
     bool heal_event_pending = false;
 
-    /* Initial Load (Atomic) */
     expected = _hn4_load128(target_addr);
 
     do {
-        /* Reset per-loop flags */
         logic_change = false;
         bool is_healing_write = false;
 
@@ -1043,23 +1015,18 @@ hn4_result_t _bitmap_op(
                 return HN4_OK; /* Fast Path: Clean Read */
             }
             
-            /* HEALING READ: Check RO Policy */
             if (vol->read_only) {
-                /* Can't persist fix in RO mode. Return clean data but don't write. */
                 if (out_result) *out_result = is_set;
                 return HN4_OK;
             }
 
-            /* Force write-back of corrected data */
             desired.lo = safe_data;
-            logic_change = true; /* Conceptually a change (repair) to force commit */
-            is_healing_write = true; /* Mark as healing */
+            logic_change = true;
+            is_healing_write = true;
         }
         else if ((op == BIT_SET && is_set) || 
                  ((op == BIT_CLEAR || op == BIT_FORCE_CLEAR) && !is_set)) 
         {
-            /* LOGICAL NO-OP: Bit is already in desired state */
-            
             if (!was_corrected) {
                 /* 
                  * HEALING L2: Even if L1 (Main) is correct, L2 might be stale.
@@ -1086,7 +1053,6 @@ hn4_result_t _bitmap_op(
             is_healing_write = true; /* Mark as healing */
         } 
         else {
-            /* MUTATION: State change required */
             desired.lo = (op == BIT_SET) ? (safe_data | bit_mask) : (safe_data & ~bit_mask);
             logic_change = true;
         }
@@ -1094,28 +1060,17 @@ hn4_result_t _bitmap_op(
         /* 2.4 Reconstruct Metadata */
         uint8_t new_ecc = _calc_ecc_hamming(desired.lo);
 
-        /* 
-         * VERSIONING STRATEGY:
-         * To prevent ABA problems across mounts/snapshots, we XOR the version 
-         * with the Epoch ID (volume_uuid.lo used as proxy here).
-         */
-        uint64_t epoch_mux = vol->sb.info.volume_uuid.lo & 0x00FFFFFFFFFFFFFFULL;
-        uint64_t current_ver_logical = (ver ^ epoch_mux); 
-        uint64_t next_ver_logical;
+      uint64_t next_ver;
 
-        if (is_healing_write) { /* Use explicit healing flag */
-            /* For Healing Reads, preserve the logical version to minimize noise */
-            next_ver_logical = current_ver_logical;
+        if (is_healing_write) { 
+            next_ver = ver;
         } else {
-            /* For Mutation, increment version */
-            next_ver_logical = (current_ver_logical + 1) & 0x00FFFFFFFFFFFFFFULL;
-            if (next_ver_logical == 0) next_ver_logical = 1;
+            next_ver = (ver + 1) & 0x00FFFFFFFFFFFFFFULL;
+            
+            if (HN4_UNLIKELY(next_ver == 0)) next_ver = 1;
         }
 
-        uint64_t final_ver = next_ver_logical ^ epoch_mux;
-
-        /* Pack High QWORD: [Version: 56] [ECC: 8] */
-        desired.hi = (final_ver << 8) | (uint64_t)new_ecc;
+        desired.hi = (next_ver << 8) | (uint64_t)new_ecc;
 
         /* 2.5 Commit */
         success = _hn4_cas128(target_addr, &expected, desired);
@@ -1125,22 +1080,17 @@ hn4_result_t _bitmap_op(
 
     /* 3. Post-Commit Updates */
     
-    /* Telemetry */
-    if (HN4_UNLIKELY(heal_event_pending)) {
-        atomic_fetch_add(&vol->health.heal_count, 1);
-    }
+    if (HN4_UNLIKELY(heal_event_pending))  atomic_fetch_add(&vol->health.heal_count, 1);
 
-    /* Result */
     if (out_result) {
         if (op == BIT_TEST) *out_result = ((desired.lo & bit_mask) != 0);
-        else *out_result = logic_change; /* Logic change is true for mutation */
+        else *out_result = logic_change;
     }
 
      bool commit_side_effects = (logic_change && op != BIT_TEST) || 
                                (heal_event_pending && !vol->read_only);
 
     if (commit_side_effects) {
-        /* GHOST BIT PROTECTION & HEALING PERSISTENCE */
         if (op != BIT_FORCE_CLEAR && !vol->locking.in_eviction_path) {
             atomic_fetch_or_explicit(&vol->sb.info.state_flags, HN4_VOL_DIRTY, memory_order_seq_cst);
         }
@@ -1154,7 +1104,6 @@ hn4_result_t _bitmap_op(
     
     return heal_event_pending ? HN4_INFO_HEALED : HN4_OK;
 }
-
 
 /*++
 
@@ -1707,10 +1656,6 @@ hn4_alloc_genesis(
                             V = hn4_hal_get_random_u64();
                         }
                         
-                        /* 
-                         * Enforce Topological Coprimality.
-                         * Projects V onto a non-resonant trajectory in O(1).
-                         */
                         V = _project_coprime_vector(V, win_phi);
                     }
 
