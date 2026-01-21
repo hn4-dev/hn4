@@ -32,18 +32,43 @@
 
 #define HN4_SHOTGUN_DEPTH           12
 
-/* Stack Pressure Relief */
-#if defined(_MSC_VER)
-    #define HN4_NO_INLINE __declspec(noinline)
-#elif defined(__GNUC__) || defined(__clang__)
-    #define HN4_NO_INLINE __attribute__((noinline))
-#else
-    #define HN4_NO_INLINE
-#endif
-
 /* =========================================================================
  * ERROR PRIORITY LOGIC (LOOKUP TABLE OPTIMIZATION)
  * ========================================================================= */
+
+ typedef struct {
+    hn4_result_t code;
+    int          weight;
+} hn4_error_weight_t;
+
+static const hn4_error_weight_t _error_weights[] = {
+    /* CRITICAL INFRASTRUCTURE (90-100) */
+    { HN4_ERR_CPU_INSANITY,      100 },
+    { HN4_ERR_HW_IO,             99  },
+    { HN4_ERR_NOMEM,             95  },
+
+    /* LOGICAL CONSISTENCY (85-90) */
+    { HN4_ERR_GENERATION_SKEW,   85  },
+    { HN4_ERR_PHANTOM_BLOCK,     82  },
+
+    /* DATA INTEGRITY (75-80) */
+    { HN4_ERR_DATA_ROT,          80  },
+    { HN4_ERR_HEADER_ROT,        80  },
+    { HN4_ERR_PAYLOAD_ROT,       80  },
+    { HN4_ERR_DECOMPRESS_FAIL,   79  },
+    { HN4_ERR_ALGO_UNKNOWN,      78  },
+
+    /* LOGICAL MISMATCH (55-70) */
+    { HN4_ERR_ID_MISMATCH,       60  },
+    { HN4_ERR_VERSION_INCOMPAT,  55  },
+
+    /* EXPECTED / INFO (0-50) */
+    { HN4_ERR_NOT_FOUND,         50  },
+    { HN4_INFO_SPARSE,           10  },
+    { HN4_OK,                    0   }
+};
+
+#define HN4_WEIGHT_TABLE_SIZE (sizeof(_error_weights) / sizeof(hn4_error_weight_t))
 
 /*
  * Error Weighting: Higher values take precedence when merging results.
@@ -51,39 +76,17 @@
  */
 static int _get_error_weight(hn4_result_t e)
 {
-   switch (e) {
+    /* Hot path optimization: OK is 0 */
+    if (HN4_LIKELY(e == HN4_OK)) return 0;
 
-    /* FATAL SYSTEM INTEGRITY (90-100) */
-    case HN4_ERR_HW_IO:             return 98;
-    case HN4_ERR_NOMEM:             return 95;
-    case HN4_ERR_CPU_INSANITY:      return 100;
+    for (size_t i = 0; i < HN4_WEIGHT_TABLE_SIZE; i++) {
+        if (_error_weights[i].code == e) {
+            return _error_weights[i].weight;
+        }
+    }
     
-    /* LOGICAL CORRUPTION / TRANSACTION VIOLATION (85-89) */
-    case HN4_ERR_PHANTOM_BLOCK:     return 86;
-    case HN4_ERR_GENERATION_SKEW:   return 88;
-    
-    /* DATA CORRUPTION (75-84) */
-    case HN4_ERR_ALGO_UNKNOWN:      return 78;
-    case HN4_ERR_DECOMPRESS_FAIL:   return 80;
-    case HN4_ERR_PAYLOAD_ROT:       return 82;
-    case HN4_ERR_HEADER_ROT:        return 83;
-    case HN4_ERR_DATA_ROT:          return 84;
-
-    /* COMPATIBILITY / IDENTITY ERRORS (60-74) */
-    case HN4_ERR_VERSION_INCOMPAT:  return 65;
-    case HN4_ERR_ID_MISMATCH:       return 70;
-
-    /* EXPECTED / NON-CORRUPTING CONDITIONS (20-59) */
-    case HN4_INFO_SPARSE:           return 20;
-    case HN4_ERR_NOT_FOUND:         return 40;
-
-    /* OK */
-    case HN4_OK:                    return 0;
-
-    /* UNKNOWN ERROR → CONSERVATIVE */
-    default:                        return 75;
-}
-
+    /* Default weight for unknown errors */
+    return 40;
 }
 
 HN4_INLINE hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)

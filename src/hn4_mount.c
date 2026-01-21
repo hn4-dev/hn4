@@ -284,7 +284,7 @@ static uint64_t _calc_south_offset(uint64_t capacity, uint32_t bs) {
  * Resolves the 4 physical block indices for Superblock replicas.
  * Unifies logic for 128-bit and 64-bit modes.
  */
-static void _calc_cardinal_targets(
+void _calc_cardinal_targets(
     hn4_size_t capacity, 
     uint32_t   bs, 
     uint64_t   out_targets[4]

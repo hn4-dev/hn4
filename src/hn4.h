@@ -22,18 +22,6 @@
 extern "C" {
 #endif
 
-/* Check for 128-bit atomic support (Hardware CAS) for the Armored Bitmap */
-#if defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_16) || defined(__x86_64__) || defined(__aarch64__)
-    #define HN4_HW_ATOMICS_128 1
-#else
-    #define HN4_HW_ATOMICS_128 0
-#endif
-
-#ifndef HN4_CACHE_LINE_SIZE
-    #define HN4_CACHE_LINE_SIZE 64
-#endif
-
-
 /* =========================================================================
  * 0. COMPILER ABSTRACTION & SAFETY
  * ========================================================================= */
@@ -43,6 +31,10 @@ extern "C" {
     #define HN4_HW_ATOMICS_128 1
 #else
     #define HN4_HW_ATOMICS_128 0
+#endif
+
+#ifndef HN4_CACHE_LINE_SIZE
+    #define HN4_CACHE_LINE_SIZE 64
 #endif
 
 /* 
@@ -60,6 +52,7 @@ extern "C" {
     #define HN4_UNLIKELY(x)     __builtin_expect(!!(x), 0)
     #define HN4_PREFETCH(x)     __builtin_prefetch(x)
     #define HN4_BARRIER()       __atomic_thread_fence(__ATOMIC_ACQUIRE)
+    #define HN4_NO_INLINE __attribute__((noinline))
     #define HN4_RESTRICT        __restrict__
 #elif defined(_MSC_VER)
     #define HN4_HOT
@@ -67,6 +60,7 @@ extern "C" {
     #define HN4_PACKED
     #define HN4_ALIGNED(x)      __declspec(align(x))
     #define HN4_INLINE          static __forceinline
+    #define HN4_NO_INLINE __declspec(noinline)
     #define HN4_LIKELY(x)       (x)
     #define HN4_UNLIKELY(x)     (x)
     #define HN4_PREFETCH(x)     ((void)0)
@@ -79,6 +73,7 @@ extern "C" {
     #define HN4_PACKED
     #define HN4_ALIGNED(x)
     #define HN4_INLINE          static inline
+    #define HN4_NO_INLINE
     #define HN4_LIKELY(x)       (x)
     #define HN4_UNLIKELY(x)     (x)
     #define HN4_PREFETCH(x)     ((void)0)
@@ -735,7 +730,20 @@ typedef struct {
 
 } hn4_volume_t;
 
+typedef struct HN4_PACKED {
+    uint32_t    magic;          /* 4B:  Signature */
+    hn4_u128_t  owner_id;       /* 16B: ID */
+    uint32_t    payload_len;    /* 4B:  Size */
+    uint32_t    data_crc;       /* 4B:  CRC */
+    uint32_t    reserved;       /* 4B:  PADDING (Fixes alignment) */
+    uint64_t    sequence;       /* 8B:  Sequence (Now aligned to offset 32) */
+    uint8_t     payload[];      /* Offset 40 (8-byte aligned) */
+} hn4_nano_quantum_t;
 
+/* 
+ * Recalculates automatically: 512 - 40 = 472 bytes max payload.
+ */
+#define HN4_NANO_MAX_PAYLOAD (512 - sizeof(hn4_nano_quantum_t))
 /* =========================================================================
  * 8. API, FORMATTING & BALLISTICS
  * ========================================================================= */

@@ -36,6 +36,26 @@
 #define HN4_ORBIT_LIMIT           12
 #define HN4_ZNS_TIMEOUT_NS        (30ULL * 1000000000ULL)
 
+typedef struct {
+    uint32_t retry_sleep_us;
+    int      max_retries;
+} hn4_write_policy_t;
+
+/* 
+ * Write Retry Policies per Profile
+ * Index = Format Profile ID (0-7)
+ */
+static const hn4_write_policy_t _write_policy_lut[8] = {
+    /* [0] GENERIC */     { 1000, 2 }, /* Default */
+    /* [1] GAMING */      { 10,   5 }, /* Aggressive poll, try harder */
+    /* [2] AI */          { 1000, 2 },
+    /* [3] ARCHIVE */     { 1000, 2 },
+    /* [4] PICO */        { 1000, 2 },
+    /* [5] SYSTEM */      { 1000, 2 },
+    /* [6] USB */         { 5000, 3 }, /* High latency tolerance */
+    /* [7] HYPER_CLOUD */ { 1000, 2 }
+};
+
 /*
  * POLICY LOOKUP TABLES
  * Centralized logic for allocation strategies based on Device Type and Profile.
@@ -857,16 +877,9 @@ retry_transaction:;
         }
     } else {
 
-        uint32_t retry_sleep = 1000; /* Default 1ms */
-        int max_retries = 2;
-
-        if (profile == HN4_PROFILE_GAMING) {
-            retry_sleep = 10; /* 10us Aggressive Poll */
-            max_retries = 5;  /* Try harder before rescue to prevent stutter */
-        } else if (profile == HN4_PROFILE_USB) {
-            retry_sleep = 5000;
-            max_retries = 3;
-        }
+        uint32_t p_idx = profile & 0x7;
+        uint32_t retry_sleep = _write_policy_lut[p_idx].retry_sleep_us;
+        int      max_retries = _write_policy_lut[p_idx].max_retries;
 
         int tries = 0;
         do {
