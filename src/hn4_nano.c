@@ -219,9 +219,15 @@ static hn4_result_t _calc_nano_trajectory(
     h *= HN4_NANO_MAGIC_SEED;
     h ^= (h >> 33);
 
-    /* Triangular Probing: offset = k * (k + 1) / 2 */
-    uint64_t probe_offset = (orbit_k * (orbit_k + 1)) >> 1;
-    uint64_t target_idx = (h + probe_offset) % capacity;
+    uint64_t target_idx;
+
+    /* Check if Capacity is Power of 2 */
+    if ((capacity & (capacity - 1)) == 0) {
+        uint64_t probe_offset = (orbit_k * (orbit_k + 1)) >> 1;
+        target_idx = (h + probe_offset) & (capacity - 1);
+    } else {
+        target_idx = (h + orbit_k) % capacity;
+    }
     
     *out_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, target_idx);
     return HN4_OK;

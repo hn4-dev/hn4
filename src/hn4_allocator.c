@@ -1252,6 +1252,7 @@ _calc_trajectory_lba(
     }
 
     uint64_t available_blocks = total_blocks - flux_aligned_blk;
+    
     uint64_t phi              = available_blocks / S;
     
     if (HN4_UNLIKELY(phi == 0)) return HN4_LBA_INVALID;
@@ -1307,6 +1308,9 @@ _calc_trajectory_lba(
     /* Check Linear LUT (Mask & 0x3 protects against corrupt tags) */
     bool is_linear = _hn4_is_linear_lut[vol->sb.info.device_type_tag & 0x3];
     bool is_system = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
+    
+    /* Explicit ZNS Hardware Check for safety */
+    if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) is_linear = true;
 
     if (!is_linear && !is_system) {
         /* If Phi is small, LUT modulo causes cycles. Use Linear Probe k. */
