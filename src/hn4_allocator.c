@@ -72,6 +72,51 @@ static const uint8_t _hn4_prof_policy[8] = {
     [HN4_PROFILE_HYPER_CLOUD] = HN4_POL_DEEP
 };
 
+/*
+ * _calc_nano_trajectory
+ * 
+ * Maps a Unique ID to a physical sector in the Cortex (D0) region.
+ * Uses Quadratic Probing (k^2) to resolve collisions deterministically.
+ * 
+ * Formula: Slot = (Hash(ID) + 0.5*k + 0.5*k^2) % Total_Slots
+ */
+ hn4_result_t _calc_nano_trajectory(
+    hn4_volume_t* vol,
+    hn4_u128_t seed_id,
+    uint32_t orbit_k,
+    hn4_addr_t* out_lba
+)
+{
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+    if (ss == 0) return HN4_ERR_GEOMETRY;
+
+    /* 1. Define the Domain */
+    uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
+    uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
+    uint64_t capacity   = end_sect - start_sect;
+
+    if (capacity == 0) return HN4_ERR_ENOSPC;
+
+    /* 2. Fold Identity into Entropy */
+    uint64_t h = seed_id.lo ^ seed_id.hi;
+    h ^= (h >> 33);
+    h *= 0xff51afd7ed558ccdULL; /* Golden Ratio Prime */
+    h ^= (h >> 33);
+
+    /* 3. Apply Quadratic Probe (Triangular Numbers) */
+    /* offset = k * (k + 1) / 2 */
+    uint64_t probe_offset = (orbit_k * (orbit_k + 1)) >> 1;
+    
+    /* 4. Project to Sector Index */
+    uint64_t target_idx = (h + probe_offset) % capacity;
+    
+    /* 5. Convert to Absolute LBA */
+    *out_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, target_idx);
+    
+    return HN4_OK;
+}
+
 
 /* =========================================================================
  * 1. HARDENED ATOMICS (NO EXTERNAL LIBS)
@@ -99,7 +144,7 @@ static const uint8_t _hn4_prof_policy[8] = {
  *
  * ======================================================================== */
 
-static inline bool
+HN4_INLINE bool
 _hn4_cas128(volatile void *dst,
             hn4_aligned_u128_t  *expected,
             hn4_aligned_u128_t   desired)
@@ -239,7 +284,7 @@ _hn4_cas128(volatile void *dst,
  * - MSVC x86:  Split 32-bit _BitScanForward
  * - Fallback:  Branchless De Bruijn Multiplication
  */
-static inline int _hn4_ctz64(uint64_t x) {
+HN4_INLINE int _hn4_ctz64(uint64_t x) {
     if (HN4_UNLIKELY(x == 0)) return 64;
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -287,7 +332,7 @@ static inline int _hn4_ctz64(uint64_t x) {
 
 
 /* Standard 64-bit CAS wrapper */
-static inline bool _hn4_cas64(volatile uint64_t* dst,
+HN4_INLINE bool _hn4_cas64(volatile uint64_t* dst,
                               uint64_t* expected,
                               uint64_t desired)
 {
@@ -305,7 +350,7 @@ static inline bool _hn4_cas64(volatile uint64_t* dst,
  * _hn4_load128
  * Atomic 128-bit load WITHOUT side-effects.
  */
-static inline hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
+HN4_INLINE hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
     hn4_aligned_u128_t  ret;
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -386,22 +431,34 @@ static inline hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
 #endif
 }
 
-static inline uint8_t _get_trajectory_limit(const hn4_volume_t* vol) {
-    /* PICO override check first */
-    if (HN4_UNLIKELY(vol->sb.info.format_profile == HN4_PROFILE_PICO)) return 0;
+/* 
+ * PRE-CALCULATED TRAJECTORY MATRIX
+ * Rows: Format Profile (0-7)
+ * Cols: Device Type (0-3)
+ * Value: Max K limit (0 or 12)
+ */
+static const uint8_t _hn4_traj_limit_lut[8][4] = {
+    /* GENERIC */ {12, 0, 0, 0}, 
+    /* GAMING  */ {12, 0, 0, 0},
+    /* AI      */ {12, 0, 0, 0},
+    /* ARCHIVE */ {12, 0, 0, 0},
+    /* PICO    */ { 0, 0, 0, 0}, /* Always 0 */
+    /* SYSTEM  */ {12, 0, 0, 0},
+    /* USB     */ { 0, 0, 0, 0}, /* Always 0 */
+    /* CLOUD   */ {12, 0, 0, 0}
+};
 
+HN4_INLINE uint8_t _get_trajectory_limit(const hn4_volume_t* vol) {
     /* 
-     * Jump Table Optimization.
-     * Replaces previous Switch statement for O(1) lookup.
-     * Mask & 0x3 protects against out-of-bounds access if tag is corrupted.
+     * Branchless Lookup:
+     * Masking ensures safety even if SB is corrupt. 
+     * No 'if' statements, purely memory access.
      */
-    if (_hn4_is_linear_lut[vol->sb.info.device_type_tag & 0x3]) {
-        return 0; /* Force Sequential (Linear) */
-    }
+    uint32_t p = vol->sb.info.format_profile & 0x7;
+    uint32_t d = vol->sb.info.device_type_tag & 0x3;
     
-    return HN4_MAX_TRAJECTORY_K; /* Ballistic (Random Access) */
+    return _hn4_traj_limit_lut[p][d];
 }
-
 
 /* =========================================================================
  * 2. CORE CONSTANTS
@@ -504,17 +561,19 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
 
     if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
         int shift = __builtin_ctz(vol->vol_block_size);
+        if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
+        /* Safe: block_size >= 512 checked elsewhere, so ctz result >= 9 */
+        int shift = __builtin_ctz(vol->vol_block_size);
         
-        /* FIX: Handle edge cases where shift is 0 or >= 64 to avoid UB */
-        if (shift == 0) {
-            blocks_128 = cap_128;
-        } else if (shift >= 64) {
+        if (shift >= 64) {
             blocks_128.lo = (cap_128.hi >> (shift - 64));
             blocks_128.hi = 0;
         } else {
+            /* Guaranteed shift > 0 here because block_size >= 512 */
             blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
             blocks_128.hi = (cap_128.hi >> shift);
         }
+    }
     } else {
         blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
     }
@@ -576,32 +635,47 @@ static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     }
 }
 
- hn4_result_t _check_quality_compliance(hn4_volume_t* vol, uint64_t lba, uint8_t intent) {
+ /* 
+ * Quality Verdict Table
+ * Rows: Strict Mode (0=Relaxed, 1=Strict)
+ * Cols: Quality Bits (00=Toxic, 01=Bronze, 10=Silver, 11=Gold)
+ */
+static const hn4_result_t _quality_verdict_lut[2][4] = {
+    /* Relaxed (Data) */
+    { HN4_ERR_MEDIA_TOXIC, HN4_OK,              HN4_OK, HN4_OK },
+    /* Strict (Meta)  */
+    { HN4_ERR_MEDIA_TOXIC, HN4_ERR_MEDIA_TOXIC, HN4_OK, HN4_OK }
+};
+
+hn4_result_t _check_quality_compliance(hn4_volume_t* vol, uint64_t lba, uint8_t intent) {
     if (!vol->quality_mask) return HN4_OK; 
 
     uint64_t word_idx = lba / 32;
-    
-    /* Bounds Check with Panic Propagation */
     if ((word_idx * 8) >= vol->qmask_size) {
-        /* CRITICAL: Set Panic Flag on OOB access */
         atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC | HN4_VOL_DIRTY);
         return HN4_ERR_GEOMETRY;
     }
 
     uint32_t shift = (lba % 32) * 2;
-    uint64_t q_word = vol->quality_mask[word_idx];
+    /* Atomic load for consistency */
+    uint64_t q_word = atomic_load_explicit((_Atomic uint64_t*)&vol->quality_mask[word_idx], memory_order_relaxed);
+    
     uint8_t q_val = (q_word >> shift) & 0x3;
 
-    if (q_val == HN4_Q_TOXIC) return HN4_ERR_MEDIA_TOXIC;
+    /* 
+     * Determine Strictness without branching:
+     * strict = (intent == METADATA) | (profile == SYSTEM)
+     */
+    int is_strict = (intent == HN4_ALLOC_METADATA) | 
+                    (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
+    
+    /* Normalize to 0 or 1 */
+    is_strict = (is_strict != 0);
 
-    if (intent == HN4_ALLOC_METADATA || vol->sb.info.format_profile == HN4_PROFILE_SYSTEM) {
-        if (q_val == HN4_Q_BRONZE) return HN4_ERR_MEDIA_TOXIC;
-    }
-
-    return HN4_OK;
+    return _quality_verdict_lut[is_strict][q_val];
 }
 
-static inline uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
+HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
     if (m == 0) return 0;
 #if defined(__SIZEOF_INT128__)
     return (uint64_t)(((__uint128_t)a * b) % m);
@@ -1074,712 +1148,6 @@ hn4_result_t _bitmap_op(
     return heal_event_pending ? HN4_INFO_HEALED : HN4_OK;
 }
 
-/*
- * _try_reserve_cortex_slots
- * 
- * ATOMIC SAFETY:
- * Attempts to transition a range of RAM slots from EMPTY (0) to PENDING.
- * This acts as a granular spinlock to prevent multiple threads from
- * claiming the same disk region simultaneously.
- * 
- * Returns: true if ALL slots in the run were successfully claimed.
- *          false if a collision occurred (rollbacks performed automatically).
- */
-static bool _try_reserve_cortex_slots(
-    hn4_anchor_t* anchors, 
-    uint64_t start_idx, 
-    uint32_t count
-) 
-{
-    for (uint32_t i = 0; i < count; i++) {
-        uint64_t idx = start_idx + i;
-        _Atomic uint64_t* dc_ptr = (_Atomic uint64_t*)&anchors[idx].data_class;
-        
-        uint64_t expected = atomic_load(dc_ptr);
-        
-        bool is_claimable = (expected == 0);
-        
-        if (!is_claimable && expected == HN4_MAGIC_NANO_PENDING) {
-             /* NOTE: In NANO_PENDING state, 'mass' holds the timestamp. */
-             uint64_t ts = anchors[idx].mass; /* Atomic read of u64 aligned is safe */
-             if ((hn4_hal_get_time_ns() - ts) > 30000000000ULL) {
-                 is_claimable = true;
-             }
-        }
-
-        if (!is_claimable) return false;
-
-        uint64_t desired = HN4_MAGIC_NANO_PENDING;
-        
-        /* CAS Loop to handle the specific expected value */
-        if (!atomic_compare_exchange_strong(dc_ptr, &expected, desired)) {
-             /* Failed. Rollback. */
-            for (uint32_t k = 0; k < i; k++) {
-                atomic_store((_Atomic uint64_t*)&anchors[start_idx + k].data_class, 0);
-            }
-            return false; 
-        }
-        
-        /* Store timestamp in mass for timeout tracking */
-        atomic_store((_Atomic uint64_t*)&anchors[idx].mass, hn4_hal_get_time_ns());
-    }
-    
-    atomic_thread_fence(memory_order_acquire);
-    return true; 
-}
-
-/* =========================================================================
- * NANO-LATTICE ALLOCATOR (The Cortex-Plex)
- * ========================================================================= */
-
-/*++
-
-Routine Description:
-
-    Scans the Cortex (D0) region for a contiguous run of free slots.
-    
-    This allocator implements a linear probe strategy with "Best Fit" heuristics.
-    It leverages the L2 Summary Bitmap (if available) to skip fully occupied
-    regions and includes self-healing logic to reclaim stale pending reservations
-    left by crashed writers.
-
-Arguments:
-
-    vol - Pointer to the volume device extension.
-
-    slots_needed - The number of contiguous 128-byte slots required.
-
-    out_slot_idx - Returns the logical slot index of the run start on success.
-
-Return Value:
-
-    HN4_OK on success, or an appropriate error code (e.g., HN4_ERR_ENOSPC).
-
---*/
-hn4_result_t 
-_alloc_cortex_run(
-    HN4_IN hn4_volume_t* vol, 
-    HN4_IN uint32_t slots_needed,
-    HN4_OUT uint64_t* out_slot_idx
-    )
-{
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t sector_size = caps->logical_block_size;
-    
-    if (sector_size < HN4_CORTEX_SLOT_SIZE) return HN4_ERR_GEOMETRY;
-
-    /* 1. Geometry Calculation */
-    uint64_t start_sect = hn4_addr_to_u64(vol->sb.info.lba_cortex_start);
-    uint64_t end_sect   = hn4_addr_to_u64(vol->sb.info.lba_bitmap_start);
-    uint64_t total_slots = ((end_sect - start_sect) * sector_size) / HN4_CORTEX_SLOT_SIZE;
-
-    uint64_t current_slot = vol->alloc.cortex_search_head; 
-    if (current_slot >= total_slots) current_slot = 0;
-
-    /*
-     * =========================================================================
-     * PATH A: RAM FAST SCAN (Occupancy Bitmap + Nano-Cortex)
-     * =========================================================================
-     */
-    if (vol->nano_cortex) {
-        
-        uint64_t* bitmap = atomic_load_explicit(
-            &vol->locking.cortex_occupancy_bitmap, 
-            memory_order_acquire
-        );
-
-        hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-
-        if (bitmap) {
-            uint64_t total_words = vol->locking.cortex_bitmap_words;
-            uint64_t word_idx = current_slot / 64;
-            uint64_t words_checked = 0;
-
-            while (words_checked < total_words) {
-                if (word_idx >= total_words) word_idx = 0;
-
-                /* 
-                 * Atomic Load of the bitmap word (Relaxed is sufficient for scanning).
-                 * We cast to _Atomic because the underlying memory is uint64_t heap.
-                 */
-                uint64_t word = atomic_load_explicit((_Atomic uint64_t*)&bitmap[word_idx], memory_order_relaxed);
-
-                /* If word is not full (UINT64_MAX), find the zero bit */
-                if (word != 0xFFFFFFFFFFFFFFFFULL) {
-                    uint64_t free_map = ~word;
-                    while (free_map != 0) {
-                        int bit = _hn4_ctz64(free_map);
-                        uint64_t candidate_slot = (word_idx * 64) + bit;
-                        
-                        if (candidate_slot >= total_slots) break;
-
-                        /* Run Contiguity Check */
-                        bool run_found = true;
-                        if (slots_needed > 1) {
-                            for (uint32_t k = 1; k < slots_needed; k++) {
-                                uint64_t next_s = candidate_slot + k;
-                                if (next_s >= total_slots) { run_found = false; break; }
-                                
-                                uint64_t nw = next_s / 64;
-                                uint64_t nb = next_s % 64;
-                                
-                                /* Optimization: Reuse 'word' if looking in same 64-slot chunk */
-                                uint64_t check_word; 
-                                if (nw == word_idx) {
-                                    check_word = word;
-                                } else {
-                                    check_word = atomic_load_explicit((_Atomic uint64_t*)&bitmap[nw], memory_order_relaxed);
-                                }
-
-                                /* Check if bit is SET (Occupied) */
-                                if (check_word & (1ULL << nb)) { 
-                                    run_found = false; 
-                                    break; 
-                                }
-                            }
-                        }
-
-                        if (run_found) {
-                            /* FIX: Reserve RAM Atomically */
-                            if (_try_reserve_cortex_slots(anchors, candidate_slot, slots_needed)) {
-                                current_slot = candidate_slot;
-                                goto perform_disk_claim;
-                            }
-                            /* Else: Race lost, continue scanning */
-                        }
-                        
-                        /* Clear bit and continue searching in this word */
-                        free_map &= ~(1ULL << bit);
-                    }
-                }
-                word_idx++;
-                words_checked++;
-            }
-            return HN4_ERR_ENOSPC;
-        }
-        
-        /* Fallback: Standard Struct Scan (if Bitmap alloc failed) */
-        uint32_t run = 0;
-        uint64_t scanned = 0;
-        uint64_t probe_idx = current_slot;
-
-        while (scanned < total_slots) {
-            if (probe_idx >= total_slots) probe_idx = 0;
-            
-            /* Use atomic load for data_class to prevent tearing */
-            uint64_t dc = atomic_load((_Atomic uint64_t*)&anchors[probe_idx].data_class);
-            bool is_free = (anchors[probe_idx].seed_id.lo == 0 && 
-                            anchors[probe_idx].seed_id.hi == 0 && 
-                            dc == 0);
-
-            if (is_free) {
-                run++;
-                if (run == slots_needed) {
-                    uint64_t potential_start = (probe_idx + 1) - run;
-                    
-                    /* FIX: Reserve RAM Atomically */
-                    if (_try_reserve_cortex_slots(anchors, potential_start, slots_needed)) {
-                        current_slot = potential_start;
-                        goto perform_disk_claim;
-                    } else {
-                        /* Race lost, reset run */
-                        run = 0;
-                    }
-                }
-            } else {
-                run = 0;
-            }
-            probe_idx++;
-            scanned++;
-        }
-        return HN4_ERR_ENOSPC;
-    }
-
-    /*
-     * =========================================================================
-     * PATH B: DISK LINEAR SCAN (Fallback)
-     * =========================================================================
-     */
-    uint32_t scan_size = (vol->sb.info.format_profile == HN4_PROFILE_PICO) ? sector_size : 65536;
-    if (scan_size < sector_size) scan_size = sector_size;
-
-    void* io_buffer = hn4_hal_mem_alloc(scan_size);
-    if (!io_buffer) return HN4_ERR_NOMEM;
-
-    uint32_t free_run_length = 0;
-    uint64_t run_start_index = 0;
-    uint64_t slots_checked = 0;
-    hn4_result_t status = HN4_ERR_ENOSPC;
-
-    /* L2 State Tracking Variable */
-    uint64_t l2_safe_until = 0;
-
-    while (slots_checked < total_slots) {
-        
-        if (current_slot >= total_slots) current_slot = 0;
-
-        /* L2 Optimization Logic */
-        if (vol->locking.l2_summary_bitmap && current_slot >= l2_safe_until) {
-            uint64_t byte_offset = current_slot * HN4_CORTEX_SLOT_SIZE;
-            uint64_t abs_lba = start_sect + (byte_offset / sector_size);
-            uint64_t block_idx = abs_lba / (vol->vol_block_size / sector_size);
-            
-            uint64_t l2_idx = block_idx / HN4_L2_COVERAGE_BITS;
-            uint64_t l2_word = l2_idx / 64;
-            uint64_t l2_bit = l2_idx % 64;
-            
-            uint64_t l2_val = atomic_load_explicit((_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word], memory_order_relaxed);
-            
-            /* Calculate remaining slots in this L2 region */
-            uint64_t blocks_rem = HN4_L2_COVERAGE_BITS - (block_idx % HN4_L2_COVERAGE_BITS);
-            uint64_t slots_in_region = (blocks_rem * vol->vol_block_size) / HN4_CORTEX_SLOT_SIZE;
-
-            if ((l2_val >> l2_bit) & 1) {
-                /* Saturated. Skip entire region. */
-                uint64_t skip = slots_in_region;
-                if (skip > (total_slots - slots_checked)) skip = 1;
-                
-                current_slot += skip;
-                slots_checked += skip;
-                l2_safe_until = current_slot; /* Force re-check at new location */
-                free_run_length = 0;
-                continue; 
-            } else {
-                /* Free. Mark safe to scan physically. */
-                l2_safe_until = current_slot + slots_in_region;
-            }
-        }
-
-        uint64_t batch_slots = (scan_size / HN4_CORTEX_SLOT_SIZE);
-        if (current_slot + batch_slots > total_slots) batch_slots = total_slots - current_slot;
-
-        uint64_t byte_offset = current_slot * HN4_CORTEX_SLOT_SIZE;
-        hn4_addr_t io_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, byte_offset / sector_size);
-        uint32_t read_bytes = (uint32_t)((batch_slots * HN4_CORTEX_SLOT_SIZE + sector_size - 1) & ~(sector_size - 1));
-
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, io_buffer, read_bytes / sector_size) != HN4_OK) {
-            status = HN4_ERR_HW_IO;
-            goto Cleanup_IO;
-        }
-
-        uint8_t* raw_ptr = (uint8_t*)io_buffer;
-        for (uint32_t i = 0; i < batch_slots; i++) {
-            uint64_t* w = (uint64_t*)(raw_ptr + (i * HN4_CORTEX_SLOT_SIZE));
-            /* Vectorized Zero Check */
-            uint64_t acc = 0;
-            for(int k=0; k<16; k+=4) { acc |= w[k] | w[k+1] | w[k+2] | w[k+3]; }
-            bool is_free = (acc == 0);
-
-            if (!is_free) {
-                /* Stale Check */
-                hn4_nano_header_t* h = (hn4_nano_header_t*)w;
-                if (h->magic == hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
-                    if ((hn4_hal_get_time_ns() - hn4_le64_to_cpu(h->version)) > 30000000000ULL) is_free = true;
-                }
-            }
-
-            if (is_free) {
-                if (free_run_length == 0) run_start_index = current_slot + i;
-                free_run_length++;
-                if (free_run_length == slots_needed) {
-                    current_slot = run_start_index;
-                    hn4_hal_mem_free(io_buffer);
-                    goto perform_disk_claim;
-                }
-            } else {
-                free_run_length = 0;
-            }
-        }
-        current_slot += batch_slots;
-        slots_checked += batch_slots;
-    }
-
-    status = HN4_ERR_ENOSPC;
-Cleanup_IO:
-    if (io_buffer) hn4_hal_mem_free(io_buffer);
-    return status;
-
-    /*
-     * =========================================================================
-     * PATH C: ATOMIC DISK CLAIM (Shared Convergence)
-     * =========================================================================
-     */
-perform_disk_claim:
-    {
-        uint32_t alloc_sz = (sector_size > 4096) ? sector_size : 4096;
-        void* claim_buf = hn4_hal_mem_alloc(alloc_sz);
-        if (!claim_buf) {
-            /* FIX: Release RAM reservation on failure */
-            if (vol->nano_cortex) {
-                hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-                for (uint32_t k = 0; k < slots_needed; k++) {
-                    atomic_store((_Atomic uint64_t*)&anchors[current_slot + k].data_class, 0);
-                }
-            }
-            return HN4_ERR_NOMEM;
-        }
-
-        uint64_t head_byte_offset = current_slot * HN4_CORTEX_SLOT_SIZE;
-        uint64_t head_sect_offset = head_byte_offset / sector_size;
-        uint32_t head_buf_offset  = head_byte_offset % sector_size;
-        
-        hn4_addr_t claim_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, head_sect_offset);
-        
-        /* 1. READ-VERIFY */
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, claim_lba, claim_buf, 1) != HN4_OK) {
-            /* FIX: Release RAM reservation on failure */
-            if (vol->nano_cortex) {
-                hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-                for (uint32_t k = 0; k < slots_needed; k++) {
-                    atomic_store((_Atomic uint64_t*)&anchors[current_slot + k].data_class, 0);
-                }
-            }
-            hn4_hal_mem_free(claim_buf);
-            return HN4_ERR_HW_IO;
-        }
-        
-        hn4_nano_header_t* hdr = (hn4_nano_header_t*)((uint8_t*)claim_buf + head_buf_offset);
-
-        if (hdr->magic != 0) {
-            bool collision = true;
-            if (hdr->magic == hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING)) {
-                if ((hn4_hal_get_time_ns() - hn4_le64_to_cpu(hdr->version)) > 30000000000ULL) collision = false;
-            }
-            
-            if (collision) {
-                /* HEAL RAM STATE */
-                if (vol->locking.cortex_occupancy_bitmap) {
-                    uint64_t w = current_slot / 64;
-                    uint64_t b = current_slot % 64;
-                    atomic_fetch_or((_Atomic uint64_t*)&vol->locking.cortex_occupancy_bitmap[w], (1ULL << b));
-                }
-                
-                /* FIX: Release our PENDING claim since we hit a collision on disk */
-                if (vol->nano_cortex) {
-                    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-                    for (uint32_t k = 0; k < slots_needed; k++) {
-                        atomic_store((_Atomic uint64_t*)&anchors[current_slot + k].data_class, 0);
-                    }
-                }
-                
-                hn4_hal_mem_free(claim_buf);
-                vol->alloc.cortex_search_head = current_slot + 1;
-                return HN4_ERR_ATOMICS_TIMEOUT;
-            }
-        }
-        
-        /* 2. WRITE RESERVATION */
-        hdr->magic = hn4_cpu_to_le32(HN4_MAGIC_NANO_PENDING);
-        hdr->payload_len = hn4_cpu_to_le64((uint64_t)slots_needed * HN4_CORTEX_SLOT_SIZE - sizeof(hn4_nano_header_t));
-        hdr->version = hn4_cpu_to_le64(hn4_hal_get_time_ns());
-        hdr->flags = 0;
-
-        uint32_t p_crc = hn4_crc32(0, &hdr->magic, 4);
-        size_t off_crc = offsetof(hn4_nano_header_t, payload_len);
-        p_crc = hn4_crc32(p_crc, (uint8_t*)hdr + off_crc, sizeof(hn4_nano_header_t) - off_crc);
-        hdr->header_crc = hn4_cpu_to_le32(p_crc);
-
-        if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, claim_lba, claim_buf, 1) != HN4_OK) {
-            /* FIX: Release RAM reservation on failure */
-            if (vol->nano_cortex) {
-                hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-                for (uint32_t k = 0; k < slots_needed; k++) {
-                    atomic_store((_Atomic uint64_t*)&anchors[current_slot + k].data_class, 0);
-                }
-            }
-            hn4_hal_mem_free(claim_buf);
-            return HN4_ERR_HW_IO;
-        }
-        
-        hn4_hal_barrier(vol->target_device);
-
-        /* 3. UPDATE RAM STATE */
-        /* 
-         * Note: The anchors themselves are already marked HN4_MAGIC_NANO_PENDING by 
-         * the reservation helper in Path A. If we came from Path B (no Nano-Cortex), 
-         * this block is skipped. If we have Nano-Cortex but came from Path B, 
-         * we should technically update them, but Path B logic implies limited RAM trust.
-         * The Bitmap update below is the critical persistence helper for allocators.
-         */
-        
-        if (vol->nano_cortex) {
-            hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-            /* 
-             * Update Anchors (Primary Truth) 
-             * We behave as if we reserved them via Path A.
-             */
-            for (uint32_t k = 0; k < slots_needed; k++) {
-                /* Store PENDING magic so scanners see it as occupied */
-                atomic_store_explicit(
-                    (_Atomic uint64_t*)&anchors[current_slot + k].data_class, 
-                    HN4_MAGIC_NANO_PENDING, 
-                    memory_order_release
-                );
-            }
-
-            /* Update Bitmap (Acceleration) */
-            if (vol->locking.cortex_occupancy_bitmap) {
-                for (uint32_t k = 0; k < slots_needed; k++) {
-                    uint64_t s = current_slot + k;
-                    uint64_t w = s / 64;
-                    uint64_t b = s % 64;
-                    atomic_fetch_or((_Atomic uint64_t*)&vol->locking.cortex_occupancy_bitmap[w], (1ULL << b));
-                }
-            }
-        }
-
-        *out_slot_idx = current_slot;
-        vol->alloc.cortex_search_head = current_slot + slots_needed;
-        
-        hn4_hal_mem_free(claim_buf);
-        return HN4_OK;
-    }
-}
-
-/*++
-
-Routine Description:
-
-    Allocates and persists a "Nano" object within the Cortex (D0) region.
-
-    Nano objects are small data payloads (<16KB) embedded directly into the
-    metadata region to minimize seek latency and fragmentation. This routine
-    handles the allocation of contiguous slots, payload construction, and
-    the atomic commit sequence required to persist the data safely.
-
-    The commit protocol uses a two-phase RMW strategy:
-    1. Reserve slots (PENDING state).
-    2. Write payload.
-    3. Commit (Set valid flag).
-
-Arguments:
-
-    vol - Pointer to the volume device extension.
-
-    anchor - Pointer to the parent Anchor structure (in-memory).
-
-    data - Buffer containing the payload.
-
-    len - Length of the payload in bytes (Max 16KB).
-
-Return Value:
-
-    HN4_OK on success.
-    HN4_ERR_INVALID_ARGUMENT if length exceeds limits.
-    HN4_ERR_ENOSPC if the Cortex is full.
-    HN4_ERR_HW_IO on media failure.
-
---*/
-hn4_result_t 
-hn4_alloc_nano(
-    HN4_IN hn4_volume_t* vol,
-    HN4_INOUT hn4_anchor_t* anchor,
-    HN4_IN const void* data,
-    HN4_IN uint32_t len
-    )
-{
-    /* Validate payload fits within Nano architecture limits */
-    if (len == 0 || len > 16384) return HN4_ERR_INVALID_ARGUMENT;
-
-    /*
-     * 1. Geometry & Allocation
-     * Calculate the number of 128-byte slots required for Header + Payload.
-     */
-    uint32_t total_payload = sizeof(hn4_nano_header_t) + len; 
-    uint32_t slots_needed = (total_payload + HN4_CORTEX_SLOT_SIZE - 1) / HN4_CORTEX_SLOT_SIZE;
-    uint32_t nano_obj_size = slots_needed * HN4_CORTEX_SLOT_SIZE;
-
-    /* Reserve contiguous slots on disk (writes PENDING marker) */
-    uint64_t start_slot;
-    hn4_result_t res = _alloc_cortex_run(vol, slots_needed, &start_slot);
-    if (res != HN4_OK) return res;
-
-    /*
-     * 2. Payload Construction
-     * Prepare the in-memory image of the Nano Object.
-     */
-    void* write_buf = hn4_hal_mem_alloc(nano_obj_size);
-    
-    /* 
-     * Resource Failure Handling:
-     * If RAM allocation fails, we must rollback the disk reservation to prevent
-     * leaking PENDING markers that would otherwise require timeout-based GC.
-     */
-    if (!write_buf) {
-        res = HN4_ERR_NOMEM;
-        goto rollback_reservation;
-    }
-    
-    memset(write_buf, 0, nano_obj_size);
-
-    hn4_nano_header_t* hdr = (hn4_nano_header_t*)write_buf;
-    
-    /* Derive strict monotonic version from parent Anchor */
-    uint64_t next_ver = hn4_le32_to_cpu(anchor->write_gen) + 1;
-    
-    hdr->magic       = hn4_cpu_to_le32(HN4_MAGIC_NANO);
-    hdr->payload_len = hn4_cpu_to_le64(len);
-    hdr->version     = hn4_cpu_to_le64(next_ver);
-    hdr->flags       = 0; /* Initially Uncommitted */
-    
-    memcpy(hdr->data, data, len);
-    
-    /* Calculate Data Integrity Checksum */
-    uint32_t d_crc = hn4_crc32(0, hdr->data, len);
-    hdr->data_crc = hn4_cpu_to_le32(d_crc);
-    
-    /* 
-     * Calculate Header Integrity Checksum (Split-CRC).
-     * The checksum covers the Magic field, skips the CRC field itself, 
-     * and covers the remainder of the header struct.
-     */
-    uint32_t h_crc = 0;
-    
-    /* Part A: Magic (First 4 bytes) */
-    h_crc = hn4_crc32(0, &hdr->magic, 4);
-    
-    /* Part B: Payload_Len to End of Header */
-    size_t offset_after_crc = offsetof(hn4_nano_header_t, payload_len);
-    h_crc = hn4_crc32(h_crc, (uint8_t*)hdr + offset_after_crc, sizeof(hn4_nano_header_t) - offset_after_crc);
-    
-    hdr->header_crc = hn4_cpu_to_le32(h_crc);
-
-    /*
-     * 3. Commit to Media (Read-Modify-Write)
-     * Nano objects may share physical sectors with other objects. 
-     * We must read the target sector(s), overlay our payload, and write back.
-     */
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size ? caps->logical_block_size : 512;
-
-    uint64_t byte_start = start_slot * HN4_CORTEX_SLOT_SIZE;
-    uint64_t byte_end   = byte_start + nano_obj_size;
-    
-    uint64_t sect_start_idx = byte_start / ss;
-    uint64_t sect_end_idx   = (byte_end + ss - 1) / ss;
-    uint32_t sectors_to_io  = (uint32_t)(sect_end_idx - sect_start_idx);
-    uint32_t buffer_offset  = byte_start % ss;
-
-    hn4_addr_t io_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, sect_start_idx);
-    void* io_buf = hn4_hal_mem_alloc(sectors_to_io * ss);
-    
-    if (!io_buf) { 
-        hn4_hal_mem_free(write_buf); 
-        return HN4_ERR_NOMEM; 
-    }
-
-    /* PHASE 1: Write Data (Flags = 0) */
-    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, io_buf, sectors_to_io) != HN4_OK) {
-        res = HN4_ERR_HW_IO; 
-        goto io_cleanup;
-    }
-
-    /* Boundary safety check before memcpy */
-    if (buffer_offset + nano_obj_size > (sectors_to_io * ss)) {
-        res = HN4_ERR_INTERNAL_FAULT; 
-        goto io_cleanup;
-    }
-    
-    memcpy((uint8_t*)io_buf + buffer_offset, write_buf, nano_obj_size);
-
-    if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, io_buf, sectors_to_io) != HN4_OK) {
-        res = HN4_ERR_HW_IO; 
-        goto io_cleanup;
-    }
-
-    /* BARRIER: Ensure payload is durable before marking valid */
-    hn4_hal_barrier(vol->target_device);
-
-    /* PHASE 2: Atomic Commit (Set COMMITTED flag) */
-    /* Only need to update the first sector containing the header */
-    hn4_nano_header_t* io_hdr = (hn4_nano_header_t*)((uint8_t*)io_buf + buffer_offset);
-    
-    io_hdr->flags = hn4_cpu_to_le32(HN4_NANO_FLAG_COMMITTED);
-    
-    /* Recompute Header CRC with new flag */
-    h_crc = hn4_crc32(0, &io_hdr->magic, 4);
-    h_crc = hn4_crc32(h_crc, (uint8_t*)io_hdr + offset_after_crc, sizeof(hn4_nano_header_t) - offset_after_crc);
-    io_hdr->header_crc = hn4_cpu_to_le32(h_crc);
-
-    /* Final Write of Header */
-    if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, io_buf, 1) != HN4_OK) {
-        /* 
-         * Torn state: Payload is present but uncommitted. 
-         * Readers will treat this as invalid due to missing flag/CRC mismatch.
-         */
-        res = HN4_ERR_HW_IO; 
-        goto io_cleanup;
-    }
-    
-    hn4_hal_barrier(vol->target_device);
-
-    /*
-     * 4. Metadata Update
-     * Update the parent Anchor in memory to point to the new Nano Object.
-     */
-    uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
-    dclass |= HN4_FLAG_NANO;
-    
-    anchor->data_class     = hn4_cpu_to_le64(dclass);
-    anchor->gravity_center = hn4_cpu_to_le64(start_slot);
-    anchor->mass           = hn4_cpu_to_le64(len);
-    anchor->write_gen      = hn4_cpu_to_le32((uint32_t)next_ver);
-
-    res = HN4_OK;
-
-    /*
-     * Error Handling & Resource Cleanup
-     */
-rollback_reservation:
-    if (res == HN4_ERR_NOMEM) {
-        if (vol->nano_cortex) {
-            hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-            for (uint32_t k = 0; k < slots_needed; k++) {
-                atomic_store((_Atomic uint64_t*)&anchors[start_slot + k].data_class, 0);
-            }
-        }
-
-        /* 
-         * Manual Rollback for NOMEM:
-         * We cannot reuse `io_buf` here as it failed allocation. We must alloc 
-         * a tiny temporary buffer to zero the header sector and clear the PENDING state.
-         */
-        const hn4_hal_caps_t* caps_rb = hn4_hal_get_caps(vol->target_device);
-        uint32_t ss_rb = caps_rb->logical_block_size ? caps_rb->logical_block_size : 512;
-        
-        uint64_t head_byte_off = start_slot * HN4_CORTEX_SLOT_SIZE;
-        uint64_t head_sect_off = head_byte_off / ss_rb;
-        hn4_addr_t wipe_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, head_sect_off);
-        
-        void* wipe_buf = hn4_hal_mem_alloc(ss_rb);
-        if (wipe_buf) {
-            memset(wipe_buf, 0, ss_rb);
-            /* Best effort wipe. Ignore errors as we are already failing. */
-            hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, wipe_lba, wipe_buf, 1);
-            hn4_hal_barrier(vol->target_device);
-            hn4_hal_mem_free(wipe_buf);
-        }
-    }
-    /* Fallthrough to return */
-    return res;
-
-io_cleanup:
-    /* Rollback PENDING reservation on IO failure using the existing buffer */
-    if (res != HN4_OK && io_buf) {
-        memset(io_buf, 0, ss);
-        hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, io_buf, 1);
-        hn4_hal_barrier(vol->target_device);
-    }
-
-    if (io_buf) hn4_hal_mem_free(io_buf);
-    if (write_buf) hn4_hal_mem_free(write_buf);
-    
-    return res;
-}
-
-/* =========================================================================
- * PHYSICS ENGINE (SECTION 6)
- * ========================================================================= */
 
 /*++
 
@@ -1930,10 +1298,8 @@ _calc_trajectory_lba(
     }
     
     /* Calculate Offset: (N * V) % Phi */
+   /* Calculate Offset: (N * V) % Phi */
     uint64_t offset = _mul_mod_safe(term_n, term_v, phi);
-    
-    /* Mix Entropy back in */
-    offset = (offset + entropy_loss) % phi;
     
     /* 
      * 6. Apply Inertial Damping (Theta Jitter)
@@ -1962,8 +1328,12 @@ _calc_trajectory_lba(
     /* Convert Fractal Index -> Physical Block Index */
     uint64_t rel_block_idx = (target_fractal_idx * S);
     
-    /* Overflow Guards */
+    /* 
+     * Re-inject Entropy Loss (Sub-block alignment)
+     * This restores the original byte-offset alignment of G.
+     */
     if (HN4_UNLIKELY((UINT64_MAX - entropy_loss) < rel_block_idx)) return HN4_LBA_INVALID;
+    
     rel_block_idx += entropy_loss;
 
     if (HN4_UNLIKELY((UINT64_MAX - flux_aligned_blk) < rel_block_idx)) return HN4_LBA_INVALID;

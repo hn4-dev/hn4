@@ -8966,18 +8966,22 @@ hn4_TEST(Optimization, Tombstone_Is_Occupied) {
 /* 
  * Helper: Inject an anchor that matches any tag query (Bloom Filter = All 1s).
  */
-static void inject_wildcard_anchor(hn4_volume_t* vol, uint32_t slot_idx, uint64_t id_lo, uint64_t id_hi, uint64_t mass) {
+static void inject_wildcard_anchor(hn4_volume_t* vol, uint32_t slot_idx, uint64_t id_lo, uint64_t id_hi, uint64_t mass, const char* name) {
     hn4_anchor_t a = {0};
-    a.seed_id.lo = id_lo; /* Keep CPU endian for logic, convert later? No, struct is LE. */
+    a.seed_id.lo = id_lo; 
     a.seed_id.hi = id_hi;
     a.seed_id = hn4_cpu_to_le128(a.seed_id);
     
     a.mass = hn4_cpu_to_le64(mass);
     a.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
-    a.tag_filter = 0xFFFFFFFFFFFFFFFFULL; /* Matches ALL tag queries */
+    a.tag_filter = 0xFFFFFFFFFFFFFFFFULL; /* Matches ALL tag queries (Bloom) */
     a.write_gen = hn4_cpu_to_le32(1);
     a.orbit_vector[0] = 1;
-    
+
+    /* FIX: Populate Name for strict verification in hn4_tensor_open */
+    if (name) {
+        strncpy((char*)a.inline_buffer, name, sizeof(a.inline_buffer)-1);
+    }
     /* Checksum */
     a.checksum = 0;
     a.checksum = hn4_cpu_to_le32(hn4_crc32(0, &a, sizeof(a)));
@@ -9015,10 +9019,10 @@ hn4_TEST(Tensor, Open_Sorts_Shards) {
 
     /* Inject Shards out of order */
     /* Slot 1: ID 20 (Should be 2nd) */
-    inject_wildcard_anchor(vol, 1, 20, 0, 1000); 
+    inject_wildcard_anchor(vol, 1, 20, 0, 1000, "model:gpt4"); 
     
     /* Slot 5: ID 10 (Should be 1st) */
-    inject_wildcard_anchor(vol, 5, 10, 0, 500);
+    inject_wildcard_anchor(vol, 5, 10, 0, 500, "model:gpt4");
 
     hn4_tensor_ctx_t* ctx = NULL;
     
@@ -9060,7 +9064,7 @@ hn4_TEST(Tensor, Open_Rejects_Zero_Mass) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
     /* Inject Zero Mass Anchor */
-    inject_wildcard_anchor(vol, 0, 1, 0, 0);
+    inject_wildcard_anchor(vol, 0, 1, 0, 0,  "tag:any");
 
     hn4_tensor_ctx_t* ctx = NULL;
     hn4_result_t res = hn4_tensor_open(vol, "tag:any", &ctx);
@@ -9087,7 +9091,7 @@ hn4_TEST(Tensor, Read_OOB) {
     ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
 
     /* Inject valid shard (Size 100) */
-    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+    inject_wildcard_anchor(vol, 0, 1, 0, 100, "tag:any");
 
     hn4_tensor_ctx_t* ctx = NULL;
     ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx));
@@ -9134,7 +9138,7 @@ hn4_TEST(Tensor, Dynamic_Geometry) {
     hn4_mount_params_t mp = {0};
     hn4_mount(dev, &mp, &vol);
     
-    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+    inject_wildcard_anchor(vol, 0, 1, 0, 100, "tag:any");
     
     hn4_tensor_ctx_t* ctx = NULL;
     ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx));
@@ -9158,7 +9162,7 @@ hn4_TEST(Tensor, Concurrent_Open) {
     hn4_mount_params_t mp = {0};
     hn4_mount(dev, &mp, &vol);
     
-    inject_wildcard_anchor(vol, 0, 1, 0, 100);
+    inject_wildcard_anchor(vol, 0, 1, 0, 100, "tag:any");
     
     hn4_tensor_ctx_t *ctx1, *ctx2;
     ASSERT_EQ(HN4_OK, hn4_tensor_open(vol, "tag:any", &ctx1));

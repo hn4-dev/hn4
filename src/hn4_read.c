@@ -51,39 +51,43 @@
  */
 static int _get_error_weight(hn4_result_t e)
 {
-    switch (e) {
-        /* CRITICAL INFRASTRUCTURE (90-100) */
-        case HN4_ERR_CPU_INSANITY:      return 100;
-        case HN4_ERR_HW_IO:             return 99;
-        case HN4_ERR_NOMEM:             return 95;
+   switch (e) {
 
-        /* LOGICAL CONSISTENCY (85-90) - TRANSACTION VIOLATIONS */
-        case HN4_ERR_GENERATION_SKEW:   return 85;
-        case HN4_ERR_PHANTOM_BLOCK:     return 82;
+    /* FATAL SYSTEM INTEGRITY (90-100) */
+    case HN4_ERR_HW_IO:             return 98;
+    case HN4_ERR_NOMEM:             return 95;
+    case HN4_ERR_CPU_INSANITY:      return 100;
+    
+    /* LOGICAL CORRUPTION / TRANSACTION VIOLATION (85-89) */
+    case HN4_ERR_PHANTOM_BLOCK:     return 86;
+    case HN4_ERR_GENERATION_SKEW:   return 88;
+    
+    /* DATA CORRUPTION (75-84) */
+    case HN4_ERR_ALGO_UNKNOWN:      return 78;
+    case HN4_ERR_DECOMPRESS_FAIL:   return 80;
+    case HN4_ERR_PAYLOAD_ROT:       return 82;
+    case HN4_ERR_HEADER_ROT:        return 83;
+    case HN4_ERR_DATA_ROT:          return 84;
 
-        /* DATA INTEGRITY (75-80) */
-        case HN4_ERR_DATA_ROT:          return 80;
-        case HN4_ERR_HEADER_ROT:        return 80;
-        case HN4_ERR_PAYLOAD_ROT:       return 80;
-        case HN4_ERR_DECOMPRESS_FAIL:   return 79;
-        case HN4_ERR_ALGO_UNKNOWN:      return 78;
+    /* COMPATIBILITY / IDENTITY ERRORS (60-74) */
+    case HN4_ERR_VERSION_INCOMPAT:  return 65;
+    case HN4_ERR_ID_MISMATCH:       return 70;
 
-        /* LOGICAL MISMATCH (55-70) */
-        case HN4_ERR_ID_MISMATCH:       return 60;
-        case HN4_ERR_VERSION_INCOMPAT:  return 55;
+    /* EXPECTED / NON-CORRUPTING CONDITIONS (20-59) */
+    case HN4_INFO_SPARSE:           return 20;
+    case HN4_ERR_NOT_FOUND:         return 40;
 
-        /* EXPECTED / INFO (0-50) */
-        case HN4_ERR_NOT_FOUND:         return 50;
-        case HN4_INFO_SPARSE:           return 10;
-        case HN4_OK:                    return 0;
+    /* OK */
+    case HN4_OK:                    return 0;
 
-        default:                        return 40;
-    }
+    /* UNKNOWN ERROR → CONSERVATIVE */
+    default:                        return 75;
 }
 
-static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)
+}
+
+HN4_INLINE hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)
 {
-    /* Hot-path optimization: success needs no merging */
     if (HN4_LIKELY(current == HN4_OK)) return new_err;
     if (HN4_LIKELY(new_err == HN4_OK)) return current;
 
@@ -93,8 +97,10 @@ static inline hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_e
     if (w_new > w_cur) return new_err;
     if (w_new < w_cur) return current;
 
-    return (new_err < current) ? new_err : current;
+    /* Equal severity → preserve causal first error */
+    return current;
 }
+
 
 /* =========================================================================
  * VALIDATION HELPER
@@ -106,7 +112,7 @@ static hn4_result_t _validate_block(
     HN4_IN uint32_t      len,
     HN4_IN hn4_u128_t    expected_well_id,
     HN4_IN uint64_t      expected_gen,
-    HN4_IN uint64_t      anchor_dclass /* Added for Policy Check */
+    HN4_IN uint64_t      anchor_dclass
 )
 {
     const hn4_block_header_t* hdr = (const hn4_block_header_t*)buffer;
@@ -119,19 +125,18 @@ static hn4_result_t _validate_block(
     }
 
     /* 1. Magic Check & Poison Detection */
-    uint32_t magic_val = hn4_le32_to_cpu(hdr->magic);
+    uint32_t magic = hn4_le32_to_cpu(hdr->magic);
 
-    if (HN4_UNLIKELY(magic_val != HN4_BLOCK_MAGIC)) {   
-        if (magic_val == 0xCCCCCCCC) {
-            /* Poison Heuristic: Scan first cache line to confirm strict poisoning */
+    if (HN4_UNLIKELY(magic != HN4_BLOCK_MAGIC)) {   
+        /* Check for debug poisoning (0xCC) before declaring phantom */
+        if (magic == 0xCCCCCCCC) {
+            /* Scan first cache line to confirm strict poisoning */
+            const uint64_t* scan = (const uint64_t*)buffer;
             bool is_poison = true;
-            uint64_t val;
-
+            
             /* Check 64 bytes (8 x 64-bit words) */
             for (int i = 0; i < 8; i++) {
-                memcpy(&val, (const uint8_t*)buffer + (i * 8), sizeof(uint64_t));
-
-                if (val != 0xCCCCCCCCCCCCCCCCULL) {
+                if (scan[i] != 0xCCCCCCCCCCCCCCCCULL) {
                     is_poison = false;
                     break;
                 }
@@ -142,38 +147,32 @@ static hn4_result_t _validate_block(
                 return HN4_ERR_HW_IO;
             }
         }
-    }
-
-    if (magic_val != HN4_BLOCK_MAGIC) {
         return HN4_ERR_PHANTOM_BLOCK;
     }
 
-    /* 2. Header Integrity Check */
-    size_t   header_boundary = offsetof(hn4_block_header_t, header_crc);
-    uint32_t stored_hcrc     = hn4_le32_to_cpu(hdr->header_crc);
-    uint32_t calc_hcrc       = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, header_boundary);
+    /* 2. Header Integrity Check (CRC) */
+    /* CRC covers everything before the header_crc field */
+    uint32_t stored_crc = hn4_le32_to_cpu(hdr->header_crc);
+    uint32_t calc_crc   = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, offsetof(hn4_block_header_t, header_crc));
 
-    if (HN4_UNLIKELY(stored_hcrc != calc_hcrc)) return HN4_ERR_HEADER_ROT;
+    if (HN4_UNLIKELY(stored_crc != calc_crc)) return HN4_ERR_HEADER_ROT;
 
-    /* 3. Identity Check */
+    /* 3. Identity Check (Anti-Collision) */
     hn4_u128_t disk_id = hn4_le128_to_cpu(hdr->well_id);
-     if (HN4_UNLIKELY(disk_id.lo != expected_well_id.lo || disk_id.hi != expected_well_id.hi)) {
+    if (HN4_UNLIKELY(disk_id.lo != expected_well_id.lo || disk_id.hi != expected_well_id.hi)) {
         return HN4_ERR_ID_MISMATCH;
     }
 
-    /*
+     /* 
      * 4. Freshness Check (STRICT ATOMICITY)
+     * Rejects Phantom Reads where Disk Gen != Anchor Gen.
+     * High 32-bits must be zero (v1 format constraint).
      */
-     uint64_t blk_gen_64 = hn4_le64_to_cpu(hdr->generation);
+    uint64_t blk_gen_64 = hn4_le64_to_cpu(hdr->generation);
     
-    if ((blk_gen_64 >> 32) != 0) {
-        return HN4_ERR_GENERATION_SKEW;
-    }
+    if ((blk_gen_64 >> 32) != 0) return HN4_ERR_GENERATION_SKEW;
 
-    uint32_t blk_gen_32 = (uint32_t)blk_gen_64;
-    uint32_t exp_gen_32 = (uint32_t)expected_gen;
-    
-    if (HN4_UNLIKELY((int32_t)(blk_gen_32 - exp_gen_32) < 0)) {
+    if (HN4_UNLIKELY((uint32_t)blk_gen_64 != (uint32_t)expected_gen)) {
         return HN4_ERR_GENERATION_SKEW;
     }
 
@@ -183,22 +182,25 @@ static hn4_result_t _validate_block(
     uint32_t c_size     = comp_meta >> HN4_COMP_SIZE_SHIFT;
     uint8_t  algo       = comp_meta & HN4_COMP_ALGO_MASK;
 
+    /* Validate Compression Algo */
     if (HN4_UNLIKELY(algo != HN4_COMP_NONE && algo != HN4_COMP_TCC)) {
         HN4_LOG_WARN("Block Validation: Unknown Algo %u", algo);
         return HN4_ERR_ALGO_UNKNOWN;
     }
 
+    /* Security: Encrypted files must not use FS compression (Information Leak) */
     if ((anchor_dclass & HN4_HINT_ENCRYPTED) && algo != HN4_COMP_NONE) {
-        /* Policy: Encrypted files MUST NOT use FS-layer compression */
         HN4_LOG_CRIT("Security: Encrypted file contains compressed block. Tamper evidence.");
         return HN4_ERR_TAMPERED;
     }
 
+    /* Meta Integrity */
     if (c_size > payload_sz) {
         HN4_LOG_WARN("Block Validation: Meta Corruption (CSize %u > Payload %u)", c_size, payload_sz);
         return HN4_ERR_HEADER_ROT;
     }
 
+    /* Payload CRC */
     uint32_t stored_dcrc = hn4_le32_to_cpu(hdr->data_crc);
     uint32_t calc_dcrc   = hn4_crc32(HN4_CRC_SEED_DATA, hdr->payload, payload_sz);
 

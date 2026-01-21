@@ -58,33 +58,32 @@ static const uint32_t POLY32 = 0xEDB88320U;
 static const uint64_t POLY64 = 0xC96C5795D7870F42ULL;
 
 void hn4_crc_init(void) {
-    uint32_t c32;
-    int i, k;
-
-    /* CRC32 Slice 0 */
-    for (i = 0; i < 256; i++) {
-        c32 = i;
-        for (k = 0; k < 8; k++) c32 = (c32 >> 1) ^ ((c32 & 1) ? POLY32 : 0);
-        hn4_table32[0][i] = c32;
+    /* Init CRC32 tables */
+    for (int i = 0; i < 256; i++) {
+        uint32_t c = i;
+        for (int k = 0; k < 8; k++) 
+            c = (c >> 1) ^ ((c & 1) ? POLY32 : 0);
+        hn4_table32[0][i] = c;
     }
-    /* CRC32 Slices 1-7 */
-    for (k = 1; k < 8; k++) {
-        for (i = 0; i < 256; i++) {
+
+    for (int i = 0; i < 256; i++) {
+        for (int k = 1; k < 8; k++) {
             uint32_t prev = hn4_table32[k - 1][i];
             hn4_table32[k][i] = (prev >> 8) ^ hn4_table32[0][prev & 0xFF];
         }
     }
 
 #ifdef HN4_CRC64_ENABLE
-    /* CRC64 Init */
-    uint64_t c64;
-    for (i = 0; i < 256; i++) {
-        c64 = i;
-        for (k = 0; k < 8; k++) c64 = (c64 >> 1) ^ ((c64 & 1) ? POLY64 : 0);
-        hn4_table64[0][i] = c64;
+    /* Init CRC64 tables */
+    for (int i = 0; i < 256; i++) {
+        uint64_t c = i;
+        for (int k = 0; k < 8; k++) 
+            c = (c >> 1) ^ ((c & 1) ? POLY64 : 0);
+        hn4_table64[0][i] = c;
     }
-    for (k = 1; k < 8; k++) {
-        for (i = 0; i < 256; i++) {
+
+    for (int i = 0; i < 256; i++) {
+        for (int k = 1; k < 8; k++) {
             uint64_t prev = hn4_table64[k - 1][i];
             hn4_table64[k][i] = (prev >> 8) ^ hn4_table64[0][prev & 0xFF];
         }
@@ -183,4 +182,3 @@ uint64_t hn4_crc64(uint64_t seed, const void * HN4_RESTRICT buf, size_t len) {
     return ~crc;
 }
 #endif
-

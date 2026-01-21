@@ -25,15 +25,6 @@ extern "C" {
  * 0. ENVIRONMENT SAFETY & ASSERTIONS
  * ========================================================================= */
 
-/* Ensure HN4_INLINE is defined safely for headers */
-#ifndef HN4_INLINE
-    #if defined(_MSC_VER)
-        #define HN4_INLINE static __forceinline
-    #else
-        #define HN4_INLINE static inline __attribute__((always_inline))
-    #endif
-#endif
-
 /* Verify Environment Assumptions */
 #if CHAR_BIT != 8
     #error "HN4 requires 8-bit bytes."
@@ -163,7 +154,7 @@ HN4_INLINE hn4_u128_t hn4_bswap128(hn4_u128_t val) {
  * ========================================================================= */
 
 /*
- * These are implemented as static inline functions to ensure:
+ * These are implemented as HN4_INLINE functions to ensure:
  * 1. Proper type checking (no macro narrowing).
  * 2. Single evaluation of arguments.
  * 3. Debuggability.

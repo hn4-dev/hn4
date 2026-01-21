@@ -1455,3 +1455,499 @@ hn4_TEST(Horizon, TripleWrapStability) {
     
     cleanup_horizon_fixture(vol);
 }
+
+/* =========================================================================
+ * TEST 30: FRACTAL SCALE REJECTION (M > 0)
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * The Horizon is a linear log of 4KB blocks. It physically cannot support 
+ * Fractal Scaling (e.g., 2MB contiguous aligned blocks).
+ * If D1 is full, but the request demands M=9 (2MB), the allocator must 
+ * fail with GRAVITY_COLLAPSE rather than returning a 4KB Horizon block 
+ * which would violate the spatial requirement.
+ */
+hn4_TEST(Horizon, FractalScaleRejection) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Request 2MB Blocks (M=9) */
+    anchor.fractal_scale = hn4_cpu_to_le16(9); 
+    
+    /* 
+     * FORCE FALLBACK:
+     * We cannot use `_jam_trajectory` here because that helper hardcodes M=0.
+     * The trajectories for M=9 are physically different (different alignment).
+     * Instead, we force D1 saturation by artificially inflating the usage counter
+     * to >95%. This guarantees the allocator skips Phase 1 (D1) and enters 
+     * Phase 2 (Horizon), where the M-check resides.
+     */
+    uint64_t total_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+    atomic_store(&vol->alloc.used_blocks, (total_blocks * 96) / 100);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* 
+     * Expectation: 
+     * D1 is skipped due to saturation.
+     * D1.5 (Horizon) Logic detects M > 0.
+     * Must return GRAVITY_COLLAPSE (Total Failure).
+     */
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_ERR_GRAVITY_COLLAPSE, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 31: SYSTEM PROFILE ISOLATION (No Spillover)
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * Critical System volumes (OS Root) prioritize D1 Ballistic placement for 
+ * bootloader/read performance. They are forbidden from spilling into the 
+ * Horizon Log unless the volume is in a Panic state.
+ */
+hn4_TEST(Horizon, SystemProfileIsolation) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    /* Set Profile to SYSTEM */
+    vol->sb.info.format_profile = HN4_PROFILE_SYSTEM;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Jam D1 */
+    _jam_trajectory(vol, 1000, 1, 0);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* Expect ENOSPC (Spillover Denied) */
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 32: PANIC OVERRIDE GATE
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * If a System Volume is corrupted or handling emergency dumps (Panic State),
+ * the "No Spillover" rule is suspended to allow data preservation.
+ */
+hn4_TEST(Horizon, PanicOverrideGate) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    /* Profile SYSTEM + Panic Flag */
+    vol->sb.info.format_profile = HN4_PROFILE_SYSTEM;
+    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Jam D1 */
+    _jam_trajectory(vol, 1000, 1, 0);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* Expect Success (Horizon used as emergency buffer) */
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(15, out_k); /* HN4_HORIZON_FALLBACK_K */
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 33: METADATA INTENT ISOLATION
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * Even on Generic volumes, allocations tagged as HN4_ALLOC_METADATA 
+ * must not spill to Horizon. Metadata fragmentation is fatal for performance.
+ */
+hn4_TEST(Horizon, MetadataIntentIsolation) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    /* Profile is Generic (usually allows spillover) */
+    vol->sb.info.format_profile = HN4_PROFILE_GENERIC;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Jam D1 */
+    _jam_trajectory(vol, 1000, 1, 0);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* 
+     * Simulate Metadata Intent via Data Class 
+     * (HN4_VOL_STATIC implies Metadata logic in alloc_block)
+     */
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_STATIC);
+    
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 34: L2 SUMMARY SYNCHRONIZATION
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * The Horizon uses `_bitmap_op`, which triggers `_update_counters_and_l2`.
+ * We must ensure that Horizon allocations correctly dirty the L2 bitmap 
+ * to ensure hierarchical scanning works for free-space display.
+ */
+hn4_TEST(Horizon, L2SummarySync) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    /* Manually Attach L2 Bitmap (Fixture doesn't create it by default) */
+    /* 100MB Capacity / 4KB = 25600 blocks. 
+       L2 covers 512 blocks per bit. 25600 / 512 = 50 bits. 
+       Need 1 uint64_t.
+    */
+    vol->locking.l2_summary_bitmap = hn4_hal_mem_alloc(64);
+    memset(vol->locking.l2_summary_bitmap, 0, 64);
+    
+    /* Alloc Horizon at 20000 */
+    uint64_t lba;
+    hn4_alloc_horizon(vol, &lba);
+    
+    /* Verify L2 Bit Set */
+    /* LBA 20000 / 512 = Index 39 */
+    uint64_t l2_idx = 20000 / 512;
+    uint64_t l2_word = atomic_load(&vol->locking.l2_summary_bitmap[0]);
+    
+    ASSERT_TRUE((l2_word & (1ULL << l2_idx)) != 0);
+    
+    hn4_hal_mem_free(vol->locking.l2_summary_bitmap);
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 35: LINEAR VECTOR SIGNALING
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * When fallback occurs, the allocator must explicitly set the output 
+ * Orbit Vector (out_V) to 0. This signals to the storage engine that 
+ * the file has transitioned from Ballistic Mode to Linear Mode.
+ */
+hn4_TEST(Horizon, LinearVectorSignaling) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 55; /* Wild Ballistic Vector */
+    
+    /* Jam D1 */
+    _jam_trajectory(vol, 1000, 55, 0);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* Use a canary value for V to ensure it gets overwritten */
+    uint64_t out_V = 0xDEADBEEF;
+    
+    /* We need to call a wrapper that calls alloc_block to check V, 
+       but `hn4_alloc_block` signature in the source provided doesn't return V?
+       Wait, checking source... 
+       Ah, `hn4_alloc_genesis` returns V. 
+       `hn4_alloc_block` gets V from Anchor and returns LBA/K.
+       
+       Let's test `hn4_alloc_genesis` fallback instead, as that's where 
+       the Vector switch decision happens.
+    */
+    
+    hn4_result_t res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &out_lba, &out_V);
+    
+    /* If genesis falls back (because D1 is jammed or saturated) */
+    /* Jamming genesis is harder because it probes random G. 
+       Easier to simulate SATURATION to force fallback. */
+    
+    /* Fake 96% Saturation */
+    atomic_store(&vol->alloc.used_blocks, (HZN_CAPACITY/HZN_BS) * 96 / 100);
+    
+    res = hn4_alloc_genesis(vol, 0, HN4_ALLOC_DEFAULT, &out_lba, &out_V);
+    
+    ASSERT_EQ(HN4_INFO_HORIZON_FALLBACK, res);
+    ASSERT_EQ(0ULL, out_V); /* Must be 0 for Linear Mode */
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 36: TIME TRAVEL (SNAPSHOT) LOCKOUT
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * If the volume is mounted in a Time-Travel state (non-zero time_offset),
+ * the filesystem is immutable view-only. The allocator must reject all 
+ * requests with HN4_ERR_ACCESS_DENIED to prevent forking history.
+ */
+hn4_TEST(Horizon, SnapshotWriteLockout) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    /* Simulate Snapshot Mount (Time -100s) */
+    vol->time_offset = 100;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 37: PROBE DEPTH EXHAUSTION (Fail-Fast)
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * The Horizon allocator uses a "Lazy Scan" with a strict limit (`max_probes=4`).
+ * It does NOT scan the entire ring. If the 4 blocks immediately following 
+ * the Head are busy, it must fail with ENOSPC immediately, even if the 
+ * rest of the ring is empty. This prevents CPU spin on saturated logs.
+ */
+hn4_TEST(Horizon, ProbeDepthExhaustion) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    uint64_t start = 20000;
+    
+    /* Occupy 0, 1, 2, 3 (The 4 probe slots) */
+    bool st;
+    _bitmap_op(vol, start + 0, BIT_SET, &st);
+    _bitmap_op(vol, start + 1, BIT_SET, &st);
+    _bitmap_op(vol, start + 2, BIT_SET, &st);
+    _bitmap_op(vol, start + 3, BIT_SET, &st);
+    
+    /* Block 4 is Free */
+    _bitmap_op(vol, start + 4, BIT_CLEAR, &st);
+    
+    /* Reset Head to 0 */
+    atomic_store(&vol->alloc.horizon_write_head, 0);
+    
+    uint64_t lba;
+    /* 
+     * Expectation: 
+     * Probe 0(Busy)..1..2..3(Busy). 
+     * Reached max_probes (4). Return ENOSPC.
+     * It should NOT find block 4.
+     */
+    hn4_result_t res = hn4_alloc_horizon(vol, &lba);
+    
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 39: READ-ONLY MOUNT ENFORCEMENT
+ * ========================================================================= */
+hn4_TEST(Horizon, ReadOnlyEnforcement) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    vol->read_only = true;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(100);
+    anchor.orbit_vector[0] = 1;
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 42: HEAD WRAP ON RESIZE
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * If a volume is shrunk, the `horizon_write_head` might be larger than 
+ * the new capacity. The modulo math must gracefully handle this 
+ * (Head % NewCap) without crashing or accessing OOB.
+ */
+hn4_TEST(Horizon, HeadWrapOnResize) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    uint64_t start = 20000;
+    
+    /* Initially Cap = 100 */
+    vol->sb.info.journal_start = start + 100;
+    
+    /* Advance head to 90 */
+    atomic_store(&vol->alloc.horizon_write_head, 90);
+    
+    /* Shrink Cap to 50 */
+    vol->sb.info.journal_start = start + 50;
+    
+    /* 
+     * Next Alloc:
+     * Head (90) % Cap (50) = 40.
+     * New Head -> 91.
+     * Should allocate at offset 40.
+     */
+    uint64_t lba;
+    ASSERT_EQ(HN4_OK, hn4_alloc_horizon(vol, &lba));
+    
+    ASSERT_EQ(start + 40, lba);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 43: SATURATION FLAG BYPASS
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * Verify that the `HN4_VOL_RUNTIME_SATURATED` flag causes `hn4_alloc_block`
+ * to skip the D1 Flux calculation entirely and jump straight to Horizon.
+ * We verify this by observing that we get a Horizon LBA (k=15) even when 
+ * the ballistic trajectory (k=0) is physically free.
+ */
+hn4_TEST(Horizon, SaturationFlagBypass) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Ensure D1 slot is PHYSICALLY FREE to prove we aren't using it */
+    bool st;
+    uint64_t d1_lba = _calc_trajectory_lba(vol, 1000, 1, 0, 0, 0);
+    _bitmap_op(vol, d1_lba, BIT_CLEAR, &st);
+    
+    /* 
+     * MANIPULATE USAGE COUNTER:
+     * Set usage to 96% to trigger the Hard Wall saturation logic.
+     * HZN_CAPACITY / HZN_BS = 25600 blocks.
+     */
+    uint64_t total = vol->vol_capacity_bytes / vol->vol_block_size;
+    uint64_t fake_usage = (total * 96) / 100;
+    atomic_store(&vol->alloc.used_blocks, fake_usage);
+    
+    /* Also set the flag for consistency, though Hard Wall check is primary here */
+    atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_RUNTIME_SATURATED);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    /* Must succeed via Horizon (k=15), ignoring the free D1 slot */
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(15, out_k);
+    
+    /* LBA should be in Horizon range (>= 20000) */
+    uint64_t val = *(uint64_t*)&out_lba;
+    ASSERT_TRUE(val >= 20000);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 45: METADATA FORCED D1 CHECK
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * Check explicit check for `HN4_ALLOC_METADATA` intent.
+ * Even if not SYSTEM profile, Metadata must effectively act like system
+ * and refuse spillover unless Panic.
+ */
+hn4_TEST(Horizon, MetadataIntentRefusal) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    vol->sb.info.format_profile = HN4_PROFILE_GENERIC;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.gravity_center = hn4_cpu_to_le64(1000);
+    anchor.orbit_vector[0] = 1;
+    
+    /* Jam D1 */
+    _jam_trajectory(vol, 1000, 1, 0);
+    
+    hn4_addr_t out_lba;
+    uint8_t out_k;
+    
+    /* Intent: Metadata (via data class or direct arg if exposed) */
+    /* hn4_alloc_block derives intent from anchor.data_class */
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_STATIC);
+    
+    hn4_result_t res = hn4_alloc_block(vol, &anchor, 0, &out_lba, &out_k);
+    
+    /* Should refuse spillover */
+    ASSERT_EQ(HN4_ERR_ENOSPC, res);
+    
+    cleanup_horizon_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 47: DYNAMIC JOURNAL EXPANSION (Capacity Truncation)
+ * ========================================================================= */
+/*
+ * RATIONALE:
+ * HN4 supports online Journal resizing. If the Journal grows *backwards*,
+ * it reduces the Horizon capacity.
+ * 
+ * Scenario: 
+ * 1. Horizon Capacity = 100 blocks. Head is at 90.
+ * 2. Journal expands, reducing Horizon Capacity to 20 blocks.
+ * 3. Next Alloc: Head (90) % NewCap (20) = 10.
+ * 
+ * The Write Head must instantly jump backwards to index 10 to stay valid.
+ */
+hn4_TEST(Horizon, JournalExpansionJump) {
+    hn4_volume_t* vol = create_horizon_fixture();
+    uint64_t start = 20000;
+    
+    /* Initial: Cap 100 */
+    vol->sb.info.lba_horizon_start = start;
+    vol->sb.info.journal_start     = start + 100;
+    
+    /* Simulate previous activity pushing head to 90 */
+    atomic_store(&vol->alloc.horizon_write_head, 90);
+    
+    /* Journal Grows Backwards: New Cap 20 */
+    vol->sb.info.journal_start = start + 20;
+    
+    /* Ensure target (Index 10) is free */
+    bool st;
+    _bitmap_op(vol, start + 10, BIT_CLEAR, &st);
+    
+    uint64_t lba;
+    ASSERT_EQ(HN4_OK, hn4_alloc_horizon(vol, &lba));
+    
+    /* 90 % 20 = 10. Start + 10. */
+    ASSERT_EQ(start + 10, lba);
+    
+    cleanup_horizon_fixture(vol);
+}

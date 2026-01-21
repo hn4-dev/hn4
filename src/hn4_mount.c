@@ -29,11 +29,19 @@
  * HELPER INLINES & MACROS
  * ========================================================================= */
 
+ /* 
+ * Cardinal Point Ratios
+ * Index 0: North (0%)
+ * Index 1: East  (33%)
+ * Index 2: West  (66%)
+ */
+static const uint8_t _cardinal_ratios[3] = { 0, 33, 66 };
+
 /* 
  * Address Translation: FS Block Index -> Device Sector LBA 
  * CRITICAL: This is the bridge between FS Logic (Blocks) and HAL Logic (Sectors).
  */
-static inline hn4_result_t _phys_lba_from_block(
+HN4_INLINE hn4_result_t _phys_lba_from_block(
     uint64_t block_idx, 
     uint32_t block_size, 
     uint32_t sector_size, 
@@ -95,73 +103,80 @@ typedef struct {
 } _hn4_topo_entry_t;
 
 /* QSort Comparator: Sort by LBA Start */
-static int _topo_cmp(const void* a, const void* b) {
-    const _hn4_topo_entry_t* ra = (const _hn4_topo_entry_t*)a;
-    const _hn4_topo_entry_t* rb = (const _hn4_topo_entry_t*)b;
-    if (ra->lba_start < rb->lba_start) return -1;
-    if (ra->lba_start > rb->lba_start) return 1;
-    return 0;
+static int _topo_cmp(const void *a, const void *b)
+{
+    const _hn4_topo_entry_t *ra = a;
+    const _hn4_topo_entry_t *rb = b;
+
+    if (ra->lba_start == rb->lba_start)
+        return 0;
+
+    return (ra->lba_start < rb->lba_start) ? -1 : 1;
 }
+
 #define HN4_MAX_TOPOLOGY_REGIONS 64
 
 /* =========================================================================
  * 2. SUPERBLOCK VALIDATION
  * ========================================================================= */
 
-/**
- * _validate_sb_integrity
- * Performs strictly Read-Only checks on a memory buffer.
- * Verifies Magic, Poison Patterns, and CRC32C.
- */
-/* =========================================================================
- * SUPERBLOCK INTEGRITY VALIDATOR
- * ========================================================================= */
 static hn4_result_t _validate_sb_integrity(HN4_IN const void* buffer)
 {
-    if (HN4_UNLIKELY(!buffer)) return HN4_ERR_INTERNAL_FAULT;
+    /* Input pointer sanity check */
+    if (!buffer) return HN4_ERR_INTERNAL_FAULT;
 
-    /* Use local copy to prevent unaligned access faults on strict archs */
-    uint32_t raw32[4];
-    memcpy(raw32, buffer, sizeof(raw32));
+    /* 
+     * Cast to typed pointers for easier access.
+     * Use raw_ptr for quick 32-bit integer checks (Magic/Poison).
+     * Use sb pointer for structured access (UUID).
+     */
+    const hn4_superblock_t* sb = (const hn4_superblock_t*)buffer;
+    const uint32_t* raw_ptr = (const uint32_t*)buffer;
 
-    uint64_t raw_magic;
-    memcpy(&raw_magic, buffer, sizeof(uint64_t));
-    uint64_t safe_magic = hn4_le64_to_cpu(raw_magic);
-
-    /* 1. Magic Check */
-    if (HN4_UNLIKELY(safe_magic != HN4_MAGIC_SB)) {
-        /* 
-         * Endian Safety Fix:
-         * The poison pattern is written as a raw Host-Endian uint32 array by format.
-         * We compare against the raw memory view, not the LE-decoded view.
-         */
-        if (raw32[0] == HN4_POISON_PATTERN && 
-            raw32[1] == HN4_POISON_PATTERN &&
-            raw32[2] == HN4_POISON_PATTERN &&
-            raw32[3] == HN4_POISON_PATTERN) {
-            HN4_LOG_CRIT("Mount Blocked: Volume contains format poison pattern.");
+    /* 
+     * 1. Poison Check (Fail Fast)
+     * Before checking the magic number, check if the block is poisoned.
+     * This indicates a pending wipe or uninitialized memory.
+     * Checking the first word is usually sufficient, but we check 4 for certainty.
+     */
+    if (HN4_UNLIKELY(hn4_le32_to_cpu(raw_ptr[0]) == HN4_POISON_PATTERN)) {
+        if (hn4_le32_to_cpu(raw_ptr[1]) == HN4_POISON_PATTERN &&
+            hn4_le32_to_cpu(raw_ptr[2]) == HN4_POISON_PATTERN &&
+            hn4_le32_to_cpu(raw_ptr[3]) == HN4_POISON_PATTERN) 
+        {
+            HN4_LOG_CRIT("Mount refused: Volume is poisoned (WIPE_PENDING)");
             return HN4_ERR_WIPE_PENDING;
         }
+    }
+
+    /* 
+     * 2. Magic Number Validation 
+     * The primary identifier for an HN4 filesystem.
+     */
+    if (HN4_UNLIKELY(hn4_le64_to_cpu(sb->info.magic) != HN4_MAGIC_SB)) {
         return HN4_ERR_BAD_SUPERBLOCK;
     }
 
-    /* 2. Reject Zero UUID (Security.ZeroUUID) */
-    const hn4_superblock_t* sb = (const hn4_superblock_t*)buffer;
-    /* We check raw values. 0 is 0 in Big or Little Endian. */
-    if (sb->info.volume_uuid.lo == 0 && sb->info.volume_uuid.hi == 0) {
-        HN4_LOG_CRIT("Mount Blocked: Zero UUID detected");
+    /* 
+     * 3. Security Check: Zero UUID
+     * A zeroed UUID implies a formatting error or a blank template.
+     * We reject this to enforce unique identity constraints.
+     */
+    if (HN4_UNLIKELY(sb->info.volume_uuid.lo == 0 && sb->info.volume_uuid.hi == 0)) {
+        HN4_LOG_CRIT("Integrity: Zero UUID detected");
         return HN4_ERR_BAD_SUPERBLOCK;
     }
 
-    /* 3. CRC Check */
-    uint32_t stored_crc;
-    const uint8_t* byte_ptr = (const uint8_t*)buffer;
-    /* CRC is at the very end of the 8KB block */
-    memcpy(&stored_crc, byte_ptr + HN4_SB_SIZE - 4, 4);
-    stored_crc = hn4_le32_to_cpu(stored_crc);
+    /* 
+     * 4. CRC32C Integrity Check
+     * Verify the checksum of the entire superblock structure.
+     * The checksum field itself is excluded from the calculation.
+     */
+    uint32_t stored_crc = hn4_le32_to_cpu(sb->raw.sb_crc);
+    
+    /* Calculate over bytes 0 to (Size - 4) */
+    uint32_t calc_crc = hn4_crc32(0, buffer, HN4_SB_SIZE - 4);
 
-    /* CRC covers bytes 0 to (Size - 4) */
-    uint32_t calc_crc = hn4_crc32(0, byte_ptr, HN4_SB_SIZE - 4);
     if (HN4_UNLIKELY(calc_crc != stored_crc)) {
         HN4_LOG_WARN("SB CRC Mismatch. Stored: %08X, Calc: %08X", stored_crc, calc_crc);
         return HN4_ERR_BAD_SUPERBLOCK;
@@ -264,6 +279,68 @@ static uint64_t _calc_south_offset(uint64_t capacity, uint32_t bs) {
     return HN4_ALIGN_DOWN(capacity - sb_space, bs);
 }
 
+/**
+ * _calc_cardinal_targets
+ * Resolves the 4 physical block indices for Superblock replicas.
+ * Unifies logic for 128-bit and 64-bit modes.
+ */
+static void _calc_cardinal_targets(
+    hn4_size_t capacity, 
+    uint32_t   bs, 
+    uint64_t   out_targets[4]
+)
+{
+    /* 1. Calculate North (0%), East (33%), West (66%) */
+    for (int i = 0; i < 3; i++) {
+        uint8_t pct = _cardinal_ratios[i];
+        
+#ifdef HN4_USE_128BIT
+        if (pct == 0) {
+            out_targets[i] = 0;
+        } else {
+            hn4_u128_t cap_128 = capacity;
+            hn4_u128_t one_pct = hn4_u128_div_u64(cap_128, 100);
+            hn4_u128_t target_bytes = hn4_u128_mul_u64(one_pct, pct);
+            
+            /* Align Up to BS */
+            hn4_u128_t blk_idx = hn4_u128_div_u64(target_bytes, bs);
+            
+            /* Check 64-bit overflow for block index */
+            if (blk_idx.hi > 0) out_targets[i] = HN4_OFFSET_INVALID;
+            else out_targets[i] = blk_idx.lo;
+        }
+#else
+        uint64_t target_bytes = (capacity / 100) * pct;
+        out_targets[i] = HN4_ALIGN_UP(target_bytes, bs) / bs;
+#endif
+    }
+
+    /* 2. Calculate South (Tail - SB_Size) */
+    uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
+    
+#ifdef HN4_USE_128BIT
+    hn4_u128_t min_req = hn4_u128_from_u64(sb_space * 16);
+    hn4_u128_t cap_128 = capacity;
+
+    if (hn4_u128_cmp(cap_128, min_req) < 0) {
+        out_targets[3] = HN4_OFFSET_INVALID;
+    } else {
+        hn4_u128_t south_bytes = hn4_u128_sub(cap_128, hn4_u128_from_u64(sb_space));
+        /* Align Down implicitly via integer division */
+        hn4_u128_t south_blk = hn4_u128_div_u64(south_bytes, bs);
+        
+        if (south_blk.hi > 0) out_targets[3] = HN4_OFFSET_INVALID;
+        else out_targets[3] = south_blk.lo;
+    }
+#else
+    if (capacity < (sb_space * 16)) {
+        out_targets[3] = HN4_OFFSET_INVALID;
+    } else {
+        out_targets[3] = HN4_ALIGN_DOWN(capacity - sb_space, bs) / bs;
+    }
+#endif
+}
+
 static hn4_result_t _execute_cardinal_vote(
     HN4_IN hn4_hal_device_t* dev,
     HN4_IN bool allow_repair,
@@ -359,59 +436,16 @@ static hn4_result_t _execute_cardinal_vote(
             }
         }
 
-        /* Calculate Cardinal Offsets */
-        uint64_t block_indices[3];
-
-#ifdef HN4_USE_128BIT
-        hn4_u128_t real_cap = caps->total_capacity_bytes;
+        /* Calculate Cardinal Offsets (North, East, West, South) */
+        uint64_t block_indices[4];
         
-        hn4_u128_t one_percent = hn4_u128_div_u64(real_cap, 100);
-        hn4_u128_t east_bytes  = hn4_u128_mul_u64(one_percent, 33);
-        hn4_u128_t west_bytes  = hn4_u128_mul_u64(one_percent, 66);
-        
-        /* Convert Bytes -> Block Indices */
-        hn4_u128_t east_blk = hn4_u128_div_u64(east_bytes, current_bs);
-        hn4_u128_t west_blk = hn4_u128_div_u64(west_bytes, current_bs);
-        
-        /* Check overflow of block index (u64 max) */
-        if (east_blk.hi > 0) block_indices[0] = HN4_OFFSET_INVALID;
-        else block_indices[0] = east_blk.lo;
-        
-        if (west_blk.hi > 0) block_indices[1] = HN4_OFFSET_INVALID;
-        else block_indices[1] = west_blk.lo;
-        
-        /* South Offset Logic */
-        uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, current_bs);
-        hn4_u128_t south_sub = hn4_u128_sub(real_cap, hn4_u128_from_u64(sb_space));
-        
-        /* Heuristic check via high/low parts */
-        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, current_bs);
-        if (south_blk.hi > 0) block_indices[2] = HN4_OFFSET_INVALID;
-        else block_indices[2] = south_blk.lo;
-#else
-        /* Standard 64-bit Logic */
-        uint64_t target_e, target_w;
-
-        #if defined(__SIZEOF_INT128__)
-            target_e = (uint64_t)(((unsigned __int128)cap_bytes * 33) / 100);
-            target_w = (uint64_t)(((unsigned __int128)cap_bytes * 66) / 100);
-        #else
-            /* Fallback: Divide first to prevent overflow on Exabyte drives */
-            target_e = (cap_bytes / 100) * 33;
-            target_w = (cap_bytes / 100) * 66;
-        #endif
-
-        block_indices[0] = HN4_ALIGN_UP(target_e, current_bs) / current_bs;
-        block_indices[1] = HN4_ALIGN_UP(target_w, current_bs) / current_bs;
-        
-        uint64_t s_off = _calc_south_offset(cap_bytes, current_bs);
-        block_indices[2] = (s_off == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_off / current_bs);
-#endif
+        /* Note: caps->total_capacity_bytes is already hn4_size_t (u128 or u64) */
+        _calc_cardinal_targets(caps->total_capacity_bytes, current_bs, block_indices);
 
         /* Scan Cardinal Points */
-         for (int i = 0; i < 3; i++) {
+         for (int i = 0; i < 4; i++) {
           if (block_indices[i] == HN4_OFFSET_INVALID ||
-            (caps->hw_flags & HN4_HW_ZNS_NATIVE))
+            (caps->hw_flags & HN4_HW_ZNS_NATIVE && i > 0))
             continue;
 
             hn4_addr_t lba;

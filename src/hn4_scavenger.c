@@ -85,7 +85,7 @@ uint64_t hn4_scavenger_lookup_delta(hn4_volume_t* vol, uint64_t logical_lba, uin
         uint64_t key = atomic_load_explicit(&vol->redirect.delta_table[idx].old_lba, memory_order_acquire);
 
         if (key == logical_lba) {
-            uint64_t seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_relaxed);
+            uint64_t seed = atomic_load_explicit(&vol->redirect.delta_table[idx].seed_hash, memory_order_acquire);
             
             if (seed == req_seed_hash) {
                 uint32_t ver = atomic_load_explicit(&vol->redirect.delta_table[idx].version, memory_order_relaxed);
@@ -784,7 +784,16 @@ static void _perform_osteoplasty(hn4_volume_t* vol, hn4_anchor_t* anchor, bool f
         }
 
         /* Note: hn4_write_block_atomic updates new_anchor in RAM */
-         if (hn4_read_block_atomic(vol, anchor, n, buf, bs, HN4_PERM_SOVEREIGN | HN4_PERM_READ) != HN4_OK) {
+          hn4_result_t w_res = hn4_write_block_atomic(
+            vol, 
+            &new_anchor, 
+            n, 
+            buf, 
+            write_len, 
+            HN4_PERM_SOVEREIGN | HN4_PERM_WRITE
+        );
+
+        if (w_res != HN4_OK) {
             migration_success = false;
             break;
         }

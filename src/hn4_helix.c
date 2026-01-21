@@ -64,7 +64,7 @@ static void _hn4_gf_init(void) {
  * O(1) Galois Multiplication 
  * Performance: ~2-3 cycles (L1 Cache Hit)
  */
-static inline uint8_t _gf_mul(uint8_t a, uint8_t b) {
+HN4_INLINE uint8_t _gf_mul(uint8_t a, uint8_t b) {
     if (a == 0 || b == 0) return 0;
     if (HN4_UNLIKELY(!atomic_load_explicit(&_gf_ready, memory_order_acquire))) _hn4_gf_init();
     return _gf_exp[(int)_gf_log[a] + (int)_gf_log[b]];
@@ -196,11 +196,11 @@ static uint32_t _resolve_shard_index(hn4_u128_t file_id, uint32_t dev_count) {
 #endif
 }
 
-static inline bool _is_io_success(hn4_result_t res) {
+HN4_INLINE bool _is_io_success(hn4_result_t res) {
     return (res == HN4_OK || res == HN4_INFO_SPARSE || res == HN4_INFO_HEALED);
 }
 
-static inline bool _is_critical_failure(hn4_result_t res) {
+HN4_INLINE bool _is_critical_failure(hn4_result_t res) {
     switch (res) {
         case HN4_ERR_HW_IO:
         case HN4_ERR_DATA_ROT:
@@ -217,7 +217,7 @@ static inline bool _is_critical_failure(hn4_result_t res) {
  * ========================================================================= */
 
 /* Inverse in GF(2^8): x^-1 = exp(255 - log(x)) */
-static inline uint8_t _gf_inv(uint8_t x) {
+HN4_INLINE uint8_t _gf_inv(uint8_t x) {
     if (HN4_UNLIKELY(x == 0)) {
         hn4_hal_panic("HN4 Helix: GF Inversion Singularity (Div by Zero)");
         return 0; /* Unreachable */
@@ -297,7 +297,7 @@ static inline uint8_t _gf_inv(uint8_t x) {
  * Maps a physical device index back to the logical data column index.
  * Used to determine the correct GF generator coefficient for Q-Parity.
  */
-static inline uint32_t _hn4_phys_to_logical(uint32_t phys, uint32_t p_col, uint32_t q_col) {
+HN4_INLINE uint32_t _hn4_phys_to_logical(uint32_t phys, uint32_t p_col, uint32_t q_col) {
 
     if (phys == p_col || phys == q_col) return UINT32_MAX;
 

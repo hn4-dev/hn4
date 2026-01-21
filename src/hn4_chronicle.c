@@ -42,7 +42,7 @@ static void _log_ratelimited(hn4_volume_t* vol, const char* msg, uint64_t val) {
     }
 }
 
-static inline uint32_t _get_commit_offset(uint32_t sector_size) {
+HN4_INLINE uint32_t _get_commit_offset(uint32_t sector_size) {
     return sector_size - sizeof(uint64_t);
 }
 

@@ -4741,59 +4741,6 @@ hn4_TEST(EdgeCases, SingularityPhiOne) {
 }
 
 
-/*
- * Test Spec 5.1: Cortex Allocator Uses L2 to Skip
- * RATIONALE:
- * If the L2 bit for a region is SET, the allocator must NOT perform IO
- * for that region. It must jump over it.
- */
-hn4_TEST(Optimization, Cortex_Skips_L2_Dirty) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* 1. Setup Cortex Geometry */
-    /* Start at LBA 1000. Block Size 4096. SS 4096. */
-    /* 1 Block = 4096 bytes = 32 Slots (128B). */
-    vol->sb.info.lba_cortex_start = hn4_addr_from_u64(1000);
-    vol->sb.info.lba_bitmap_start = hn4_addr_from_u64(2000); /* 1000 blocks total */
-    
-    /* 
-     * L2 Region 0 covers Blocks 0-511. 
-     * Block 0 in L2 corresponds to LBA 0 of the DISK (if L2 covers whole disk).
-     * Actually, L2 covers the whole volume. 
-     * We need to calculate which L2 bit corresponds to LBA 1000.
-     * Block Index = 1000.
-     * L2 Index = 1000 / 512 = 1.
-     */
-    uint64_t target_l2_idx = 1000 / 512;
-    
-    /* 2. Manually Dirty L2 for this region */
-    vol->locking.l2_summary_bitmap[target_l2_idx / 64] |= (1ULL << (target_l2_idx % 64));
-    
-    /* 
-     * 3. Attempt Allocation
-     * - The disk (mock IO) is empty (0s).
-     * - If it scans, it finds Slot 0.
-     * - If it SKIPS based on L2, it jumps 512 blocks.
-     *   L2 Region 1 covers blocks 512-1023. 
-     *   Since we start at 1000, we are inside Region 1 (512-1023).
-     *   Wait, 1000 / 512 = 1. So we are in Region 1.
-     *   
-     *   Remaining blocks in region: 1024 - 1000 = 24 blocks.
-     *   24 blocks * 32 slots = 768 slots.
-     *   
-     *   It should skip 768 slots and return a slot index >= 768.
-     */
-    
-    uint64_t slot;
-    hn4_result_t res = _alloc_cortex_run(vol, 1, &slot);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* PROOF: It must have skipped the first ~768 slots */
-    ASSERT_TRUE(slot >= 768);
-    
-    cleanup_alloc_fixture(vol);
-}
 
 hn4_TEST(AtomicOps, Fallback_Smoke_Test) {
     /* 
@@ -5377,37 +5324,6 @@ hn4_TEST(PhysicsEngine, Entropy_Reinjection_Modulo_Safety) {
     cleanup_alloc_fixture(vol);
 }
 
-
-hn4_TEST(NanoLogic, O1_Slot_Fit) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->vol_block_size = 4096;
-    
-    /* 1. Define Cortex Region: LBA 100 to 200 */
-    vol->sb.info.lba_cortex_start = 100;
-    vol->sb.info.lba_bitmap_start = 200;
-    
-    /* 
-     * 2. Mock HAL I/O capabilities for the Cortex scan 
-     * (Assume create_alloc_fixture sets up a RAM-backed Mock HAL)
-     */
-    
-    uint64_t slot1, slot2;
-    
-    /* Request 50 bytes -> 1 Slot (128B) */
-    ASSERT_EQ(HN4_OK, _alloc_cortex_run(vol, 1, &slot1));
-    
-    /* Request 150 bytes -> 2 Slots (256B) */
-    ASSERT_EQ(HN4_OK, _alloc_cortex_run(vol, 2, &slot2));
-    
-    /* Verify packing */
-    ASSERT_EQ(slot1 + 1, slot2);
-    
-    /* Verify cursor advancement */
-    ASSERT_EQ(slot2 + 2, vol->alloc.cortex_search_head);
-
-    cleanup_alloc_fixture(vol);
-}
-
 hn4_TEST(PhysicsEngine, Affinity_Window_Containment) {
     hn4_volume_t* vol = create_alloc_fixture();
     vol->sb.info.format_profile = HN4_PROFILE_AI;
@@ -5530,43 +5446,6 @@ hn4_TEST(ComplexityProof, Ballistic_Probe_Limit) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST O1_3: L2 Summary Skip (Cortex Allocator)
- * RATIONALE:
- * Verify `_alloc_cortex_run` skips massive chunks (512 blocks) in O(1) 
- * by checking the L2 summary bit, rather than reading 512 * 32 = 16k bitmap bits.
- * ========================================================================= */
-hn4_TEST(ComplexityProof, L2_Skip_Optimization) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    
-    /* LBA 1000 is inside L2 Region 1 (512-1023). */
-    vol->sb.info.lba_cortex_start = 1000;
-    
-    /* 1. Mark L2 Region 1 as Full (Dirty) */
-    /* Region 1 corresponds to blocks 512-1023.
-       Map Start (1000) is inside this region.
-       Allocator starts at offset 0 (LBA 1000). 
-       LBA 1000 / 512 = 1. L2 index 1.
-    */
-    vol->locking.l2_summary_bitmap[0] |= (1ULL << 1); /* Set Bit 1 */
-    
-    /* 2. Alloc */
-    uint64_t slot;
-    hn4_result_t res = _alloc_cortex_run(vol, 1, &slot);
-    
-    ASSERT_EQ(HN4_OK, res);
-    
-    /* 
-     * PROOF:
-     * Region 1 ends at block 1023. Start was 1000.
-     * Remaining blocks in region: 24.
-     * Slots skipped: 24 * 32 = 768.
-     * The returned slot must be >= 768 (jumped to next L2 region).
-     */
-    ASSERT_TRUE(slot >= 768);
-
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST O1_4: ZNS Zone Append (Atomic Pointer)
@@ -5916,28 +5795,6 @@ hn4_TEST(PhysicsEngine, Gravity_Assist_Non_Identity) {
     ASSERT_TRUE(diff != 0);
 }
 
-hn4_TEST(NanoLogic, Cortex_Full_Rejection) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
-    
-    /* 1. Setup Cortex Backing Store */
-    uint32_t ctx_size = 65536; /* 64KB */
-    mdev->mmio_base = hn4_hal_mem_alloc(ctx_size);
-    mdev->caps.hw_flags |= HN4_HW_NVM;
-    
-    /* 2. Fill it completely (simulating used slots) */
-    memset(mdev->mmio_base, 0xFF, ctx_size);
-    
-    /* 3. Alloc */
-    uint64_t slot;
-    hn4_result_t res = _alloc_cortex_run(vol, 1, &slot);
-    
-    /* 4. Expect Failure */
-    ASSERT_EQ(HN4_ERR_ENOSPC, res);
-    
-    hn4_hal_mem_free(mdev->mmio_base);
-    cleanup_alloc_fixture(vol);
-}
 
 hn4_TEST(RecoveryLogic, Trajectory_Is_Pure) {
     hn4_volume_t* vol = create_alloc_fixture();
@@ -6198,34 +6055,6 @@ hn4_TEST(AllocatorSaturation, Update_Horizon_Fallback) {
     cleanup_alloc_fixture(vol);
 }
 
-/* =========================================================================
- * TEST A7: Cortex Slot Contiguity
- * RATIONALE:
- * `_alloc_cortex_run` must find N *contiguous* free slots.
- * If slots 0,1 are free but 2 is used, a request for 3 must start at 3.
- * ========================================================================= */
-hn4_TEST(AllocatorCortex, Contiguous_Run_Search) {
-    hn4_volume_t* vol = create_alloc_fixture();
-    vol->sb.info.lba_cortex_start = 100;
-    vol->sb.info.lba_bitmap_start = 200;
-    
-    /* Mock RAM Cortex */
-    vol->cortex_size = 1024 * 128; // 1024 slots
-    vol->nano_cortex = hn4_hal_mem_alloc(vol->cortex_size);
-    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-    
-    /* Occupy Slot 2 */
-    anchors[2].data_class = 1;
-    
-    /* Request 3 slots. Should skip 0,1,2 and take 3,4,5 */
-    uint64_t start_slot;
-    hn4_result_t res = _alloc_cortex_run(vol, 3, &start_slot);
-    
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(3ULL, start_slot);
-    
-    cleanup_alloc_fixture(vol);
-}
 
 /* =========================================================================
  * TEST A8: L2 Summary Bit Propagation

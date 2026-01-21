@@ -49,40 +49,55 @@ typedef struct HN4_PACKED {
  * I/O Buffer Waterfall
  * We try to alloc the largest buffer first. If that fails, we step down.
  * Crucial for embedded systems with fragmented RAM.
+ * Added 4KB fallback for Pico/Microcontroller environments.
  */
 static const uint32_t PREF_IO_SIZES[] = {
     32 * (uint32_t)HN4_SZ_MB,
     2  * (uint32_t)HN4_SZ_MB,
-    64 * (uint32_t)HN4_SZ_KB
+    64 * (uint32_t)HN4_SZ_KB,
+    4  * (uint32_t)HN4_SZ_KB  /* Desperation Mode */
+};
+
+/* 
+ * Device Resolution Matrix
+ * Maps [Profile][HW_Traits] -> Device Type
+ * 
+ * Columns (HW Traits Index):
+ * [0] = SSD (None)
+ * [1] = HDD (Rotational)
+ * [2] = ZNS (Zoned)
+ * [3] = ZNS + HDD (Zoned Priority)
+ */
+static const uint8_t _resolve_dev_lut[8][4] = {
+    /* 0: GENERIC */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 1: GAMING  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 2: AI      */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 3: ARCHIVE */ { HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE }, /* Force Tape */
+    /* 4: PICO    */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 5: SYSTEM  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 6: USB     */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
+    /* 7: CLOUD   */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  }
 };
 
 static uint32_t _resolve_device_type(uint64_t hw_flags, uint32_t profile_id) {
+    /* Mask profile to safety limits (0-7) */
+    uint32_t p = profile_id & 0x7;
+
     /* 
-     * [LAYER 1] BUSINESS LOGIC OVERRIDES
-     * Profile-specific mandates that ignore hardware reality.
+     * Compress 64-bit flags into 2-bit Index:
+     * Bit 0: Rotational (HDD)
+     * Bit 1: ZNS (Zoned)
      * 
-     * Rule: Archive Profile on non-NVM/non-ZNS media is treated as TAPE.
-     * (e.g., SMR HDDs, Actual Tape, or Unknown cold storage).
+     * Logic:
+     * (flags & ROT) is bit 2 -> shift down 2 -> index bit 0
+     * (flags & ZNS) is bit 0 -> shift up 1   -> index bit 1
      */
-    const uint64_t modern_media_mask = (HN4_HW_NVM | HN4_HW_ZNS_NATIVE);
+    uint32_t is_rot = (uint32_t)((hw_flags & HN4_HW_ROTATIONAL) >> 2); /* Bit 2 -> 0 */
+    uint32_t is_zns = (uint32_t)((hw_flags & HN4_HW_ZNS_NATIVE) << 1); /* Bit 0 -> 1 */
     
-    if (HN4_UNLIKELY(profile_id == HN4_PROFILE_ARCHIVE)) {
-        return HN4_DEV_TAPE;
-    }
-   
-    // 1. Zoned Namespaces (Strict Sequential Write Constraints)
-    if (hw_flags & HN4_HW_ZNS_NATIVE) {
-        return HN4_DEV_ZNS;
-    }
+    uint32_t idx = (is_zns | is_rot) & 0x3;
 
-    // 2. Rotational Media (Seek Penalties Apply)
-    if (hw_flags & HN4_HW_ROTATIONAL) {
-        return HN4_DEV_HDD;
-    }
-
-    // 3. Non-Volatile Memory (Random Access Friendly)
-    // Note: We fall through to SSD for NVM or if no specific flag matches (Generic).
-    return HN4_DEV_SSD;
+    return _resolve_dev_lut[p][idx];
 }
 
 /* =========================================================================
@@ -98,40 +113,41 @@ typedef struct {
     uint64_t    max_cap;
     uint32_t    default_block_size;
     uint32_t    alignment_target;
-    uint32_t    revision; /* Profile Revisioning */
+    
+    /* Layout Tuning */
+    uint32_t    cortex_permille; /* Parts per 1000 (20 = 2%) */
+    uint32_t    horizon_percent; /* Parts per 100 (10 = 10%) */
+    uint64_t    journal_bytes;   /* Fixed log size */
+
+    uint32_t    revision;
     const char* name;
 } hn4_profile_spec_t;
 
 static const hn4_profile_spec_t PROFILE_SPECS[] = {
-    /* [0] GENERIC (SSD/General Purpose) */
-    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   1, "GENERIC" },
+    /* [0] GENERIC */
+    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   20, 10, 10 * HN4_SZ_MB, 1, "GENERIC" },
     
-    /* [1] GAMING (Assets/Read-Heavy) */
-    { 1   * HN4_SZ_GB,  16 * HN4_SZ_TB,  16384,    65536,           1, "GAMING"  },
+    /* [1] GAMING */
+    { 1   * HN4_SZ_GB,  16 * HN4_SZ_TB,  16384,    65536,           20, 10, 10 * HN4_SZ_MB, 1, "GAMING"  },
     
-    /* [2] AI (Tensor Tunnel - UNLIMITED CAPACITY) */
-    { 1   * HN4_SZ_TB,  HN4_CAP_UNLIMITED, 67108864, 67108864,      1, "AI"      },
+    /* [2] AI (Reduced Cortex for huge blocks) */
+    { 1   * HN4_SZ_TB,  HN4_CAP_UNLIMITED, 67108864, 67108864,      5,  10, 32 * HN4_SZ_MB, 1, "AI"      },
     
-    /* [3] ARCHIVE (Tape/Cold - Capped at 18 EiB) */
-    { 10  * HN4_SZ_GB,  18 * HN4_SZ_EB,  67108864, 67108864,        1, "ARCHIVE" },
+    /* [3] ARCHIVE (Tiny Horizon) */
+    { 10  * HN4_SZ_GB,  18 * HN4_SZ_EB,  67108864, 67108864,        10, 2,  10 * HN4_SZ_MB, 1, "ARCHIVE" },
     
-    /* [4] PICO (Embedded/IoT - Tiny Limit) */
-    { 1   * HN4_SZ_MB,  2  * HN4_SZ_GB,  512,      512,             1, "PICO"    },
+    /* [4] PICO (Tiny Log, Minimal Cortex) */
+    { 1   * HN4_SZ_MB,  2  * HN4_SZ_GB,  512,      512,             10, 10, 64 * 1024,      1, "PICO"    },
     
-    /* [5] SYSTEM (OS Root) */
-    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   1, "SYSTEM"  },
+    /* [5] SYSTEM */
+    { 128 * HN4_SZ_MB,  18 * HN4_SZ_EB,  4096,     2 * HN4_SZ_MB,   20, 10, 32 * HN4_SZ_MB, 1, "SYSTEM"  },
     
-    /* [6] USB (Portable) */
-    { 128 * HN4_SZ_MB,  2  * HN4_SZ_TB,  65536,    65536,           1, "USB"     },
+    /* [6] USB */
+    { 128 * HN4_SZ_MB,  2  * HN4_SZ_TB,  65536,    65536,           20, 10, 4 * HN4_SZ_MB,  1, "USB"     },
     
-    /* [7] HYPER_CLOUD (Server) 
-     * - 64KB Blocks: Optimal for checksum overhead vs throughput.
-     * - 1MB Align: RAID/Cloud stripe friendly.
-     * - Unlimited Cap: Ready for Quettabytes.
-     */
-    { 100 * HN4_SZ_GB,  HN4_CAP_UNLIMITED, 65536,  1 * HN4_SZ_MB,   1, "HYPER_CLOUD" }
+    /* [7] HYPER_CLOUD */
+    { 100 * HN4_SZ_GB,  HN4_CAP_UNLIMITED, 65536,  1 * HN4_SZ_MB,   20, 10, 64 * HN4_SZ_MB, 1, "HYPER_CLOUD" }
 };
-
 
 #define HN4_MAX_PROFILES (sizeof(PROFILE_SPECS) / sizeof(hn4_profile_spec_t))
 
@@ -326,8 +342,8 @@ static hn4_result_t _survey_silicon_cartography(
     void* buf = NULL;
     uint32_t buf_sz = 0;
 
-    /* Waterfall Allocation Logic */
-    for (int i = 0; i < 3; i++) {
+    /* Waterfall Allocation Logic (Updated limit to 4) */
+    for (int i = 0; i < 4; i++) {
         buf = hn4_hal_mem_alloc(PREF_IO_SIZES[i]);
         if (buf) {
             buf_sz = PREF_IO_SIZES[i];
@@ -435,17 +451,20 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     if (start_lba >= phys_limit_lba) return HN4_OK;
 #endif
 
-    void* buffer = NULL;
-    uint32_t buf_sz = 0;
+    /* Try 32MB, fall back to 2MB, then 64KB */
+    uint32_t buf_sz = 32 * 1024 * 1024;
+    void* buffer = hn4_hal_mem_alloc(buf_sz);
 
-    /* Waterfall Allocator */
-    for (int i = 0; i < 3; i++) {
-        buffer = hn4_hal_mem_alloc(PREF_IO_SIZES[i]);
-        if (buffer) {
-            buf_sz = PREF_IO_SIZES[i];
-            break;
-        }
+    if (!buffer) {
+        buf_sz = 2 * 1024 * 1024;
+        buffer = hn4_hal_mem_alloc(buf_sz);
     }
+    if (!buffer) {
+        buf_sz = 64 * 1024;
+        buffer = hn4_hal_mem_alloc(buf_sz);
+    }
+
+    if (!buffer) return HN4_ERR_NOMEM;
     
     if (!buffer) return HN4_ERR_NOMEM;
     memset(buffer, 0, buf_sz);
@@ -841,8 +860,13 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
 
     /* Explicit Lower Bound Check before subtraction */
      uint64_t min_required = offset + chronicle_sz + (HN4_SB_SIZE * 4); 
-    
+
+#ifdef HN4_USE_128BIT
+    hn4_u128_t min_req_128 = hn4_u128_from_u64(min_required);
+    if (HN4_UNLIKELY(hn4_u128_cmp(capacity_bytes, min_req_128) < 0)) {
+#else
     if (HN4_UNLIKELY(capacity_bytes < min_required)) {
+#endif
         HN4_LOG_ERR("Drive too small for layout. Need %llu bytes.", min_required);
         return HN4_ERR_ENOSPC;
     }
@@ -889,8 +913,18 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     
     /* Clamp overlap */
     if (horizon_start <= offset) {
-        horizon_start = offset + (1024ULL * bs); 
-        if (horizon_start + min_horizon > chron_start_offset) return HN4_ERR_ENOSPC;
+        /* 
+         * PICO profile cannot afford a 1024-block gap on tiny media.
+         * Standard profile keeps 1024 blocks for metadata expansion safety.
+         */
+        uint64_t pad = (pid == HN4_PROFILE_PICO) ? bs : (1024ULL * bs);
+        
+        horizon_start = offset + pad; 
+        
+        if (horizon_start + min_horizon > chron_start_offset) {
+            HN4_LOG_ERR("Format failed: No space for Horizon (Overlap).");
+            return HN4_ERR_ENOSPC;
+        }
     }
 
     sb_out->info.lba_horizon_start = hn4_lba_from_sectors(horizon_start / ss);
@@ -1112,17 +1146,25 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
     /* --- STEP 4: ZERO METADATA REGIONS --- */
     
 #ifdef HN4_USE_128BIT
+    /* 
+     * 128-BIT PATH:
+     * Uses arithmetic primitives (sub, mul) to handle Quettabyte ranges.
+     * Passes full hn4_u128_t length to _zero_region_explicit.
+     */
     #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
         if (hn4_u128_cmp((end_lba), (start_lba)) < 0) { \
              return HN4_ERR_GEOMETRY; \
         } \
         hn4_u128_t count_ = hn4_u128_sub((end_lba), (start_lba)); \
-        hn4_u128_t len_128_ = hn4_u128_mul_u64(count_, ss); \
-        if (len_128_.hi > 0) return HN4_ERR_GEOMETRY; \
-        uint64_t len_ = len_128_.lo; \
-        if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
+        hn4_u128_t len_bytes_ = hn4_u128_mul_u64(count_, ss); \
+        /* Pass full 128-bit struct. No downcast or check needed. */ \
+        if ((res = _zero_region_explicit(dev, (start_lba), len_bytes_, bs)) != HN4_OK) return res; \
     } while(0)
 #else
+    /* 
+     * 64-BIT PATH:
+     * Standard arithmetic with physical bounds clamping.
+     */
     #define SAFE_ZERO_REGION(start_lba, end_lba) do { \
         if ((end_lba) < (start_lba)) { \
              return HN4_ERR_GEOMETRY; \
@@ -1134,7 +1176,7 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
         if (safe_end_ > (start_lba)) { \
             uint64_t count_ = safe_end_ - (start_lba); \
             uint64_t len_ = count_ * ss; \
-            if ((res = _zero_region_explicit(dev, start_lba, len_, bs)) != HN4_OK) return res; \
+            if ((res = _zero_region_explicit(dev, (start_lba), len_, bs)) != HN4_OK) return res; \
         } \
     } while(0)
 #endif

@@ -38,7 +38,7 @@ _Static_assert(sizeof(hn4_epoch_header_t) <= 512, "HN4: Epoch Header exceeds min
  * Prevents logic divergence between Read/Write paths.
  * Enforces strict bounds checking against Volume Capacity (in Blocks).
  */
-static inline hn4_result_t _epoch_phys_map(
+HN4_INLINE hn4_result_t _epoch_phys_map(
     uint64_t block_idx,
     uint32_t block_size,
     uint32_t sector_size,

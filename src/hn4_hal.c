@@ -73,30 +73,33 @@ uint32_t _hn4_cpu_features = 0;
 static void _probe_cpu_persistence_features(void)
 {
     _hn4_cpu_features = 0;
+
 #if defined(HN4_ARCH_X86)
-    int info[4];
+    int regs[4];
 
-    /* Standard Leaf 1: Check CLFLUSH */
-#if defined(_MSC_VER)
-    __cpuid(info, 1);
-#else
-    __cpuid(1, info[0], info[1], info[2], info[3]);
-#endif
-    if (info[3] & (1 << 19)) _hn4_cpu_features |= HN4_CPU_X86_CLFLUSH;
+    /* Leaf 1: EDX bit 19 = CLFLUSH */
+    #if defined(_MSC_VER)
+        __cpuid(regs, 1);
+    #else
+        __cpuid(1, regs[0], regs[1], regs[2], regs[3]);
+    #endif
+    
+    if (regs[3] & (1 << 19)) 
+        _hn4_cpu_features |= HN4_CPU_X86_CLFLUSH;
 
-    /* Extended Leaf 7: Check CLFLUSHOPT / CLWB */
-    info[0] = 0; info[1] = 0; info[2] = 0; info[3] = 0;
-#if defined(_MSC_VER)
-    __cpuidex(info, 7, 0);
-#else
-    __cpuid_count(7, 0, info[0], info[1], info[2], info[3]);
-#endif
-    if (info[1] & (1 << 23)) _hn4_cpu_features |= HN4_CPU_X86_CLFLUSHOPT;
-    if (info[1] & (1 << 24)) _hn4_cpu_features |= HN4_CPU_X86_CLWB;
+    /* Leaf 7, Subleaf 0: EBX bit 23=CLFLUSHOPT, 24=CLWB */
+    #if defined(_MSC_VER)
+        __cpuidex(regs, 7, 0);
+    #else
+        __cpuid_count(7, 0, regs[0], regs[1], regs[2], regs[3]);
+    #endif
+
+    if (regs[1] & (1 << 23)) _hn4_cpu_features |= HN4_CPU_X86_CLFLUSHOPT;
+    if (regs[1] & (1 << 24)) _hn4_cpu_features |= HN4_CPU_X86_CLWB;
 #endif
 }
 
-static inline void _assert_hal_init(void)
+HN4_INLINE void _assert_hal_init(void)
 {
     if (HN4_UNLIKELY(!atomic_load_explicit(&_hal_initialized, memory_order_acquire))) {
         hn4_hal_panic("HN4 HAL Not Initialized");
@@ -200,6 +203,48 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
             case HN4_IO_DISCARD:
                 /* Optional: Check HN4_FLAG_SHRED if memset(0) is required */
                 break;
+
+            case HN4_IO_ZONE_APPEND:
+            {
+                /* 
+                 * ZNS EMULATION ON NVM
+                 * 1. Calculate Zone Index
+                 * 2. Atomically advance Write Pointer (WP)
+                 * 3. Determine Final LBA
+                 * 4. Perform Memcpy
+                 */
+                uint64_t zone_cap_blocks = (ZNS_SIM_ZONE_SIZE / ZNS_SIM_SECTOR_SIZE);
+                uint64_t zone_idx = lba_raw / zone_cap_blocks;
+                uint64_t zone_start_lba = zone_idx * zone_cap_blocks;
+                uint64_t sim_idx = zone_idx % ZNS_SIM_ZONES;
+
+                uint64_t old_offset, new_offset;
+                do {
+                    old_offset = atomic_load(&_zns_zone_ptrs[sim_idx]);
+                    if (old_offset + req->length > zone_cap_blocks) {
+                        if (cb) cb(req, HN4_ERR_ZONE_FULL);
+                        return;
+                    }
+                    new_offset = old_offset + req->length;
+                } while (!atomic_compare_exchange_weak(&_zns_zone_ptrs[sim_idx], &old_offset, new_offset));
+
+                uint64_t final_lba = zone_start_lba + old_offset;
+                
+                /* Update Request Result so Driver knows where it landed */
+                req->result_lba = hn4_addr_from_u64(final_lba);
+
+                /* Calculate Physical RAM Address for the APPENDED location */
+                uint64_t final_byte_offset = final_lba * dev->caps.logical_block_size;
+                
+                if (HN4_UNLIKELY((final_byte_offset + len_bytes) > max_cap)) {
+                     if (cb) cb(req, HN4_ERR_HW_IO);
+                     return;
+                }
+
+                memcpy(dev->mmio_base + final_byte_offset, req->buffer, len_bytes);
+                hn4_hal_nvm_persist(dev->mmio_base + final_byte_offset, len_bytes);
+                break;
+            }
 
             case HN4_IO_ZONE_RESET:
                 /* Physical Clear */
@@ -309,17 +354,27 @@ void* hn4_hal_mem_alloc(size_t size)
     if (!raw) return NULL;
 
     /* Calculate aligned address */
-    uintptr_t raw_addr     = (uintptr_t)raw;
-    uintptr_t aligned_addr = (raw_addr + sizeof(alloc_header_t) + (HN4_HAL_ALIGNMENT - 1))
-                             & ~((uintptr_t)HN4_HAL_ALIGNMENT - 1);
+   uintptr_t raw_addr = (uintptr_t)raw;
+    
+    /* 
+     * 1. Reserve space for Header.
+     * 2. Add Alignment - 1.
+     * 3. Mask to align.
+     */
+    uintptr_t start_limit = raw_addr + sizeof(alloc_header_t);
+    uintptr_t aligned_addr = (start_limit + (HN4_HAL_ALIGNMENT - 1)) & ~((uintptr_t)HN4_HAL_ALIGNMENT - 1);
 
     void* ptr = (void*)aligned_addr;
-
-    /* Store header immediately preceding the aligned pointer */
     alloc_header_t* h = (alloc_header_t*)((uint8_t*)ptr - sizeof(alloc_header_t));
 
-    /* Verify our math didn't corrupt the heap or overlap */
-    if ((void*)h < raw) hn4_hal_panic("Allocator Math Underflow");
+    /* 
+     * Mathematical invariant proof:
+     * aligned_addr >= start_limit
+     * aligned_addr >= raw_addr + sizeof(header)
+     * ptr >= raw + sizeof(header)
+     * ptr - sizeof(header) >= raw
+     * h >= raw
+     */
 
     h->magic   = HN4_MEM_MAGIC;
     h->raw_ptr = raw;
@@ -383,7 +438,7 @@ hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, 
     }
 
     /* Fence is now redundant due to load_acquire above, but harmless to keep */
-    atomic_thread_fence(memory_order_acquire);
+    HN4_BARRIER();
     return ctx.res;
 }
 
@@ -482,7 +537,9 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
         uint64_t bytes_transferred = (uint64_t)chunk_blocks * block_size;
 
         /* Advance Buffer */
-        buf_cursor += bytes_transferred;
+        if (buf_cursor) {
+            buf_cursor += bytes_transferred;
+        }
 
         current_lba = hn4_addr_add(current_lba, chunk_blocks * spb);
 

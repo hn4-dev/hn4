@@ -162,15 +162,10 @@ hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superbloc
     /* 
      * 7. Checksum: Corrected Coverage (Spec 8.1)
      */
+
     root->checksum = 0;
-    
-    /* CRC Head (0x00 to 0x5F) */
-    root->checksum = 0;
-    
-    /* Hash the ENTIRE 128 bytes (includes orbit_hints and inline_buffer) */
-    uint32_t crc = hn4_crc32(0, root, sizeof(hn4_anchor_t));
-    
-    root->checksum = hn4_cpu_to_le32(crc);
+    uint32_t c = hn4_crc32(0, root, sizeof(*root));
+    root->checksum = hn4_cpu_to_le32(c);
 
     /* 8. Commit to Cortex Start */
     hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_WRITE, write_lba, buf, sector_count);

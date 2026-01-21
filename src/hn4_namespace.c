@@ -97,27 +97,19 @@ static inline uint64_t _ns_hash_uuid(hn4_u128_t id)
  */
 static uint64_t _ns_parse_hex_u64(const char* s, size_t len) 
 {
-    static int8_t hex_lut[256];
-    static atomic_bool init_done = false;
-
-    if (HN4_UNLIKELY(!atomic_load_explicit(&init_done, memory_order_acquire))) {
-        /* Initialize Safe Defaults */
-        for (int i=0; i<256; i++) hex_lut[i] = -1;
-        for (int i='0'; i<='9'; i++) hex_lut[i] = i - '0';
-        for (int i='A'; i<='F'; i++) hex_lut[i] = i - 'A' + 10;
-        for (int i='a'; i<='f'; i++) hex_lut[i] = i - 'a' + 10;
-        atomic_store_explicit(&init_done, true, memory_order_release);
-    }
-
-    uint64_t val = 0;
+    uint64_t v = 0;
     for (size_t i = 0; i < len; i++) {
-        uint8_t idx = (uint8_t)s[i];
-        int8_t  digit = hex_lut[idx];
-        
-        if (digit == -1) break; /* Invalid char stops parse */
-        val = (val << 4) | digit;
+        uint8_t c = (uint8_t)s[i];
+        int val = -1;
+
+        if (c >= '0' && c <= '9') val = c - '0';
+        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
+
+        if (val < 0) break;
+        v = (v << 4) | val;
     }
-    return val;
+    return v;
 }
 
 

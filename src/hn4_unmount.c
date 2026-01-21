@@ -23,7 +23,7 @@
 /* =========================================================================
  * INTERNAL HELPERS
  * ========================================================================= */
-
+ 
 /* 
  * Helper to safely free and nullify pointers during teardown.
  * Performs secure zeroing if requested (for bitmaps/keys).
@@ -58,6 +58,7 @@ typedef enum {
  * Updates state flags and persists the Superblock to Cardinal Points.
  * Implements Fault Tolerance via Quorum.
  */
+
 static hn4_result_t _broadcast_superblock(
     HN4_IN hn4_hal_device_t* dev, 
     HN4_IN hn4_volume_t* vol,
@@ -132,44 +133,12 @@ static hn4_result_t _broadcast_superblock(
         if (force_degraded) cpu_sb->info.state_flags |= HN4_VOL_DEGRADED;
     }
 
-    /* 2. Calculate Targets (Using 128-bit safe logic from previous steps) */
+    /* 2. Calculate Targets */
     uint64_t targets[SB_LOC_MAX];
-    bool attempt_south = false;
-    uint64_t sb_space = HN4_ALIGN_UP(HN4_SB_SIZE, bs);
-
-#ifdef HN4_USE_128BIT
-    hn4_u128_t dev_cap_128 = vol->vol_capacity_bytes;
-    targets[SB_LOC_NORTH] = 0;
     
-    hn4_u128_t one_pct = hn4_u128_div_u64(dev_cap_128, 100);
-    hn4_u128_t e_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 33), bs);
-    hn4_u128_t w_blk = hn4_u128_div_u64(hn4_u128_mul_u64(one_pct, 66), bs);
+    _calc_cardinal_targets(vol->vol_capacity_bytes, bs, targets);
     
-    targets[SB_LOC_EAST] = (e_blk.hi > 0) ? 0 : e_blk.lo;
-    targets[SB_LOC_WEST] = (w_blk.hi > 0) ? 0 : w_blk.lo;
-
-    hn4_u128_t sb_space_128 = hn4_u128_from_u64(sb_space);
-    if (hn4_u128_cmp(dev_cap_128, sb_space_128) > 0) {
-        hn4_u128_t south_sub = hn4_u128_sub(dev_cap_128, sb_space_128);
-        hn4_u128_t south_blk = hn4_u128_div_u64(south_sub, bs);
-        targets[SB_LOC_SOUTH] = (south_blk.hi > 0) ? 0 : south_blk.lo;
-    } else {
-        targets[SB_LOC_SOUTH] = 0;
-    }
-    attempt_south = (targets[SB_LOC_SOUTH] > 0);
-#else
-    /* 64-bit Logic */
-    targets[SB_LOC_NORTH] = 0;
-    targets[SB_LOC_EAST]  = HN4_ALIGN_UP((vol->vol_capacity_bytes / 100) * 33, bs) / bs;
-    targets[SB_LOC_WEST]  = HN4_ALIGN_UP((vol->vol_capacity_bytes / 100) * 66, bs) / bs;
-    uint64_t aligned_cap = HN4_ALIGN_DOWN(vol->vol_capacity_bytes, bs);
-    if (aligned_cap >= (sb_space * 16)) {
-        targets[SB_LOC_SOUTH] = (aligned_cap - sb_space) / bs;
-        attempt_south = true;
-    } else {
-        targets[SB_LOC_SOUTH] = 0;
-    }
-#endif
+    bool attempt_south = (targets[SB_LOC_SOUTH] != HN4_OFFSET_INVALID);
 
     if (attempt_south) cpu_sb->info.compat_flags |= HN4_COMPAT_SOUTH_SB;
     else cpu_sb->info.compat_flags &= ~HN4_COMPAT_SOUTH_SB;
@@ -187,7 +156,9 @@ static hn4_result_t _broadcast_superblock(
 
     for (int i = 0; i < SB_LOC_MAX; i++) {
         if (i == SB_LOC_SOUTH && !attempt_south) continue;
-        if (i > SB_LOC_NORTH && targets[i] == 0) { slot_ok[i] = false; continue; }
+        
+        /* Skip invalid targets */
+        if (targets[i] == HN4_OFFSET_INVALID) { slot_ok[i] = false; continue; }
 
         hn4_addr_t phys_lba;
     #ifdef HN4_USE_128BIT
@@ -258,6 +229,7 @@ static hn4_result_t _broadcast_superblock(
     }
     return quorum_met ? HN4_OK : HN4_ERR_HW_IO;
 }
+ 
 /* =========================================================================
  * MAIN UNMOUNT IMPLEMENTATION
  * ========================================================================= */

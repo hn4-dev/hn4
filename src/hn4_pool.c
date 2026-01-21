@@ -94,7 +94,7 @@ static hn4_result_t _probe_device_health(hn4_hal_device_t* dev, const hn4_hal_ca
  * 
  * CONTRACT: Caller/Reader MUST hold L2 Spinlock.
  */
-static inline void _atomic_store_u128(hn4_size_t* ptr, hn4_size_t val) {
+HN4_INLINE void _atomic_store_u128(hn4_size_t* ptr, hn4_size_t val) {
     if (HN4_UNLIKELY(((uintptr_t)ptr & 0xF) != 0)) {
         memcpy(ptr, &val, sizeof(hn4_size_t));
         atomic_thread_fence(memory_order_release);

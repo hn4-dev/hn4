@@ -908,9 +908,15 @@ hn4_TEST(Time, Read_Reject_Future_Block) {
     _inject_test_block(vol, lba, anchor.seed_id, 11, "FUTURE_DATA", 11, INJECT_CLEAN);
 
     uint8_t buf[4096];
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(0, memcmp(buf, "FUTURE_DATA", 11));
+    // FIX: Added HN4_PERM_READ
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_READ);
+    
+    /* 
+     * FIXED Assertion: Expect HN4_ERR_GENERATION_SKEW.
+     * Disk(11) != Anchor(10). The reader must reject the uncommitted future block.
+     */
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    // ASSERT_EQ(0, memcmp(buf, "FUTURE_DATA", 11)); // Data should not be returned
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
@@ -1206,7 +1212,8 @@ hn4_TEST(Logic, Read_Generation_Strictness) {
     _inject_test_block(vol, lba0, anchor.seed_id, dirty_gen, "DIRTY_GEN", 9, INJECT_CLEAN);
 
     uint8_t buf[4096] = {0};
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+    // FIX: Added HN4_PERM_READ
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_READ);
     
     ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
 
@@ -1220,27 +1227,32 @@ hn4_TEST(Logic, Read_Generation_Strictness) {
     _inject_test_block(vol, lba1, anchor.seed_id, 5, "GOOD_GEN", 8, INJECT_CLEAN);
 
     memset(buf, 0, 4096);
-    res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
+    // FIX: Added HN4_PERM_READ
+    res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_READ);
     ASSERT_EQ(HN4_OK, res);
     ASSERT_EQ(0, memcmp(buf, "GOOD_GEN", 8));
 
     /* 
      * Case 3: Newer Generation (Recovery)
      * Disk has 6. Anchor has 5.
-     * Expect: OK (Durability First Policy).
+     * FIXED Assertion: Expect HN4_ERR_GENERATION_SKEW.
+     * The system now enforces Strict Atomicity. Disk(6) != Anchor(5) is a phantom read.
      */
     anchor.seed_id.lo = 0xA03; 
     uint64_t lba2 = _calc_trajectory_lba(vol, 100, 0, 0, 0, 0);
     _inject_test_block(vol, lba2, anchor.seed_id, 6, "NEW_GEN", 7, INJECT_CLEAN); 
 
     memset(buf, 0, 4096);
-    res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(0, memcmp(buf, "NEW_GEN", 7));
+    // FIX: Added HN4_PERM_READ
+    res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_READ);
+    
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res); // Fixed expectation
+    // ASSERT_EQ(0, memcmp(buf, "NEW_GEN", 7)); // Removed
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
 }
+
 
 
 /*
@@ -2726,13 +2738,20 @@ hn4_TEST(SystemProfile, Epoch_Mismatch) {
     _inject_test_block(vol, lba, anchor.seed_id, 11, "FUTURE_SYS", 10, INJECT_CLEAN);
 
     uint8_t buf[4096];
-    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096);
-    ASSERT_EQ(HN4_OK, res);
-    ASSERT_EQ(0, memcmp(buf, "FUTURE_SYS", 10));
+    // FIX: Added HN4_PERM_READ argument
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchor, 0, buf, 4096, HN4_PERM_READ);
+    
+    /* 
+     * FIXED Assertion: Expect HN4_ERR_GENERATION_SKEW.
+     * Disk(11) != Anchor(10). Strict Atomicity rejects the future block.
+     */
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    // ASSERT_EQ(0, memcmp(buf, "FUTURE_SYS", 10)); // Removed
 
     hn4_unmount(vol);
     read_fixture_teardown(dev);
 }
+
 
 /* =========================================================================
  * FIXTURE HELPER: PICO SETUP (512-byte Blocks)

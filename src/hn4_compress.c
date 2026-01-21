@@ -148,7 +148,7 @@ _Static_assert(sizeof(_hn4_lexicon_table) / sizeof(hn4_lexicon_entry_t) == HN4_L
      * SSD/RAM Mode uses Fast Scan (8 bytes) to save CPU.
      * 
      */
-    static inline int8_t _tcc_detect_linear_gradient(
+    HN4_INLINE int8_t _tcc_detect_linear_gradient(
         const uint8_t* p,
         const uint8_t* end,
         uint32_t device_type
@@ -256,7 +256,7 @@ _Static_assert(sizeof(_hn4_lexicon_table) / sizeof(hn4_lexicon_entry_t) == HN4_L
      * Calculates size and emits token if buffer has space.
      * 
      */
-    static inline uint8_t* _tcc_write_token(uint8_t* p, const uint8_t* oend, uint8_t tag, uint32_t count) 
+    HN4_INLINE uint8_t* _tcc_write_token(uint8_t* p, const uint8_t* oend, uint8_t tag, uint32_t count) 
     {
         if (HN4_UNLIKELY(count > HN4_MAX_TOKEN_LEN)) return NULL;
 
@@ -343,13 +343,8 @@ static uint32_t _tcc_attempt_bitmask(
         if (word_ptr[i] != 0) non_zero_words++;
     }
     
-    /* 
-     * Profitability Logic (Relaxed):
-     * Previous 3:1 density requirement (non_zero * 4 < total) was too aggressive.
-     * We revert to a safer check: Ensure we aren't expanding or barely breaking even.
-     * We require non-zero words to be less than 87.5% of total to ensure *some* sparsity.
-     */
-    if (non_zero_words * 8 > total_words * 7) return 0;
+   /* Require at least 12.5% sparsity (7/8 density) */
+   if (non_zero_words > (total_words - (total_words >> 3))) return 0;
 
     /* Calculate Header Size */
     uint32_t header_sz = 1;
@@ -402,7 +397,7 @@ static uint32_t _tcc_attempt_bitmask(
      * Flushes pending literals.
      * Handles NVM Optimization if hw_flags & HN4_HW_NVM is set.
      */
-    static inline hn4_result_t _flush_literal_buffer(
+    HN4_INLINE hn4_result_t _flush_literal_buffer(
     uint8_t** op_ptr, const uint8_t* oend, 
     const uint8_t* lit_start, size_t lit_len,
     uint64_t hw_flags
@@ -456,7 +451,7 @@ static uint32_t _tcc_attempt_bitmask(
 }
 
 /* Helper: Write Raw VarInt (For Extended Ops) */
-static inline uint8_t* _tcc_write_varint(uint8_t* p, const uint8_t* oend, uint32_t val) {
+HN4_INLINE uint8_t* _tcc_write_varint(uint8_t* p, const uint8_t* oend, uint32_t val) {
     while (val >= HN4_VARINT_MARKER) {
         if (p >= oend) return NULL;
         *p++ = HN4_VARINT_MARKER;
@@ -635,9 +630,12 @@ hn4_result_t hn4_compress_block(
             while (run_len >= HN4_TENSOR_MIN_SPAN) {
                 uint32_t max_enc = HN4_MAX_TOKEN_LEN + HN4_TENSOR_MIN_SPAN;
                 uint32_t chunk = (run_len > max_enc) ? max_enc : (uint32_t)run_len;
-                uint32_t count = chunk - HN4_TENSOR_MIN_SPAN;
+                /* Safety check: Should be guaranteed by outer while loop, but safe is better */
+                if (chunk < HN4_TENSOR_MIN_SPAN) break; 
 
+                uint32_t count = chunk - HN4_TENSOR_MIN_SPAN;
                 uint8_t* next_op = _tcc_write_token(op, oend, HN4_OP_ISOTOPE, count);
+                
                 if (!next_op || next_op >= oend) return HN4_ERR_ENOSPC;
                 
                 op = next_op;

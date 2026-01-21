@@ -66,25 +66,21 @@ static const uint8_t _prof_policy_lut[8] = {
  * INTERNAL HELPERS
  * ========================================================================= */
 
-static inline void _pack_header(
-    HN4_OUT hn4_block_header_t* hdr,
-    HN4_IN  hn4_u128_t          well_id,
-    HN4_IN  uint64_t            seq_idx,
-    HN4_IN  uint64_t            generation,
-    HN4_IN  uint32_t            data_crc,
-    HN4_IN  uint32_t            comp_meta
-)
+HN4_INLINE void _pack_header(hn4_block_header_t* h, hn4_u128_t id, 
+                                uint64_t seq, uint64_t gen, 
+                                uint32_t dcrc, uint32_t meta)
 {
-    hdr->well_id    = hn4_cpu_to_le128(well_id);
-    hdr->seq_index  = hn4_cpu_to_le64(seq_idx);
-    hdr->generation = hn4_cpu_to_le64(generation);
-    hdr->magic      = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
-    hdr->data_crc   = hn4_cpu_to_le32(data_crc);
-    hdr->comp_meta  = hn4_cpu_to_le32(comp_meta);
+    h->magic      = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id    = hn4_cpu_to_le128(id);
+    h->seq_index  = hn4_cpu_to_le64(seq);
+    h->generation = hn4_cpu_to_le64(gen);
+    h->data_crc   = hn4_cpu_to_le32(dcrc);
+    h->comp_meta  = hn4_cpu_to_le32(meta);
 
-    hdr->header_crc = 0;
-    uint32_t hcrc   = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, offsetof(hn4_block_header_t, header_crc));
-    hdr->header_crc = hn4_cpu_to_le32(hcrc);
+    /* CRC covers fields up to header_crc */
+    uint32_t hcrc = hn4_crc32(HN4_CRC_SEED_HEADER, h, 
+                              offsetof(hn4_block_header_t, header_crc));
+    h->header_crc = hn4_cpu_to_le32(hcrc);
 }
 
 /**
@@ -475,10 +471,20 @@ retry_transaction:;
      * - HYPER_CLOUD: Never speculate. Only compress if HINT_COMPRESSED is explicitly set.
      *   (Server workloads are often already compressed/encrypted; avoiding the CPU hit boosts IOPS).
      */
-    bool try_compress = (dclass_check & HN4_HINT_COMPRESSED);
+     bool try_compress = (dclass_check & HN4_HINT_COMPRESSED);
     
     if (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE) {
         try_compress = true;
+    }
+
+    /* 
+     * SAFETY FIX: Mutual Exclusion.
+     * Encrypted data (high entropy) is incompressible. 
+     * Furthermore, the Read Path (_validate_block) explicitly rejects blocks 
+     * marked as both Encrypted and Compressed to prevent compression-oracle attacks.
+     */
+    if (dclass_check & HN4_HINT_ENCRYPTED) {
+        try_compress = false;
     }
 
     /* 
@@ -788,6 +794,7 @@ retry_transaction:;
                  * If this is the start of the file, we can shift the Gravity Center (G)
                  * to match the drive's Write Pointer without breaking previous blocks.
                  */
+                /* Case A: Genesis Drift (Block 0) */
                 if (block_idx == 0) {
                     /* 
                      * Calculate new G.
@@ -799,8 +806,24 @@ retry_transaction:;
                     
                     txn_anchor.gravity_center = hn4_cpu_to_le64(new_G);
                     
-                    /* Update Bitmap: Release 'target', Claim 'actual' */
+                    /* Update Bitmap: Release 'target' */
                     _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);
+
+                    /* 
+                     * Ensure the drive didn't append to a block we think is already valid data.
+                     */
+                    bool collision = false;
+                    _bitmap_op(vol, actual_lba_idx, BIT_TEST, &collision);
+                    
+                    if (HN4_UNLIKELY(collision)) {
+                        HN4_LOG_CRIT("ZNS CRITICAL: Drive appended to allocated LBA %llu. State Desync.", 
+                                     (unsigned long long)actual_lba_idx);
+                        atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_PANIC);
+                        hn4_hal_mem_free(io_buf);
+                        return HN4_ERR_DATA_ROT;
+                    }
+
+                    /* Claim 'actual' */
                     _bitmap_op(vol, actual_lba_idx, BIT_SET, NULL);
                     
                     /* Sync internal state variables */

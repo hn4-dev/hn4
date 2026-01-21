@@ -52,20 +52,13 @@ uint64_t hn4_addr_to_u64(hn4_addr_t addr) {
 #endif
 }
 
-hn4_addr_t hn4_addr_add(hn4_addr_t base, uint64_t inc) {
+hn4_addr_t hn4_addr_add(hn4_addr_t base, uint64_t inc) 
+{
 #ifdef HN4_USE_128BIT
-    hn4_addr_t res = base;
-    uint64_t old_lo = res.lo;
-    
-    res.lo += inc;
-    
-    /* Carry detection: If result is smaller than original, wrap-around occurred */
-    if (res.lo < old_lo) {
-        res.hi++; 
-    }
-    return res;
+    base.lo += inc;
+    if (base.lo < inc) base.hi++;
+    return base;
 #else
-    /* Standard arithmetic */
     return base + inc;
 #endif
 }
@@ -220,20 +213,31 @@ hn4_u128_t hn4_u128_div_u64(hn4_u128_t a, uint64_t b) {
     uint64_t quotient_lo = 0;
     
     /* Iterate 64 bits */
-    for (int i = 0; i < 64; i++) {
-        /* Shift remainder left by 1, pulling in MSB of low */
+     for (int i = 0; i < 64; i++) {
+        /* 1. Capture the bit moving from Low -> High */
         uint64_t msb_low = (low >> 63);
         
-        /* Capture MSB of remainder to detect overflow after shift */
-        uint64_t rem_msb = (rem >> 63);
-        
-        rem = (rem << 1) | msb_low;
+        /* 2. Shift Low Part */
         low = (low << 1);
         
+        /* 3. Capture the bit moving out of High (Overflow) */
+        uint64_t rem_overflow = (rem >> 63);
+        
+        /* 4. Shift High Part (Remainder) and inject Low MSB */
+        rem = (rem << 1) | msb_low;
+        
+        /* 5. Shift Quotient */
         quotient_lo = (quotient_lo << 1);
 
-        if (rem_msb || rem >= b) {
-            rem -= b; /* Wraps correctly for rem_msb case, standard sub for >= case */
+        /* 
+         * 6. Check Logic:
+         * If rem_overflow is set, the value effectively exceeds 64 bits (>= 2^64).
+         * Since b is uint64_t, (2^64 + rem) is ALWAYS >= b.
+         * The subtraction `rem - b` relies on unsigned underflow to mathematically
+         * equal `(2^64 + rem) - b`.
+         */
+        if (rem_overflow || rem >= b) {
+            rem -= b;
             quotient_lo |= 1;
         }
     }
