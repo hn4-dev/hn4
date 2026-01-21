@@ -24,6 +24,7 @@
 #define HN4_SMALL_ARRAY_LIMIT 8
 #define HN4_HELIX_STRIPE_SECTORS 128 
 
+
 /* =========================================================================
  * GALOIS FIELD MATH ENGINE (PORTABLE)
  * Polynomial: x^8 + x^4 + x^3 + x^2 + 1 (0x11D)
@@ -59,7 +60,6 @@ static void _hn4_gf_init(void) {
     hn4_hal_spinlock_release(&_gf_lock);
 }
 
-
 /* 
  * O(1) Galois Multiplication 
  * Performance: ~2-3 cycles (L1 Cache Hit)
@@ -69,6 +69,25 @@ HN4_INLINE uint8_t _gf_mul(uint8_t a, uint8_t b) {
     if (HN4_UNLIKELY(!atomic_load_explicit(&_gf_ready, memory_order_acquire))) _hn4_gf_init();
     return _gf_exp[(int)_gf_log[a] + (int)_gf_log[b]];
 }
+
+/* Reconstruction Strategies */
+typedef enum {
+    HELIX_SOLVE_NONE = 0,
+    HELIX_SOLVE_P_ONLY,     /* Q is dead. Use P (XOR). */
+    HELIX_SOLVE_Q_ONLY,     /* P is dead. Use Q (Galois). */
+    HELIX_SOLVE_PQ_ALGEBRA  /* Both P/Q alive. Use Algebra. */
+} hn4_helix_strategy_t;
+
+/* 
+ * Dual Failure Resolution Matrix
+ * Index Bits: [Bit 1: Q_Dead] [Bit 0: P_Dead]
+ */
+static const uint8_t _helix_solve_lut[4] = {
+    [0] = HELIX_SOLVE_PQ_ALGEBRA, /* 00: Both Alive -> Data + Data failed */
+    [1] = HELIX_SOLVE_Q_ONLY,     /* 01: P Dead    -> Data + P failed */
+    [2] = HELIX_SOLVE_P_ONLY,     /* 10: Q Dead    -> Data + Q failed */
+    [3] = HELIX_SOLVE_NONE        /* 11: Both Dead -> Data Safe (Impossible here) */
+};
 
 /* =========================================================================
  * INTERNAL HELPERS
@@ -346,8 +365,6 @@ static hn4_result_t _hn4_reconstruct_helix(
         /* 
          * Treat the target as "missing" (an erasure variable) 
          * even if the drive is physically online (e.g., during RMW read failure).
-         * Ideally, target_col is one of the failures, but we must ensure it 
-         * enters the equation as an unknown.
          */
         bool is_unknown = is_failed || (i == target_col);
 
@@ -403,20 +420,17 @@ static hn4_result_t _hn4_reconstruct_helix(
      * 2. OPTIMISTIC PATH: Single Failure (XOR Only)
      * --------------------------------------------------------- */
     if (fail_cnt == 1) {
-    /* 
-     * Strict Mode. Only use XOR if recovering a DATA column.
-     * If Target is P or Q, we route through the solver to ensure
-     * consistent handling of syndromes, even if XOR is theoretically possible for P.
-     */
-    if (target_col != q_col && target_col != p_col) {
-        memset(result_buf, 0, byte_len);
-        
-        for (uint32_t i = 0; i < count; i++) {
-            /* Skip the missing drive */
-            if (i == target_col) continue;
+        /* 
+         * Strict Mode. Only use XOR if recovering a DATA column.
+         * If Target is P or Q, we route through the solver to ensure
+         * consistent handling of syndromes.
+         */
+        if (target_col != q_col && target_col != p_col) {
+            memset(result_buf, 0, byte_len);
             
-            /* Skip Q (it does not contribute to P-based reconstruction) */
-            if (i == q_col) continue;
+            for (uint32_t i = 0; i < count; i++) {
+                if (i == target_col) continue;
+                if (i == q_col) continue; /* Skip Q for XOR recovery */
 
                 /* Read survivor */
                 if (hn4_hal_sync_io(snapshot[i].dev_handle, HN4_IO_READ, io_lba, tmp, len) != HN4_OK) {
@@ -441,7 +455,7 @@ static hn4_result_t _hn4_reconstruct_helix(
      * 3. PESSIMISTIC PATH: Dual Failure / Q-Regen
      * --------------------------------------------------------- */
     
-    if (HN4_UNLIKELY(!_gf_ready)) _hn4_gf_init();
+    if (HN4_UNLIKELY(!atomic_load_explicit(&_gf_ready, memory_order_acquire))) _hn4_gf_init();
 
     /* Scan Survivors to build Syndromes */
     for (uint32_t i = 0; i < count; i++) {
@@ -479,83 +493,87 @@ static hn4_result_t _hn4_reconstruct_helix(
     }
 
     /* ---------------------------------------------------------
-     * 4. ALGEBRAIC SOLVER
+     * 4. ALGEBRAIC SOLVER (Table Driven)
      * --------------------------------------------------------- */
     int x = fail_idxs[0];
     int y = fail_idxs[1];
     
     /* Normalize: If one of them is the specific target, ensure it's in 'x' for return */
     if (fail_cnt == 1) {
-        x = fail_idxs[0]; /* Only one failure */
+        x = fail_idxs[0]; 
     } else {
         if (y == (int)target_col) { int swap = x; x = y; y = swap; }
     }
 
-    /* CASE A: Data + Data Failure */
-    if (x != (int)p_col && x != (int)q_col && y != (int)p_col && y != (int)q_col) {
-        uint32_t log_x = _hn4_phys_to_logical(x, p_col, q_col);
-        uint32_t log_y = _hn4_phys_to_logical(y, p_col, q_col);
-        uint8_t g_x = _gf_exp[log_x % 255];
-        uint8_t g_y = _gf_exp[log_y % 255];
+    /* Calculate State Vector based on P/Q Liveness */
+    int state = 0;
+    if (x == (int)p_col || y == (int)p_col) state |= 1; /* Bit 0: P Dead */
+    if (x == (int)q_col || y == (int)q_col) state |= 2; /* Bit 1: Q Dead */
 
-        if (g_x == g_y) {
-            /* Logic error or configuration mismatch */
-            if (using_heap) { hn4_hal_mem_free(p_syn); hn4_hal_mem_free(q_syn); hn4_hal_mem_free(tmp); }
-            return HN4_ERR_PARITY_BROKEN;
-        }
+    hn4_result_t res = HN4_OK;
 
-        uint8_t den_base = g_x ^ g_y;
-        if (den_base == 0) {
-            if (using_heap) { 
-                hn4_hal_mem_free(p_syn); 
-                hn4_hal_mem_free(q_syn); 
-                hn4_hal_mem_free(tmp); 
+    switch (_helix_solve_lut[state]) {
+        case HELIX_SOLVE_PQ_ALGEBRA:
+        {
+            uint32_t log_x = _hn4_phys_to_logical(x, p_col, q_col);
+            uint32_t log_y = _hn4_phys_to_logical(y, p_col, q_col);
+            uint8_t g_x = _gf_exp[log_x % 255];
+            uint8_t g_y = _gf_exp[log_y % 255];
+
+            if (g_x == g_y) {
+                res = HN4_ERR_PARITY_BROKEN;
+                break;
             }
-            return HN4_ERR_PARITY_BROKEN;
+
+            uint8_t den_base = g_x ^ g_y;
+            if (den_base == 0) {
+                res = HN4_ERR_PARITY_BROKEN;
+                break;
+            }
+
+            uint8_t den = _gf_inv(den_base);
+            uint8_t* res_u8 = (uint8_t*)result_buf;
+            
+            /* Solve for X: x = (Q_syn ^ (P_syn * g_y)) / (g_x ^ g_y) */
+            for (size_t k = 0; k < byte_len; k++) {
+                uint8_t num = q_syn[k] ^ _gf_mul(p_syn[k], g_y);
+                res_u8[k] = _gf_mul(num, den);
+            }
+            break;
         }
 
-        uint8_t den = _gf_inv(den_base);
-        uint8_t* res_u8 = (uint8_t*)result_buf;
-        
-        /* Solve for X: x = (Q_syn ^ (P_syn * g_y)) / (g_x ^ g_y) */
-        for (size_t k = 0; k < byte_len; k++) {
-            uint8_t num = q_syn[k] ^ _gf_mul(p_syn[k], g_y);
-            res_u8[k] = _gf_mul(num, den);
+        case HELIX_SOLVE_P_ONLY: /* Q is dead (or N/A), use P */
+        {
+            /* P = X ^ Survivors. P_syn already holds this. */
+            memcpy(result_buf, p_syn, byte_len);
+            break;
         }
-    }
-    /* CASE B: Data (x) + Q (y) Failure */
-    else if (y == (int)q_col || x == (int)q_col) {
-        /* 
-         * If Q is dead, we solve X using only P.
-         * P_syn currently holds: P ^ Sum(Survivors).
-         * Since P = X ^ Sum(Survivors), then P_syn IS X.
-         */
-        memcpy(result_buf, p_syn, byte_len);
-    }
-    /* CASE C: Data (x) + P (y) Failure */
-    else if (y == (int)p_col || x == (int)p_col) {
-        /* 
-         * Handle Data+P failure.
-         * If P is dead, we solve X using Q.
-         * X = Q_syn * g_x^-1
-         */
-        
-        /* Ensure x is the data column (not the parity column) */
-        int data_col = (x == (int)p_col) ? y : x;
-        
-        uint32_t log_x = _hn4_phys_to_logical(data_col, p_col, q_col);
-        uint8_t g_inv_x = _gf_inv(_gf_exp[log_x % 255]);
-        
-        uint8_t* res_u8 = (uint8_t*)result_buf;
-        for (size_t k = 0; k < byte_len; k++) {
-            res_u8[k] = _gf_mul(q_syn[k], g_inv_x);
+
+        case HELIX_SOLVE_Q_ONLY: /* P is dead, use Q */
+        {
+            /* If P is dead, we solve X using Q. */
+            /* Determine which variable is the data column (it's not P) */
+            int data_col = (x == (int)p_col) ? y : x;
+            
+            uint32_t log_x = _hn4_phys_to_logical(data_col, p_col, q_col);
+            uint8_t g_inv_x = _gf_inv(_gf_exp[log_x % 255]);
+            
+            uint8_t* res_u8 = (uint8_t*)result_buf;
+            for (size_t k = 0; k < byte_len; k++) {
+                res_u8[k] = _gf_mul(q_syn[k], g_inv_x);
+            }
+            break;
         }
+
+        default:
+            res = HN4_ERR_INTERNAL_FAULT;
+            break;
     }
 
     if (using_heap) {
         hn4_hal_mem_free(p_syn); hn4_hal_mem_free(q_syn); hn4_hal_mem_free(tmp);
     }
-    return HN4_OK;
+    return res;
 }
 
 /* =========================================================================

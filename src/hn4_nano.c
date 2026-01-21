@@ -287,15 +287,29 @@ hn4_result_t hn4_write_nano_ballistic(
 
         if (read_res != HN4_OK) continue; 
 
+          uint32_t anchors_per_sector = ss / sizeof(hn4_anchor_t);
+        hn4_anchor_t* anchor_view = (hn4_anchor_t*)io_buf;
+        
+        /* Check if it's already a valid Nano Quantum owned by us */
         hn4_nano_quantum_t* slot = (hn4_nano_quantum_t*)io_buf;
-        hn4_u128_t slot_id = hn4_le128_to_cpu(slot->owner_id);
-        uint32_t slot_magic = hn4_le32_to_cpu(slot->magic);
-        uint32_t slot_len = hn4_le32_to_cpu(slot->payload_len);
+        bool is_mine = (hn4_le32_to_cpu(slot->magic) == HN4_MAGIC_NANO && 
+                        slot->owner_id.lo == anchor->seed_id.lo && 
+                        slot->owner_id.hi == anchor->seed_id.hi);
 
-        /* Slot is claimable if Empty OR if we already own it */
-        bool is_empty = (slot_magic == 0 && slot_id.lo == 0 && slot_id.hi == 0 && slot_len == 0);
-        bool is_mine  = (slot_magic == HN4_MAGIC_NANO && 
-                         slot_id.lo == my_id.lo && slot_id.hi == my_id.hi);
+        bool is_empty = true;
+        if (!is_mine) {
+            for (uint32_t i = 0; i < anchors_per_sector; i++) {
+                /* Check for non-zero data in the anchor slot */
+                /* Optimization: Check key fields (Seed ID and Data Class) */
+                if (anchor_view[i].seed_id.lo != 0 || 
+                    anchor_view[i].seed_id.hi != 0 || 
+                    anchor_view[i].data_class != 0) 
+                {
+                    is_empty = false;
+                    break;
+                }
+            }
+        }
 
         if (is_empty || is_mine) {
             /* 3. Prepare Write */

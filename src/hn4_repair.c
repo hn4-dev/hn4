@@ -22,6 +22,45 @@
 #define HN4_MAX_CAS_RETRIES     100
 #define HN4_DMA_POISON_BYTE     0xDD
 
+/* 
+ * Repair Outcome Categories 
+ */
+#define HN4_R_OUTCOME_SUCCESS   0
+#define HN4_R_OUTCOME_FAILED    1
+#define HN4_R_OUTCOME_ABSTAIN   2
+
+/*
+ * Quality Mask Transition Matrix
+ * Maps [Outcome][Current_State] -> New_State
+ *
+ * Rules:
+ * 1. TOXIC (00) is sticky (Terminal State).
+ * 2. SUCCESS downgrades Silver/Gold to BRONZE (01).
+ * 3. FAILURE downgrades everything to TOXIC (00).
+ */
+static const uint8_t _qmask_trans_lut[3][4] = {
+    /* [0] SUCCESS: Heal -> Bronze */
+    { HN4_Q_TOXIC, HN4_Q_BRONZE, HN4_Q_BRONZE, HN4_Q_BRONZE },
+    
+    /* [1] FAILED:  Die  -> Toxic  */
+    { HN4_Q_TOXIC, HN4_Q_TOXIC,  HN4_Q_TOXIC,  HN4_Q_TOXIC  },
+    
+    /* [2] ABSTAIN: No Change      */
+    { HN4_Q_TOXIC, HN4_Q_BRONZE, HN4_Q_SILVER, HN4_Q_GOLD   }
+};
+
+HN4_INLINE int _map_repair_outcome(hn4_result_t res) {
+    if (res == HN4_OK) return HN4_R_OUTCOME_SUCCESS;
+    
+    /* Logic errors (NOMEM/ARGS) should not mark silicon as Toxic */
+    if (res == HN4_ERR_NOMEM || res == HN4_ERR_INVALID_ARGUMENT) {
+        return HN4_R_OUTCOME_ABSTAIN;
+    }
+    
+    /* HW_IO, DATA_ROT, MEDIA_TOXIC -> Physical Failure */
+    return HN4_R_OUTCOME_FAILED;
+}
+
 /* =========================================================================
  * CORE REPAIR LOGIC
  * ========================================================================= */
@@ -140,39 +179,34 @@ _Check_return_ hn4_result_t hn4_repair_block(
             int      retries = 0;
 
             /* CAS Loop: Commit the health status */
+               int outcome_idx = _map_repair_outcome(res);
+
+            /* CAS Loop: Commit the health status */
             do {
                 /* Current state of the 2 bits */
                 uint64_t old_state = (old_val >> shift) & 0x3;
 
-                /* LATTICE MONOTONICITY: Toxic is sticky */
-                if (old_state == HN4_Q_TOXIC) {
-                    /* Silicon is dead. Do not resuscitate. */
+                /* O(1) Table Lookup */
+                uint64_t next_state = _qmask_trans_lut[outcome_idx][old_state];
+
+                if (next_state == old_state) {
+                    /* Optimization: Don't write if state didn't change */
                     new_val = old_val;
-                    /* Pretend success to exit loop, but result remains ERR_MEDIA_TOXIC */
+                    /* 
+                     * Edge Case: If we tried to repair but the block was ALREADY Toxic,
+                     * we must force the return code to reflect failure, even if the 
+                     * write succeeded physically. Toxic is terminal.
+                     */
+                    if (old_state == HN4_Q_TOXIC && res == HN4_OK) {
+                        res = HN4_ERR_MEDIA_TOXIC;
+                    }
                     success = true;
-                    /* If we thought we repaired it, force fail the result code */
-                    if (res == HN4_OK) res = HN4_ERR_MEDIA_TOXIC;
                     break;
                 }
 
-                /* Clear the 2 bits for this block */
+                /* Construct new word */
                 uint64_t cleared = old_val & ~(3ULL << shift);
-
-                bool is_physical_failure = (res != HN4_OK && 
-                                res != HN4_ERR_NOMEM && 
-                                res != HN4_ERR_INVALID_ARGUMENT);
-
-                if (res == HN4_OK) {
-                    /* REPAIR SUCCESS: Downgrade to BRONZE (01) */
-                    new_val = cleared | (1ULL << shift);
-                }  else if (is_physical_failure) {
-                    /* REPAIR FAILURE: Downgrade to TOXIC (00) */
-                    new_val = cleared; /* 00 */
-                }  else {
-                    new_val = old_val;
-                    success = true; 
-                    break; 
-                }
+                new_val = cleared | (next_state << shift);
 
                 success = atomic_compare_exchange_weak_explicit(q_ptr, &old_val, new_val,
                                                                 memory_order_release,

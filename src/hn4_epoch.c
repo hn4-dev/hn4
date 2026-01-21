@@ -29,6 +29,36 @@ _Static_assert(sizeof(hn4_epoch_header_t) <= 512, "HN4: Epoch Header exceeds min
 
 #define HN4_RING_SIZE_BYTES         (1024ULL * 1024ULL) /* 1MB Fixed Ring */
 
+/* Define Enum FIRST */
+typedef enum {
+    EPOCH_STATE_SYNCED          = 0,
+    EPOCH_STATE_FUTURE_DILATION = 1,
+    EPOCH_STATE_FUTURE_TOXIC    = 2,
+    EPOCH_STATE_PAST_SKEW       = 3,
+    EPOCH_STATE_PAST_TOXIC      = 4
+} hn4_epoch_drift_state_t;
+
+/* Define Logic Table SECOND */
+static const hn4_epoch_drift_state_t _drift_logic_lut[3][3] = {
+    /* [0] SYNC (Diff=0) */
+    { EPOCH_STATE_SYNCED, EPOCH_STATE_SYNCED, EPOCH_STATE_SYNCED },
+    
+    /* [1] FUTURE (Disk > Mem) */
+    { EPOCH_STATE_SYNCED, EPOCH_STATE_FUTURE_DILATION, EPOCH_STATE_FUTURE_TOXIC },
+    
+    /* [2] PAST (Mem > Disk) */
+    { EPOCH_STATE_SYNCED, EPOCH_STATE_PAST_SKEW, EPOCH_STATE_PAST_TOXIC }
+};
+
+/* Lookup Table for Error Mapping (Existing) */
+static const hn4_result_t _drift_err_map[] = {
+    [EPOCH_STATE_SYNCED]          = HN4_OK,
+    [EPOCH_STATE_FUTURE_DILATION] = HN4_ERR_TIME_DILATION,
+    [EPOCH_STATE_FUTURE_TOXIC]    = HN4_ERR_MEDIA_TOXIC,
+    [EPOCH_STATE_PAST_SKEW]       = HN4_ERR_GENERATION_SKEW,
+    [EPOCH_STATE_PAST_TOXIC]      = HN4_ERR_MEDIA_TOXIC
+};
+
 /* =========================================================================
  * INTERNAL HELPERS
  * ========================================================================= */
@@ -147,23 +177,6 @@ Cleanup:
  * RING VALIDATION
  * ========================================================================= */
 
-typedef enum {
-    EPOCH_STATE_SYNCED          = 0,
-    EPOCH_STATE_FUTURE_DILATION = 1,
-    EPOCH_STATE_FUTURE_TOXIC    = 2,
-    EPOCH_STATE_PAST_SKEW       = 3,
-    EPOCH_STATE_PAST_TOXIC      = 4
-} hn4_epoch_drift_state_t;
-
-/* Lookup Table for Error Mapping */
-static const hn4_result_t _drift_err_map[] = {
-    [EPOCH_STATE_SYNCED]          = HN4_OK,
-    [EPOCH_STATE_FUTURE_DILATION] = HN4_ERR_TIME_DILATION,
-    [EPOCH_STATE_FUTURE_TOXIC]    = HN4_ERR_MEDIA_TOXIC,
-    [EPOCH_STATE_PAST_SKEW]       = HN4_ERR_GENERATION_SKEW,
-    [EPOCH_STATE_PAST_TOXIC]      = HN4_ERR_MEDIA_TOXIC
-};
-
 _Check_return_ hn4_result_t hn4_epoch_check_ring(
     HN4_IN hn4_hal_device_t* dev, 
     HN4_IN const hn4_superblock_t* sb, 
@@ -279,17 +292,18 @@ _Check_return_ hn4_result_t hn4_epoch_check_ring(
     }
 
     /* Classify State */
-    if (diff == 0) {
-        state = EPOCH_STATE_SYNCED;
-    } else if (is_future) {
-        state = (diff > HN4_EPOCH_DRIFT_MAX_FUTURE) 
-                ? EPOCH_STATE_FUTURE_TOXIC 
-                : EPOCH_STATE_FUTURE_DILATION;
-    } else {
-        state = (diff > HN4_EPOCH_DRIFT_MAX_PAST) 
-                ? EPOCH_STATE_PAST_TOXIC 
-                : EPOCH_STATE_PAST_SKEW;
+    int dir_idx = 0;
+    if (diff > 0) dir_idx = is_future ? 1 : 2;
+
+    /* Determine Magnitude Index */
+    int mag_idx = 0;
+    if (diff > 0) {
+        uint64_t limit = is_future ? HN4_EPOCH_DRIFT_MAX_FUTURE : HN4_EPOCH_DRIFT_MAX_PAST;
+        mag_idx = (diff > limit) ? 2 : 1;
     }
+
+    /* O(1) Lookup */
+    state = _drift_logic_lut[dir_idx][mag_idx];
 
     /* Map to Result */
     status = _drift_err_map[state];
