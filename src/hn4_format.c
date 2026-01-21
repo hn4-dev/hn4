@@ -466,7 +466,6 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
 
     if (!buffer) return HN4_ERR_NOMEM;
     
-    if (!buffer) return HN4_ERR_NOMEM;
     memset(buffer, 0, buf_sz);
     
     hn4_size_t remaining = byte_len;

@@ -2110,8 +2110,6 @@ hn4_TEST(Math_Boundary, S_Overflow) {
  * 1. Identity: Delta=0 must not change P or Q.
  * 2. Inversion: Applying Delta=0xFF twice should revert P (XOR) but Q will change (GF).
  */
-extern void _hn4_helix_apply_delta(uint8_t* p, uint8_t* q, const uint8_t* d, size_t len, uint8_t coeff);
-
 hn4_TEST(Math_Physics, Atomic_Torn_Write_Algebra) {
     uint8_t P[16] = {0};
     uint8_t Q[16] = {0};
@@ -2125,7 +2123,8 @@ hn4_TEST(Math_Physics, Atomic_Torn_Write_Algebra) {
     memset(P, 0xAA, 16);
     memset(Q, 0x55, 16);
     
-    _hn4_helix_apply_delta(P, Q, Delta_Zero, 16, 2); // coeff=2
+    /* UPDATE SIGNATURE: Added true, true for update_p and update_q */
+    _hn4_helix_apply_delta(P, Q, Delta_Zero, 16, 2, true, true); 
     
     ASSERT_EQ(0xAA, P[0]);
     ASSERT_EQ(0x55, Q[0]);
@@ -2135,7 +2134,7 @@ hn4_TEST(Math_Physics, Atomic_Torn_Write_Algebra) {
        P should invert (XOR FF). 
        Q should change by (0xFF * g^2). 
     */
-    _hn4_helix_apply_delta(P, Q, Delta_FF, 16, 2);
+    _hn4_helix_apply_delta(P, Q, Delta_FF, 16, 2, true, true);
     
     /* P check: 0xAA ^ 0xFF = 0x55 */
     ASSERT_EQ(0x55, P[0]);
@@ -2145,7 +2144,7 @@ hn4_TEST(Math_Physics, Atomic_Torn_Write_Algebra) {
     
     /* 3. Reversibility (XOR property) */
     /* Applying FF Delta again should revert P to 0xAA. */
-    _hn4_helix_apply_delta(P, Q, Delta_FF, 16, 2);
+    _hn4_helix_apply_delta(P, Q, Delta_FF, 16, 2, true, true);
     
     ASSERT_EQ(0xAA, P[0]);
     /* Q should also revert because GF add/sub are both XOR. */
