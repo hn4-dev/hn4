@@ -289,10 +289,9 @@ HN4_INLINE int _hn4_ctz64(uint64_t x) {
     };
     
     /* Isolate LSB: (x & -x) */
-    uint64_t lsb = x & (0 - x); // Avoid unary minus warning on some compilers
+    uint64_t lsb = x & (~x + 1); 
     
-    /* Multiply by De Bruijn Sequence and Shift to map unique 6-bit index */
-    return table[(lsb * 0x03F79D71B4CB0A89ULL) >> 58];
+    return table[((uint64_t)(lsb * 0x03F79D71B4CB0A89ULL)) >> 58];
 #endif
 }
 
@@ -504,7 +503,7 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
  * 
  * Determines if the volume has entered the "Event Horizon" state (Saturation).
   */
-static bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
+bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
     if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
     
     uint64_t used = atomic_load_explicit(&vol->alloc.used_blocks, memory_order_acquire);
@@ -655,23 +654,22 @@ hn4_result_t _check_quality_compliance(hn4_volume_t* vol, uint64_t lba, uint8_t 
 
 HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
     if (m == 0) return 0;
+
+    if (b == 0 || a < (0xFFFFFFFFFFFFFFFFULL / b)) return (a * b) % m;
+
 #if defined(__SIZEOF_INT128__)
     return (uint64_t)(((__uint128_t)a * b) % m);
 #else
+    /* Slow path for 32-bit targets without __int128 */
     uint64_t res = 0;
     a %= m;
     while (b > 0) {
         if (b & 1) {
-            /* 
-             * Safe Add: if (res + a >= m) res = (res + a) - m 
-             * Rewrite to avoid (res+a) overflow:
-             */
             if (res >= m - a) res -= (m - a);
             else res += a;
         }
         b >>= 1;
         if (b > 0) {
-            /* Safe Double */
             if (a >= m - a) a -= (m - a);
             else a += a;
         }
@@ -723,7 +721,10 @@ HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
 
     stride = _project_coprime_vector(stride, capacity);
 
-    uint64_t k_offset = _mul_mod_safe(orbit_k, stride, capacity);
+    uint64_t k_sq = (uint64_t)orbit_k * orbit_k;
+    uint64_t k_quad = (orbit_k + k_sq) >> 1; 
+
+    uint64_t k_offset = _mul_mod_safe(k_quad, stride, capacity);
     uint64_t target_idx = (h + k_offset) % capacity;
     
     *out_lba = hn4_addr_add(vol->sb.info.lba_cortex_start, target_idx);
@@ -731,8 +732,8 @@ HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
     return HN4_OK;
 }
 
-
 static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool is_set) {
+
     /* =========================================================================
      * PATH A: ALLOCATION (The Hot Path)
      * ========================================================================= */
@@ -769,18 +770,13 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
      * PATH B: DEALLOCATION (The Heavy Path)
      * ========================================================================= */
     else {
-        /* 
-         * UNDERFLOW PROTECTION:
-         * Use a CAS loop to decrement. If we hit 0, we have a logic bug 
-         * (Double Free or Counter Drift). We log CRIT and dirty the volume 
-         * to force an fsck, but we do not panic the kernel.
-         */
+
         uint64_t current = atomic_load(&vol->alloc.used_blocks);
         do {
             if (HN4_UNLIKELY(current == 0)) {
                 atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
                 HN4_LOG_ERR("Allocator Underflow! Used=0 but freeing block %llu.", (unsigned long long)block_idx);
-                break; 
+                return;
             }
         } while (!atomic_compare_exchange_weak(&vol->alloc.used_blocks, &current, current - 1));
         
@@ -795,20 +791,13 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
             if (use_lock) hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
 
             uint64_t word_idx = block_idx / 64;
-            /* Align to the start of the 512-bit (8-word) L2 region */
             uint64_t start_w = (word_idx / 8) * 8; 
-            
-            /* 
-             * SCAN: Check if the entire 512-block region is now empty.
-             * We check 8 contiguous 64-bit words in the Level 1 bitmap.
-             */
             size_t total_words = vol->bitmap_size / sizeof(hn4_armored_word_t);
 
             bool region_empty = true;
             for (int i = 0; i < 8; i++) {
-                /* Boundary Check */
-                if ((start_w + i) >= total_words) break;
 
+                if ((start_w + i) >= total_words) break;
                 if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
                     memory_order_relaxed) != 0) {
                     region_empty = false;
@@ -829,7 +818,36 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
                 uint64_t l2_mask = (1ULL << (l2_idx % 64));
                 _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word_idx];
 
-                atomic_fetch_and_explicit(l2_ptr, ~l2_mask, memory_order_release);
+
+                uint64_t old_val = atomic_load_explicit(l2_ptr, memory_order_relaxed);
+
+                while (old_val & l2_mask) {
+                    if (atomic_compare_exchange_weak_explicit(l2_ptr, &old_val, old_val & ~l2_mask,
+                                                              memory_order_release, memory_order_relaxed)) {
+                        break;
+                    }
+                }
+                
+                atomic_thread_fence(memory_order_seq_cst);
+                
+                bool oops_dirty = false;
+                for (int i = 0; i < 8; i++) {
+                    if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
+                        memory_order_relaxed) != 0) {
+                        oops_dirty = true;
+                        break;
+                    }
+                }
+                
+                if (oops_dirty) {
+                    uint64_t r_old = atomic_load_explicit(l2_ptr, memory_order_relaxed);
+                    while (!(r_old & l2_mask)) {
+                         if (atomic_compare_exchange_weak_explicit(l2_ptr, &r_old, r_old | l2_mask,
+                                                                   memory_order_relaxed, memory_order_relaxed)) {
+                             break;
+                         }
+                    }
+                }
             }
 
             if (use_lock) hn4_hal_spinlock_release(&vol->locking.l2_lock);
@@ -841,8 +859,6 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
  * 5. BITMAP OPERATIONS
  * ========================================================================= */
 
-HN4_HOT
-_Check_return_
 HN4_HOT
 _Check_return_
 hn4_result_t _bitmap_op(
@@ -857,10 +873,7 @@ hn4_result_t _bitmap_op(
      * ========================================================================= */
     if (HN4_UNLIKELY(!vol->void_bitmap)) {
         
-        /* 
-         * Validation: If bitmap is NULL, we must be in PICO profile. 
-         * Otherwise, the volume is uninitialized/corrupt.
-         */
+        /* Validation */
         if (vol->sb.info.format_profile != HN4_PROFILE_PICO) {
             return HN4_ERR_UNINITIALIZED;
         }
@@ -873,7 +886,6 @@ hn4_result_t _bitmap_op(
         
         if (!sector_buf) return HN4_ERR_NOMEM;
         
-        /* Coordinate Calculation */
         uint64_t word_idx      = block_idx / 64;
         uint64_t bit_off       = block_idx % 64;
         uint64_t byte_offset   = word_idx * sizeof(hn4_armored_word_t);
@@ -881,21 +893,29 @@ hn4_result_t _bitmap_op(
         uint64_t offset_in_sec = byte_offset % ss;
 
         hn4_addr_t io_lba = hn4_addr_add(vol->sb.info.lba_bitmap_start, sector_offset / ss);
-        hn4_result_t res = HN4_OK;
-
-        uint32_t lock_idx = (block_idx / 64) % HN4_CORTEX_SHARDS;
-        hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
         uint32_t sectors_to_io = 1;
         if ((offset_in_sec + sizeof(hn4_armored_word_t)) > ss) {
             sectors_to_io = 2;
         }
 
-        if (alloc_size < (sectors_to_io * ss)) {
-             res = HN4_ERR_NOMEM;
-             goto pico_cleanup; // Use cleanup label to release lock
+        hn4_addr_t max_lba = vol->sb.info.lba_qmask_start;
+        if (hn4_addr_to_u64(io_lba) + sectors_to_io > hn4_addr_to_u64(max_lba)) {
+             hn4_hal_mem_free(sector_buf);
+             return HN4_ERR_GEOMETRY;
         }
 
+        hn4_result_t res = HN4_OK;
+
+        uint32_t lock_idx = (block_idx / 64) % HN4_CORTEX_SHARDS;
+        hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
+
+        if (alloc_size < (sectors_to_io * ss)) {
+             res = HN4_ERR_NOMEM;
+             goto pico_cleanup;
+        }
+
+        /* 1. READ */
         if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, io_lba, sector_buf, sectors_to_io) != HN4_OK) {
             res = HN4_ERR_HW_IO;
             goto pico_cleanup;
@@ -903,6 +923,7 @@ hn4_result_t _bitmap_op(
 
         hn4_armored_word_t* word = (hn4_armored_word_t*)((uint8_t*)sector_buf + offset_in_sec);
 
+        /* 2. VALIDATE */
         uint64_t safe_data;
         bool corrected = false;
         
@@ -915,6 +936,7 @@ hn4_result_t _bitmap_op(
             word->data = safe_data;
         }
 
+        /* 3. EXECUTE */
         bool is_set = (word->data & (1ULL << bit_off)) != 0;
         bool mutation_needed = false;
         bool report_change = false;
@@ -931,12 +953,12 @@ hn4_result_t _bitmap_op(
             if (op == BIT_SET) word->data |= (1ULL << bit_off);
             else word->data &= ~(1ULL << bit_off);
             
-            /* Regenerate ECC */
             word->ecc = _calc_ecc_hamming(word->data);
             mutation_needed = true;
             report_change = true;
         }
 
+        /* 4. WRITE */
         if (mutation_needed) {
             hn4_result_t w_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, io_lba, sector_buf, sectors_to_io);
             
@@ -952,9 +974,10 @@ hn4_result_t _bitmap_op(
         
         if (op != BIT_TEST && out_result) *out_result = report_change;
 
-    pico_cleanup:
-        if (sector_buf) hn4_hal_mem_free(sector_buf);
+   pico_cleanup:
         hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
+        
+        if (sector_buf) hn4_hal_mem_free(sector_buf);
         return res;
     }
 
@@ -1151,13 +1174,18 @@ _calc_trajectory_lba(
     uint8_t              k
     )
 {
-    /* Inertial Damping Lookup Table (Theta Jitter) */
+    /* 
+     * [INERTIAL DAMPING]
+     * Lookup table for Theta Jitter. This scatters writes on SSDs to avoid 
+     * hitting the same flash pages repeatedly, reducing wear concentration.
+     */
     static const uint8_t _theta_lut[16] = {
         0, 1, 3, 6, 10, 15, 21, 28, 
         36, 45, 55, 66, 78, 91, 105, 120
     };
 
     /* 1. Validate Fractal Scale & Device Context */
+    /* Safety: M >= 63 would cause 1ULL << M to overflow 64 bits. */
     if (HN4_UNLIKELY(M >= 63 || !vol->target_device)) {
         return HN4_LBA_INVALID;
     }
@@ -1169,9 +1197,12 @@ _calc_trajectory_lba(
     uint32_t bs          = vol->vol_block_size;
     uint32_t ss          = caps->logical_block_size ? caps->logical_block_size : 512;
     uint32_t sec_per_blk = (bs / ss) ? (bs / ss) : 1;
-    uint64_t S           = 1ULL << M;
+    uint64_t S           = 1ULL << M; /* The Fractal Stride Size */
 
-    /* Calculate Flux Domain Boundaries */
+    /* 
+     * [CAPACITY NORMALIZATION]
+     * Calculate total usable blocks. Handles the 128-bit Quettabyte build flag.
+     */
      uint64_t total_blocks;
 
 #ifdef HN4_USE_128BIT
@@ -1186,6 +1217,10 @@ _calc_trajectory_lba(
     total_blocks = vol->vol_capacity_bytes / bs;
 #endif
 
+    /* 
+     * [FLUX DOMAIN ALIGNMENT]
+     * Determine where the "Flux" (Data) region starts.
+     */
     uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
     uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
 
@@ -1200,16 +1235,17 @@ _calc_trajectory_lba(
         return HN4_LBA_INVALID;
     }
 
+    /* Phi is the size of the available addressing window */
     uint64_t available_blocks = total_blocks - flux_aligned_blk;
-    
     uint64_t phi              = available_blocks / S;
     
     if (HN4_UNLIKELY(phi == 0)) return HN4_LBA_INVALID;
 
     /* 
      * 3. Apply Gravity Assist (Vector Shift)
-     * If k >= 4, we engage "Gravity Assist" to teleport the vector using
-     * the canonical Swizzle Engine. This escapes local gravity wells (collisions).
+     * If we are deep in collision territory (k >= 4), we engage "Gravity Assist" 
+     * to teleport the vector using the canonical Swizzle Engine. 
+     * This escapes local gravity wells (hash collisions).
      */
     uint64_t effective_V = V;
     if (k >= HN4_GRAVITY_ASSIST_K) {
@@ -1217,20 +1253,16 @@ _calc_trajectory_lba(
     }
     effective_V |= 1; /* Force Odd (Anti-Even Degeneracy) */
 
-    /* 
-     * 4. Enforce Fractal Alignment on G
-     * G must be a multiple of S. We extract the lower bits as "Entropy Loss"
-     * to be re-injected after the trajectory calculation.
+    /*
+     * [DECOMPOSITION]
+     * G is split into the fractal index and the "Entropy Loss" (sub-block offset).
+     * The Entropy Loss is re-injected at the end to preserve byte alignment.
      */
     uint64_t g_aligned   = G & ~(S - 1);
     uint64_t g_fractal   = g_aligned / S;
     uint64_t entropy_loss = G & (S - 1);
-
-    /* 
-     * 5. Calculate Modular Terms 
-     * Enforce Coprimality: If Phi has changed (Resize), V might share factors.
-     * This destroys injectivity. If not coprime, fallback to Linear (V=1).
-     */
+    
+    /* Logical blocks (N) are clustered to keep small runs contiguous */
     uint64_t cluster_idx = N >> 4;
     uint64_t sub_offset  = N & 0xF;
 
@@ -1238,23 +1270,22 @@ _calc_trajectory_lba(
     uint64_t term_v = effective_V % phi;
     
     /* 
-     * RESONANCE DAMPENER (O(1) Projection)
-     * If the volume was resized, V might resonate with the new Phi.
-     * We re-project it deterministically to avoid short cycles.
+     * [COPRIMALITY ENFORCEMENT]
+     * Ensures the vector V covers the entire ring Phi without short cycles.
+     * Replaces the old slow GCD loop with the O(1) projection function.
      */
     term_v = _project_coprime_vector(term_v, phi);
     
-   /* Calculate Offset: (N * V) % Phi */
+    /* Calculate Offset using safe modular math to prevent overflow */
     uint64_t offset = _mul_mod_safe(term_n, term_v, phi);
-    
-    /* 
-     * 6. Apply Inertial Damping (Theta Jitter)
-     * SSDs benefit from pseudo-random scattering to reduce write amplification.
-     * Linear media (HDD/ZNS) requires sequential access (Theta = 0).
-     */
     uint64_t theta = 0;
     
-    /* Check Linear LUT (Mask & 0x3 protects against corrupt tags) */
+    /* 
+     * [DEVICE PHYSICS]
+     * Check Linear LUT (Mask & 0x3 protects against corrupt tags).
+     * ZNS, HDD, and Tape require sequential writes (Linear).
+     * SSDs allow scattered writes (Ballistic).
+     */
     bool is_linear = _hn4_is_linear_lut[vol->sb.info.device_type_tag & 0x3];
     bool is_system = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
     
@@ -1266,12 +1297,14 @@ _calc_trajectory_lba(
         if (HN4_UNLIKELY(phi < 32)) {
             theta = k % phi;
         } else {
+            /* Apply Inertial Damping from LUT */
             uint8_t safe_k = (k < 16) ? k : 15;
             theta = _theta_lut[safe_k] % phi;
         }
     }
     
     /* 7. Final Projection */
+    /* Target Fractal Index = Base + Offset + Jitter */
     uint64_t target_fractal_idx = (g_fractal + offset + theta) % phi;
     
     /* Convert Fractal Index -> Physical Block Index */
