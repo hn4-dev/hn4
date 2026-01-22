@@ -26,6 +26,38 @@
 #include "hn4_constants.h"
 #include <string.h>
 
+
+/* =========================================================================
+ * PREFETCH OPTIMIZATION TABLES
+ * ========================================================================= */
+
+static const uint16_t _hdd_prefetch_lut[32] = {
+    /* 0-11: Reserved/Tiny (0) */
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    
+    /* Small Blocks: Aggressive Count */
+    [12] = 32, /* 4KB   -> 128KB Total */
+    [13] = 16, /* 8KB   -> 128KB Total */
+    [14] = 8,  /* 16KB  -> 128KB Total */
+    [15] = 4,  /* 32KB  -> 128KB Total */
+    [16] = 2,  /* 64KB  -> 128KB Total */
+    
+    /* Large Blocks: Single Block Prefetch */
+    [17] = 1,  /* 128KB */
+    [18] = 1,  /* 256KB */
+    [19] = 1,  /* 512KB */
+    [20] = 1,  /* 1MB   */
+    [21] = 1,  /* 2MB   */
+    [22] = 1,  /* 4MB   */
+    [23] = 1,  /* 8MB   */
+    [24] = 1,  /* 16MB  */
+    [25] = 1,  /* 32MB  */
+    [26] = 1,  /* 64MB  */
+    
+    /* 27-31: Huge/Reserved */
+    [27] = 1, [28] = 1, [29] = 1, [30] = 1, [31] = 1
+};
+
 /* =========================================================================
  * CONSTANTS & MACROS
  * ========================================================================= */
@@ -89,15 +121,21 @@ static int _get_error_weight(hn4_result_t e)
     return 40;
 }
 
-static void _sort_candidates_spatial(uint64_t* candidates, int count) {
-    for (int i = 1; i < count; i++) {
-        uint64_t key = candidates[i];
-        int j = i - 1;
-        while (j >= 0 && candidates[j] > key) {
-            candidates[j + 1] = candidates[j];
-            j--;
+/* 
+ * MECHANICAL SORT (C-LOOK Simulation)
+ * Sorts LBAs ascending to ensure the head sweeps in one direction 
+ * rather than vibrating back and forth between tracks.
+ */
+static void _sort_candidates_mechanical(uint64_t* candidates, int count) {
+    /* Bubble sort is sufficient for small N (max 12) and keeps stack light */
+    for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - i - 1; j++) {
+            if (candidates[j] > candidates[j+1]) {
+                uint64_t temp = candidates[j];
+                candidates[j] = candidates[j+1];
+                candidates[j+1] = temp;
+            }
         }
-        candidates[j + 1] = key;
     }
 }
 
@@ -166,7 +204,6 @@ static hn4_result_t _validate_block(
     }
 
     /* 2. Header Integrity Check (CRC) */
-    /* CRC covers everything before the header_crc field */
     uint32_t stored_crc = hn4_le32_to_cpu(hdr->header_crc);
     uint32_t calc_crc   = hn4_crc32(HN4_CRC_SEED_HEADER, hdr, offsetof(hn4_block_header_t, header_crc));
 
@@ -197,25 +234,21 @@ static hn4_result_t _validate_block(
     uint32_t c_size     = comp_meta >> HN4_COMP_SIZE_SHIFT;
     uint8_t  algo       = comp_meta & HN4_COMP_ALGO_MASK;
 
-    /* Validate Compression Algo */
     if (HN4_UNLIKELY(algo != HN4_COMP_NONE && algo != HN4_COMP_TCC)) {
         HN4_LOG_WARN("Block Validation: Unknown Algo %u", algo);
         return HN4_ERR_ALGO_UNKNOWN;
     }
 
-    /* Security: Encrypted files must not use FS compression (Information Leak) */
     if ((anchor_dclass & HN4_HINT_ENCRYPTED) && algo != HN4_COMP_NONE) {
         HN4_LOG_CRIT("Security: Encrypted file contains compressed block. Tamper evidence.");
         return HN4_ERR_TAMPERED;
     }
 
-    /* Meta Integrity */
     if (c_size > payload_sz) {
         HN4_LOG_WARN("Block Validation: Meta Corruption (CSize %u > Payload %u)", c_size, payload_sz);
         return HN4_ERR_HEADER_ROT;
     }
 
-    /* Payload CRC */
     uint32_t stored_dcrc = hn4_le32_to_cpu(hdr->data_crc);
     uint32_t calc_dcrc   = hn4_crc32(HN4_CRC_SEED_DATA, hdr->payload, payload_sz);
 
@@ -248,8 +281,8 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     memcpy(&anchor, anchor_ptr, sizeof(hn4_anchor_t));
     hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
-    /* Caller Contract Enforcement */
     uint32_t payload_cap = HN4_BLOCK_PayloadSize(vol->vol_block_size);
+
     if (buffer_len < payload_cap) {
         HN4_LOG_ERR("Read Error: Buffer %u < Payload %u", buffer_len, payload_cap);
         return HN4_ERR_INVALID_ARGUMENT;
@@ -296,6 +329,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     uint32_t profile       = vol->sb.info.format_profile;
     uint32_t dev_type      = vol->sb.info.device_type_tag;
 
+   bool is_hdd = (dev_type == HN4_DEV_HDD) || 
+                  (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) ||
+                  (profile == HN4_PROFILE_ARCHIVE);
+
     switch (profile) {
         case HN4_PROFILE_PICO:
             depth_limit   = 1;
@@ -307,9 +344,9 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             break;
         case HN4_PROFILE_GAMING:
             if (hn4_le64_to_cpu(anchor.mass) < 65536) {
-                depth_limit = 1; /* RAM Disk Mode */
+                depth_limit = 1;
             }
-            retry_sleep = 10; /* Aggressive polling for Audio */
+            retry_sleep = 10;
             break;
         default:
             /* Device-specific overrides */
@@ -353,7 +390,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
         /* Determine target Orbit (k) from Anchor Hint (2 bits per cluster) */
         uint8_t  target_k   = 0;
-        uint64_t cluster_idx = block_idx >> 4;   /* 16 blocks per cluster */
+        uint64_t cluster_idx = block_idx >> 4;
 
         if (cluster_idx < 16) {
             uint32_t hints = hn4_le32_to_cpu(anchor.orbit_hints);
@@ -422,10 +459,11 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
         memset(out_buffer, 0, buffer_len);
         return HN4_INFO_SPARSE;
     }
-
-     if ((vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) && valid_candidates > 1) {
-        _sort_candidates_spatial(candidates, valid_candidates);
+    
+     if (is_hdd && valid_candidates > 1) {
+        _sort_candidates_mechanical(candidates, valid_candidates);
     }
+
 
     /* 5. The "Shotgun" Read Loop */
     void* io_buf = hn4_hal_mem_alloc(bs);
@@ -453,16 +491,29 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     #endif
 
         int max_retries = (vol->sb.info.hw_caps_flags & HN4_HW_NVM) ? 1 : 2;
-        int tries       = 0;
+        int tries = 0;
         hn4_result_t io_res;
 
+        /* THERMAL DECAY CALCULATION */
+        uint32_t current_retry_delay = retry_sleep;
+        
+        if (is_hdd) {
+
+            uint32_t health_score = atomic_load(&vol->health.taint_counter);
+            
+            #define HN4_HEALTH_THRESHOLD 50
+            if (health_score > HN4_HEALTH_THRESHOLD) {
+                int shift = (health_score - HN4_HEALTH_THRESHOLD) / 10;
+                if (shift > 6) shift = 6; /* Cap at 64x delay */
+                current_retry_delay <<= shift;
+                
+                /* Limit max sleep to 100ms to prevent timeout */
+                if (current_retry_delay > 100000) current_retry_delay = 100000;
+            }
+        }
+
         do {
-            /*
-             * L10 OPTIMIZATION: Partial Poison.
-             * Only poison the header/cache-line (64 bytes). The validation logic
-             * checks the first 64 bytes for the 0xCC signature to detect DMA ghosts.
-             * Wiping the payload (bs) is unnecessary bandwidth waste.
-             */
+
             memset(io_buf, 0xCC, 64);
 
             io_res = _hn4_spatial_router(
@@ -491,8 +542,14 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 }
             }
 
+            if (io_res != HN4_OK && is_hdd) {
+                if (io_res == HN4_ERR_HW_IO || io_res == HN4_ERR_ATOMICS_TIMEOUT) {
+                    atomic_fetch_add(&vol->health.taint_counter, 1);
+                }
+            }
+
             if (++tries < max_retries && io_res != HN4_OK) {
-                hn4_hal_micro_sleep(retry_sleep);
+                hn4_hal_micro_sleep(current_retry_delay);
             }
         } while (HN4_UNLIKELY(io_res != HN4_OK && tries < max_retries));
 
@@ -552,9 +609,29 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                  * - GAMING: Prefetch for asset streaming.
                  * - HYPER_CLOUD: Prefetch for database table scans / blob streaming.
                  */
-                bool is_hdd = (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL);
+               bool is_hdd = (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) || 
+                          (dev_type == HN4_DEV_HDD);
+            
+            bool is_streaming = (profile == HN4_PROFILE_GAMING || 
+                                 profile == HN4_PROFILE_HYPER_CLOUD);
 
-                if (is_hdd || profile == HN4_PROFILE_GAMING || profile == HN4_PROFILE_HYPER_CLOUD) {
+            if (is_hdd || is_streaming) {
+                uint32_t pf_len_sectors = 0;
+
+                if (is_hdd) {
+
+                    int shift = 0;
+                    uint32_t v = vol->vol_block_size;
+                    while (v >>= 1) shift++;
+
+                    if (shift >= 32) shift = 31;
+                    
+                    pf_len_sectors = _hdd_prefetch_lut[shift] * sectors;
+                } else {
+                    pf_len_sectors = sectors;
+                }
+
+                if (pf_len_sectors > 0) {
                     uint8_t next_k = 0;
                     uint64_t next_cluster = (block_idx + 1) >> 4;
                     
@@ -562,8 +639,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                         uint32_t h = hn4_le32_to_cpu(anchor.orbit_hints);
                         next_k = (h >> (next_cluster * 2)) & 0x3;
                     }
-                    
-                    /* Calculate next logical block */
+
                     uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, next_k);
                     
                     if (next_lba != HN4_LBA_INVALID && next_lba < max_blocks) {
@@ -574,13 +650,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                              hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
                          #endif
                          
-                         /* HDD OPTIMIZATION: Double the prefetch length (2048 sectors = 1MB) */
-                         uint32_t pf_len = is_hdd ? 2048 : 1024;
-
-                         /* Issue Non-Blocking Hint to Hardware */
-                         hn4_hal_prefetch(vol->target_device, pf_phys, pf_len);
+                         hn4_hal_prefetch(vol->target_device, pf_phys, pf_len_sectors);
                     }
                 }
+            }
 
                 break;
             } else {
@@ -593,7 +666,6 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             failed_mask |= (1U << i);
             deep_error = _merge_error(deep_error, io_res);
 
-            /* Telemetry Split */
             if (io_res == HN4_ERR_HEADER_ROT || io_res == HN4_ERR_PAYLOAD_ROT || io_res == HN4_ERR_DATA_ROT) {
                 atomic_fetch_add(&vol->health.crc_failures, 1);
             }

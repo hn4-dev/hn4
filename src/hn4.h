@@ -232,6 +232,7 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_HINT_ENCRYPTED      (1ULL << 20)
 #define HN4_HINT_BOOT           (1ULL << 21) /* Force allocation in Hot Zone (0-1GB) */
 #define HN4_FLAG_NANO           (1ULL << 22) /* Data resides in Cortex Slots */
+#define HN4_FLAG_EXTENDED       (1ULL << 23) /* Inline Buffer holds Ext LBA */
 
 /* Add to On-Disk Structures */
 #define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" - Magic for data slots */
@@ -639,6 +640,8 @@ typedef struct {
     /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
     void*               target_device;
     
+    uint8_t             _pad0[7];         /* Keep alignment */
+
     /* Superblock & Geometry */
     hn4_superblock_t    sb;
     uint64_t            sb_offsets_bytes[4]; 

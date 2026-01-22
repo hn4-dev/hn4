@@ -106,17 +106,20 @@ typedef struct {
 } hn4_orbit_target_t;
 
 static void _sort_orbits_spatial(hn4_orbit_target_t* targets, int count) {
-    /* Insertion sort for small N (max 12) is faster than qsort overhead */
-    for (int i = 1; i < count; i++) {
-        hn4_orbit_target_t key = targets[i];
-        int j = i - 1;
-        while (j >= 0 && targets[j].lba > key.lba) {
-            targets[j + 1] = targets[j];
-            j--;
+    static const int gaps[] = {4, 1, 0}; // Gaps for Shell Sort
+    
+    for (const int* g = gaps; *g > 0; ++g) {
+        for (int i = *g; i < count; i++) {
+            hn4_orbit_target_t temp = targets[i];
+            int j;
+            for (j = i; j >= *g && targets[j - *g].lba > temp.lba; j -= *g) {
+                targets[j] = targets[j - *g];
+            }
+            targets[j] = temp;
         }
-        targets[j + 1] = key;
     }
 }
+
 
 HN4_INLINE void _pack_header(hn4_block_header_t* h, hn4_u128_t id, 
                                 uint64_t seq, uint64_t gen, 

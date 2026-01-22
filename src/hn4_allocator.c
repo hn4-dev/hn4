@@ -1199,7 +1199,7 @@ _calc_trajectory_lba(
      * 2. ROTATIONAL: Must be sequential to avoid seek latency (Fragmentation).
      */
     uint64_t linear_mask = HN4_HW_ZNS_NATIVE | HN4_HW_ROTATIONAL;
-    
+
     if (vol->sb.info.hw_caps_flags & linear_mask) is_linear = true;
 
     if (!is_linear && !is_system) {
@@ -1345,6 +1345,31 @@ _get_ai_affinity_bias(
     }
     
     return false;
+}
+
+/* 
+ * BITMASK SCAN: HDD OPTIMIZATION
+ * Scans 64 blocks (1 Word) instantly using CPU intrinsics.
+ * Returns relative offset of free bit (0-63) or -1 if full.
+ */
+static int _scan_word_for_gap(hn4_volume_t* vol, uint64_t block_idx) {
+    uint64_t word_idx = block_idx / 64;
+    
+    /* 1. Bulk Load (Atomic 128-bit to get Data + ECC) */
+    hn4_aligned_u128_t raw = _hn4_load128(&vol->void_bitmap[word_idx]);
+    
+    /* 2. Fast Fail: If word is all 1s (Full), skip */
+    if (raw.lo == 0xFFFFFFFFFFFFFFFFULL) return -1;
+    
+    /* 3. ECC Validation (Amortized cost) */
+    uint64_t data;
+    if (_ecc_check_and_fix(vol, raw.lo, (uint8_t)(raw.hi & 0xFF), &data, NULL) != HN4_OK) return -1;
+    
+    /* 4. Bitmask Logic: Invert to find 0s */
+    uint64_t free_mask = ~data;
+    
+    /* 5. Intrinsic: Count Trailing Zeros */
+    return _hn4_ctz64(free_mask);
 }
 
 /* =========================================================================
@@ -1571,6 +1596,16 @@ hn4_alloc_genesis(
                     }
                     
                     uint64_t G = g_fractal * S;
+
+                    /* [OPTIMIZATION] HDD: Bitmask Gap Scanning (Stop thrashing) */
+                    if (vol->sb.info.device_type_tag == HN4_DEV_HDD) {
+                        int gap = _scan_word_for_gap(vol, G);
+                        if (gap != -1) {
+                            /* Align G to word boundary and add gap offset */
+                            uint64_t aligned_G = (G & ~63ULL) + gap;
+                            G = aligned_G; /* Snap to nearest hole */
+                        }
+                    }
 
                     /* 4b. Pick Orbit Vector (V) */
                     uint64_t V;

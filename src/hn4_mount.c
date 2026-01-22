@@ -2069,6 +2069,15 @@ hn4_result_t hn4_mount(
     
     vol->sb.info.volume_label[31] = '\0';
     vol->vol_block_size = vol->sb.info.block_size;
+    
+    /* Precompute Block Shift for Read Path Optimization */
+    {
+        uint32_t v = vol->vol_block_size;
+        uint8_t shift = 0;
+        while (v >>= 1) shift++;
+        vol->block_shift = shift;
+    }
+
     if (HN4_UNLIKELY(!_addr_to_u64_checked(vol->sb.info.total_capacity, &vol->vol_capacity_bytes))) {
         res = HN4_ERR_GEOMETRY;
         goto cleanup;
