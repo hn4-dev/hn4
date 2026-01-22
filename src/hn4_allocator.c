@@ -1193,8 +1193,14 @@ _calc_trajectory_lba(
     bool is_linear = _hn4_is_linear_lut[vol->sb.info.device_type_tag & 0x3];
     bool is_system = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
     
-    /* Explicit ZNS Hardware Check for safety */
-    if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) is_linear = true;
+    /* 
+     * HARDWARE OVERRIDE:
+     * 1. ZNS: Must be sequential to respect Write Pointer.
+     * 2. ROTATIONAL: Must be sequential to avoid seek latency (Fragmentation).
+     */
+    uint64_t linear_mask = HN4_HW_ZNS_NATIVE | HN4_HW_ROTATIONAL;
+    
+    if (vol->sb.info.hw_caps_flags & linear_mask) is_linear = true;
 
     if (!is_linear && !is_system) {
         if (HN4_UNLIKELY(phi < 32)) {
@@ -1511,6 +1517,15 @@ hn4_alloc_genesis(
                 uint8_t prof_p = _hn4_prof_policy[vol->sb.info.format_profile & 0x7];
                 uint8_t policy = dev_p | prof_p;
 
+                 /* 
+                 * Hardware Override: Rotational Media (HDD)
+                 * If the hardware reports spinning platters, force DEEP scan policy.
+                 * Local exhaustive search is cheaper than seeking to a new G.
+                 */
+                if (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) {
+                    policy |= HN4_POL_DEEP | HN4_POL_SEQ;
+                }
+
                 /* 
                  * Determine Vector Constraint.
                  * SSDs prefer ballistic scatter (V=Random). 
@@ -1519,7 +1534,7 @@ hn4_alloc_genesis(
                 bool force_sequential = (policy & HN4_POL_SEQ) || 
                                         (alloc_intent == HN4_ALLOC_CONTIGUOUS);
 
-                /*
+                 /*
                  * 4. THE PROBE LOOP
                  * High-latency media (HDD/Tape) requires exhaustive local search (128).
                  * Low-latency media (SSD/ZNS) fails fast to retry elsewhere (20).

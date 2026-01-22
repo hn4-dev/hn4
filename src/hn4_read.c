@@ -536,7 +536,9 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                  * - GAMING: Prefetch for asset streaming.
                  * - HYPER_CLOUD: Prefetch for database table scans / blob streaming.
                  */
-                if (profile == HN4_PROFILE_GAMING || profile == HN4_PROFILE_HYPER_CLOUD) {
+                bool is_hdd = (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL);
+
+                if (is_hdd || profile == HN4_PROFILE_GAMING || profile == HN4_PROFILE_HYPER_CLOUD) {
                     uint8_t next_k = 0;
                     uint64_t next_cluster = (block_idx + 1) >> 4;
                     
@@ -556,8 +558,11 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                              hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
                          #endif
                          
+                         /* HDD OPTIMIZATION: Double the prefetch length (2048 sectors = 1MB) */
+                         uint32_t pf_len = is_hdd ? 2048 : 1024;
+
                          /* Issue Non-Blocking Hint to Hardware */
-                         hn4_hal_prefetch(vol->target_device, pf_phys, sectors);
+                         hn4_hal_prefetch(vol->target_device, pf_phys, pf_len);
                     }
                 }
 

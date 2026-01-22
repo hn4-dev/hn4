@@ -42,18 +42,31 @@ typedef struct {
 } hn4_write_policy_t;
 
 /* 
- * Write Retry Policies per Profile
- * Index = Format Profile ID (0-7)
+ * Write Retry Policies per Profile & Device Physics
+ * Index = (Is_Rotational << 3) | Profile_ID
+ * Size = 16 (8 Profiles * 2 Device States)
  */
-static const hn4_write_policy_t _write_policy_lut[8] = {
-    /* [0] GENERIC */     { 1000, 2 }, /* Default */
-    /* [1] GAMING */      { 10,   5 }, /* Aggressive poll, try harder */
+static const hn4_write_policy_t _write_policy_lut[16] = {
+    /* --- SSD / SOLID STATE (Index 0-7) --- */
+    /* [0] GENERIC */     { 1000, 2 },
+    /* [1] GAMING */      { 10,   5 },
     /* [2] AI */          { 1000, 2 },
     /* [3] ARCHIVE */     { 1000, 2 },
     /* [4] PICO */        { 1000, 2 },
     /* [5] SYSTEM */      { 1000, 2 },
-    /* [6] USB */         { 5000, 3 }, /* High latency tolerance */
-    /* [7] HYPER_CLOUD */ { 1000, 2 }
+    /* [6] USB */         { 5000, 3 },
+    /* [7] HYPER_CLOUD */ { 1000, 2 },
+
+    /* --- HDD / ROTATIONAL (Index 8-15) --- */
+    /* Optimization: Enforce min 10ms sleep & 5 retries to handle seek latency */
+    /* [8] GENERIC */     { 10000, 5 },
+    /* [9] GAMING */      { 10000, 5 },
+    /* [10] AI */         { 10000, 5 },
+    /* [11] ARCHIVE */    { 10000, 5 },
+    /* [12] PICO */       { 10000, 5 },
+    /* [13] SYSTEM */     { 10000, 5 },
+    /* [14] USB */        { 10000, 5 },
+    /* [15] HYPER_CLOUD */{ 10000, 5 }
 };
 
 /*
@@ -877,11 +890,14 @@ retry_transaction:;
         }
     } else {
 
-        uint32_t p_idx = profile & 0x7;
-        uint32_t retry_sleep = _write_policy_lut[p_idx].retry_sleep_us;
-        int      max_retries = _write_policy_lut[p_idx].max_retries;
+    uint32_t is_rot = (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) ? 1 : 0;
+    
+    uint32_t idx = (is_rot << 3) | (profile & 0x7);
+    uint32_t retry_sleep = _write_policy_lut[idx].retry_sleep_us;
 
-        int tries = 0;
+    int max_retries = _write_policy_lut[idx].max_retries;
+    int tries = 0;
+
         do {
             io_res = _hn4_spatial_router(
                 vol, 

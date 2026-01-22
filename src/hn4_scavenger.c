@@ -250,16 +250,22 @@ static void _reaper_flush(hn4_hal_device_t* dev, _reaper_batch_t* batch, hn4_vol
             merged++;
         }
 
-        /* Issue Single IO for the Range */
+       /* Issue Single IO for the Range */
         bool is_zns = (caps->hw_flags & HN4_HW_ZNS_NATIVE);
+        bool is_hdd = (caps->hw_flags & HN4_HW_ROTATIONAL);
 
         if (batch->secure_shred && zero_buf) {
             for (uint32_t k = 0; k < merged; k++) {
                 hn4_addr_t target = hn4_addr_add(start, k * sectors_per_blk);
                 hn4_hal_sync_io(dev, HN4_IO_WRITE, target, zero_buf, sectors_per_blk);
             }
-        } else if (!is_zns) {
-            /* Standard Trim - Only for Conventional Block Devices */
+        } else if (!is_zns && !is_hdd) {
+            /* 
+             * Standard Trim:
+             * - ZNS: Reset handled by Evacuator.
+             * - HDD: Skip DISCARD to prevent firmware stalls/seek penalties.
+             * - SSD: Issue TRIM to maintain performance.
+             */
             hn4_hal_sync_io(dev, HN4_IO_DISCARD, start, NULL, sectors_per_blk * merged);
         }
         
@@ -1050,7 +1056,12 @@ static void _perform_leak_audit(hn4_volume_t* vol) {
 
     /* 1. Define Window */
     uint64_t start_lba = _audit_region_cursor / bs;
-    uint64_t end_lba   = (_audit_region_cursor + HN4_AUDIT_REGION_SIZE) / bs;
+    
+    /* Calculate end with overflow protection for the sum */
+    uint64_t next_cursor = _audit_region_cursor + HN4_AUDIT_REGION_SIZE;
+    if (next_cursor < _audit_region_cursor) next_cursor = UINT64_MAX; /* Saturate */
+    
+    uint64_t end_lba = next_cursor / bs;
     
     /* Clamp to capacity */
     uint64_t max_blocks = vol->vol_capacity_bytes / bs;
@@ -1058,9 +1069,18 @@ static void _perform_leak_audit(hn4_volume_t* vol) {
         _audit_region_cursor = 0; /* Reset for next pass */
         return;
     }
+    
+    /* Strict clamping: End cannot exceed Max, and End cannot be less than Start */
     if (end_lba > max_blocks) end_lba = max_blocks;
+    if (end_lba < start_lba) end_lba = start_lba; /* Prevent underflow */
 
     uint64_t window_blocks = end_lba - start_lba;
+    
+    /* Optimization: If window is empty, advance and return immediately */
+    if (window_blocks == 0) {
+        _audit_region_cursor += HN4_AUDIT_REGION_SIZE;
+        return;
+    }
     
     /* 2. Shadow Bitmap Allocation (1 bit per block in window) */
     size_t shadow_sz = (window_blocks + 7) / 8;
