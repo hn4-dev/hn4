@@ -156,7 +156,9 @@ static hn4_result_t _validate_sb_integrity(HN4_IN const void* buffer)
     if (HN4_UNLIKELY(hn4_le64_to_cpu(sb->info.magic) != HN4_MAGIC_SB)) {
         return HN4_ERR_BAD_SUPERBLOCK;
     }
-
+    if (HN4_UNLIKELY(hn4_le64_to_cpu(sb->info.magic_tail) != HN4_MAGIC_TAIL)) {
+        return HN4_ERR_BAD_SUPERBLOCK;
+    }
     /* 
      * 3. Security Check: Zero UUID
      * A zeroed UUID implies a formatting error or a blank template.
@@ -249,7 +251,7 @@ static hn4_result_t _read_sb_at_lba(
     if (out_sb->info.block_size % dev_sector_size != 0) {
         HN4_LOG_CRIT("Geometry Mismatch: FS_BS %u %% PHY_SS %u != 0", 
                      out_sb->info.block_size, dev_sector_size);
-        return HN4_ERR_GEOMETRY;
+        return HN4_ERR_ALIGNMENT_FAIL; 
     }
 
     return HN4_OK;
@@ -428,9 +430,13 @@ static hn4_result_t _execute_cardinal_vote(
             
             current_buf_sz = required_sz;
             probe_buf = hn4_hal_mem_alloc(current_buf_sz);
-            heal_buf = hn4_hal_mem_alloc(current_buf_sz);
+            if (probe_buf) {
+                heal_buf = hn4_hal_mem_alloc(current_buf_sz);
+            }
             
+            /* FIX: Ensure we don't leak probe_buf if heal_buf fails */
             if (!probe_buf || !heal_buf) {
+                /* Cleanup handles freeing whatever is non-NULL */
                 final_res = HN4_ERR_NOMEM;
                 goto cleanup;
             }
@@ -586,11 +592,8 @@ static hn4_result_t _execute_cardinal_vote(
             dsb->raw.sb_crc = hn4_cpu_to_le32(crc);
 
             uint64_t targets[4];
-            targets[0] = 0;
-            targets[1] = HN4_ALIGN_UP((cap_bytes / 100) * 33, bs) / bs;
-            targets[2] = HN4_ALIGN_UP((cap_bytes / 100) * 66, bs) / bs;
-            uint64_t s_off = _calc_south_offset(cap_bytes, bs);
-            targets[3] = (s_off == HN4_OFFSET_INVALID) ? HN4_OFFSET_INVALID : (s_off / bs);
+            
+            _calc_cardinal_targets(caps->total_capacity_bytes, bs, targets);
 
             for (int i = 0; i < 4; i++) {
 
@@ -622,6 +625,15 @@ static hn4_result_t _execute_cardinal_vote(
 
                 if (needs_heal) {
                     uint32_t secs = io_sz / sector_sz;
+                    
+                    if ((caps->hw_flags & HN4_HW_ZNS_NATIVE)) {
+                        if (hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, 0) != HN4_OK) {
+                            heal_failures++;
+                            continue; /* Cannot write if reset fails */
+                        }
+                        hn4_hal_barrier(dev);
+                    }
+
                     if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, heal_buf, secs) != HN4_OK) {
                         heal_failures++;
                     } else {
@@ -640,7 +652,6 @@ static hn4_result_t _execute_cardinal_vote(
                             }
                             hn4_hal_mem_free(verify_buf);
                         } else {
-                            /* Non-fatal allocation failure */
                             HN4_LOG_WARN("Could not allocate verify buffer. Skipping read-back.");
                         }
                     }
@@ -655,9 +666,6 @@ cleanup:
     if (heal_buf) hn4_hal_mem_free(heal_buf);
     return final_res;
 }
-
-
-
 
 /* =========================================================================
  * 4. ATOMIC STATE TRANSITION (DIRTY MARKING)
@@ -677,14 +685,15 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     uint32_t old_taint = vol->health.taint_counter; 
 
     if ((dirty_sb.info.state_flags & HN4_VOL_CLEAN) && (dirty_sb.info.state_flags & HN4_VOL_DIRTY)) {
-        return HN4_ERR_INTERNAL_FAULT;
+        return HN4_ERR_BAD_SUPERBLOCK;
     }
 
     if (dirty_sb.info.copy_generation >= HN4_MAX_GENERATION) return HN4_ERR_EEXIST;
 
+    if (dirty_sb.info.state_flags & HN4_VOL_CLEAN) dirty_sb.info.copy_generation++;
+
     dirty_sb.info.state_flags |= HN4_VOL_DIRTY;
     dirty_sb.info.state_flags &= ~HN4_VOL_CLEAN;
-    dirty_sb.info.copy_generation++;
     dirty_sb.info.last_mount_time = hn4_hal_get_time_ns();
 
     if (vol->health.taint_counter > 0) dirty_sb.info.dirty_bits |= HN4_DIRTY_BIT_TAINT;
@@ -838,6 +847,10 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
     }
 
      hn4_hal_mem_free(io_buf);
+
+    if (original_sb.info.state_flags & HN4_VOL_CLEAN) {
+        atomic_fetch_and(&vol->health.taint_counter, vol->health.taint_counter / 2);
+    }
 
     vol->sb = dirty_sb;
     return HN4_OK;
@@ -1099,8 +1112,22 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
         if (regions[i] > (UINT64_MAX / ss)) return HN4_ERR_GEOMETRY;
         
         /* Check if Region Start >= Capacity */
+       /* Check if Region Start >= Capacity */
         if ((regions[i] * ss) >= cap_bytes) return HN4_ERR_GEOMETRY;
 #endif
+    }
+
+#ifdef HN4_USE_128BIT
+    if (hn4_u128_cmp(sb->info.lba_epoch_start, sb->info.lba_cortex_start) >= 0 ||
+        hn4_u128_cmp(sb->info.lba_cortex_start, sb->info.lba_bitmap_start) >= 0 ||
+        hn4_u128_cmp(sb->info.lba_bitmap_start, sb->info.lba_qmask_start) >= 0)
+#else
+    if (sb->info.lba_epoch_start >= sb->info.lba_cortex_start ||
+        sb->info.lba_cortex_start >= sb->info.lba_bitmap_start ||
+        sb->info.lba_bitmap_start >= sb->info.lba_qmask_start)
+#endif
+    {
+         return HN4_ERR_GEOMETRY;
     }
 
     return HN4_OK;
@@ -2000,6 +2027,19 @@ hn4_result_t hn4_mount(
     res = _execute_cardinal_vote(dev, !force_ro, &vol->sb);
     if (HN4_UNLIKELY(res != HN4_OK)) goto cleanup;
 
+    if (vol->sb.info.dirty_bits & HN4_DIRTY_BIT_TAINT) {
+        if (vol->health.taint_counter == 0) {
+            vol->health.taint_counter = 1;
+        }
+    }
+
+    if (vol->sb.info.copy_generation >= HN4_MAX_GENERATION) {
+        if (!force_ro && !(params && (params->mount_flags & HN4_MNT_READ_ONLY))) {
+             res = HN4_ERR_VOLUME_LOCKED;
+             goto cleanup;
+        }
+    }
+
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
 
      if (params) {
@@ -2026,7 +2066,8 @@ hn4_result_t hn4_mount(
         HN4_LOG_CRIT("Mount Rejected: Invalid Geometry/Layout in Superblock");
         goto cleanup;
     }
-
+    
+    vol->sb.info.volume_label[31] = '\0';
     vol->vol_block_size = vol->sb.info.block_size;
     if (HN4_UNLIKELY(!_addr_to_u64_checked(vol->sb.info.total_capacity, &vol->vol_capacity_bytes))) {
         res = HN4_ERR_GEOMETRY;

@@ -800,7 +800,9 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     if (pid == HN4_PROFILE_PICO && capacity_bytes < 100 * HN4_SZ_MB) {
         cortex_sz = (capacity_bytes / 100) * 1; 
     }
-    if (cortex_sz < 65536) cortex_sz = 65536;
+
+    if (cortex_sz < 65536) cortex_sz = 65536; /* Hard floor */
+
     cortex_sz = HN4_ALIGN_UP(cortex_sz, bs);
     
     /* Use from_sectors */

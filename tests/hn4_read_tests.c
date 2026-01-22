@@ -93,7 +93,7 @@ static hn4_hal_device_t* read_fixture_setup(void) {
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
     sb.info.copy_generation = 1;
     sb.info.current_epoch_id = 1;
-    
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
     sb.info.volume_uuid.lo = 0x1122334455667788;
     sb.info.volume_uuid.hi = 0x8877665544332211;
 

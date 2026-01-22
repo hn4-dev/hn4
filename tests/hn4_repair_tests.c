@@ -71,7 +71,7 @@ static hn4_hal_device_t* repair_setup(void) {
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
     sb.info.volume_uuid.lo = 0x1;
     sb.info.current_epoch_id = 1;
-    
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
 #ifdef HN4_USE_128BIT
     sb.info.total_capacity.lo = REP_FIXTURE_SIZE;
 #else

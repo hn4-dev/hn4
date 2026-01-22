@@ -118,6 +118,7 @@ static hn4_hal_device_t* write_fixture_setup(void) {
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
     sb.info.copy_generation = 100;
     sb.info.current_epoch_id = 500;
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
     
     /* Layout Calculation */
     uint64_t epoch_start_sector = 16; 
@@ -12020,7 +12021,6 @@ hn4_TEST(Collision, Tombstone_Reuse_Safety) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
-
 
 /* =========================================================================
  * TEST: Integration_Persistence_Undelete_Impossible

@@ -80,6 +80,7 @@ static hn4_hal_device_t* compress_setup(void) {
     sb.info.block_size = CMP_BLOCK_SIZE;
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
     sb.info.format_profile = HN4_PROFILE_ARCHIVE;
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
     sb.info.volume_uuid.lo = 0x2;
     sb.info.current_epoch_id = 1;
     

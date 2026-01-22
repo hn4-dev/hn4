@@ -66,6 +66,7 @@ static hn4_hal_device_t* zfs_resilience_setup(void) {
     sb.info.magic = HN4_MAGIC_SB;
     sb.info.version = 0x00060006;
     sb.info.block_size = RES_BLOCK_SIZE;
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;
     sb.info.volume_uuid.lo = 0xBADF00D;
     sb.info.current_epoch_id = 1;

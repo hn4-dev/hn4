@@ -64,6 +64,7 @@ static hn4_hal_device_t* resilience_setup(void) {
     /* Standard Layout */
     hn4_superblock_t sb = {0};
     sb.info.magic = HN4_MAGIC_SB;
+    sb.info.magic_tail = HN4_MAGIC_TAIL;
     sb.info.version = 0x00060006;
     sb.info.block_size = RES_BLOCK_SIZE;
     sb.info.state_flags = HN4_VOL_CLEAN | HN4_VOL_METADATA_ZEROED;

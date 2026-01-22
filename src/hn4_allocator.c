@@ -76,28 +76,6 @@ static const uint8_t _hn4_prof_policy[8] = {
  * 1. HARDENED ATOMICS (NO EXTERNAL LIBS)
  * ========================================================================= */
 
-/* ========================================================================
- *  hn4_cas128
- *
- *  Atomically:
- *      if (*dst == *expected) {
- *          *dst = desired;
- *          return true;
- *      } else {
- *          *expected = *dst;
- *          return false;
- *      }
- *
- *  REQUIREMENTS:
- *      - dst MUST be 16-byte aligned
- *      - CPU must support 128-bit CAS
- *
- *  MEMORY ORDER:
- *      x86  : full barrier (LOCK cmpxchg16b)
- *      ARM  : Acquire+Release via CASPAL
- *
- * ======================================================================== */
-
 HN4_INLINE bool
 _hn4_cas128(volatile void *dst,
             hn4_aligned_u128_t  *expected,

@@ -157,7 +157,6 @@ static hn4_result_t _broadcast_superblock(
     for (int i = 0; i < SB_LOC_MAX; i++) {
         if (i == SB_LOC_SOUTH && !attempt_south) continue;
         
-        /* Skip invalid targets */
         if (targets[i] == HN4_OFFSET_INVALID) { slot_ok[i] = false; continue; }
 
         hn4_addr_t phys_lba;
@@ -166,9 +165,13 @@ static hn4_result_t _broadcast_superblock(
         uint64_t sec_per_blk = bs / ss;
         phys_lba = hn4_u128_mul_u64(blk_128, sec_per_blk);
     #else
-        phys_lba = targets[i] * (bs / ss);
+        uint64_t sec_per_blk = bs / ss;
+        if (targets[i] > (UINT64_MAX / sec_per_blk)) {
+            slot_ok[i] = false; 
+            continue; 
+        }
+        phys_lba = targets[i] * sec_per_blk;
     #endif
-
         if ((caps->hw_flags & HN4_HW_ZNS_NATIVE)) {
             if (i > SB_LOC_NORTH) { slot_ok[i] = false; continue; }
             hn4_result_t z_res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, phys_lba, NULL, 0);
@@ -339,11 +342,12 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                             persistence_ok = false;
                             final_res = HN4_ERR_HW_IO;
                         }
+                        
+                        if ((cursor % 512) == 0) hn4_hal_barrier(dev);
 
                         start_lba_val += sectors;
-                    }
                 }
-
+            }
                 /* B. Quality Mask Persistence */
 
                 if (persistence_ok && vol->void_bitmap) {
@@ -378,6 +382,7 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                 }
 
                 hn4_hal_mem_free(meta_buf);
+                meta_buf = NULL;
 
                 /* Metadata Barrier */
                 if (persistence_ok) {
@@ -453,19 +458,10 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                 vol->health.taint_counter++;
                 hn4_hal_barrier(dev);
 
-                 /* 
-                 * We manually increment the generation in the volume structure to 
-                 * supersede the "Clean" SB we just tried to write.
-                 * Then we call broadcast with bump_generation = false.
-                 */
-                if (vol->sb.info.copy_generation < HN4_MAX_GENERATION) {
-                    vol->sb.info.copy_generation++;
-                }
-
                 _broadcast_superblock(dev, vol, active_epoch, active_ring_ptr_blk, 
                     false, /* set_clean */
                     true,  /* force_degraded */
-                    true   /* bump_generation: YES (Write N+2) */);
+                    true   /* bump_generation: YES (Write N+1) */);
                 final_res = tmp_res;
             }
         }
@@ -495,11 +491,14 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
         size_t topo_sz = vol->topo_count * sizeof(*vol->topo_map);
         _safe_release_mem((void**)&vol->topo_map, topo_sz, false);
 
+        int status_code = (int)final_res;
+        
         if (should_zero) _secure_zero(vol, sizeof(hn4_volume_t));
         hn4_hal_mem_free(vol);
+        
+        /* Safe logging using local stack variable */
+        HN4_LOG_FMT("Unmount Complete. Status: %d\n", status_code);
     }
-
-    HN4_LOG_FMT("Unmount Complete. Status: %d\n", (int)final_res);
     return final_res;
 }
 
