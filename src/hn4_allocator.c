@@ -182,11 +182,6 @@ _hn4_cas128(volatile void *dst,
 #else
     /* 
      * Provides binary compatibility for 32-bit/Embedded targets (Pico).
-     *
-     * WARNING: SCALABILITY HAZARD
-     * This serializes ALL allocations globally. 
-     * Acceptable ONLY for HN4_PROFILE_PICO or single-core recovery tools.
-     */
     static atomic_flag _hn4_global_cas_lock = ATOMIC_FLAG_INIT;
     
     /* Spin-Wait */
@@ -199,13 +194,11 @@ _hn4_cas128(volatile void *dst,
     bool success = false;
     uint64_t* mem = (uint64_t*)dst;
     
-    /* Critical Section */
     if (mem[0] == expected->lo && mem[1] == expected->hi) {
         mem[0] = desired.lo;
         mem[1] = desired.hi;
         success = true;
     } else {
-        /* CAS Failure: Update expected */
         expected->lo = mem[0];
         expected->hi = mem[1];
     }
@@ -310,10 +303,10 @@ HN4_INLINE hn4_aligned_u128_t  _hn4_load128(volatile void* src) {
      * Dirty Read: Get an initial guess to seed the CAS loop. 
      */
     #ifdef HN4_STRICT_READ_ONLY
-    /* Tearing-Tolerant Load (Pure Read) */
-    /* Reads loop until two consecutive snapshots match */
+
     uint64_t t_lo, t_hi;
-    do {
+
+   do {
         res_lo = *(volatile uint64_t*)src;
         res_hi = *(((volatile uint64_t*)src) + 1);
         
@@ -480,114 +473,104 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
  * _check_saturation
  * 
  * Determines if the volume has entered the "Event Horizon" state (Saturation).
-  */
-bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
-    if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
-    
-    uint64_t used = atomic_load_explicit(&vol->alloc.used_blocks, memory_order_acquire);
-    uint64_t cap_blocks;
-    uint64_t limit_genesis; // 90%
-    uint64_t limit_update;  // 95%
-    uint64_t limit_recover; // 85%
+ */
+ bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
+    uint64_t l_gen = vol->alloc.limit_genesis;
+    uint64_t l_upd = vol->alloc.limit_update;
+    uint64_t l_rec = vol->alloc.limit_recover;
+
+    if (HN4_UNLIKELY(l_upd == 0)) {
+        if (HN4_UNLIKELY(vol->vol_block_size == 0)) return true;
 
 #ifdef HN4_USE_128BIT
-    hn4_u128_t cap_128 = vol->vol_capacity_bytes;
-    hn4_u128_t blocks_128;
+        hn4_u128_t cap_128 = vol->vol_capacity_bytes;
+        hn4_u128_t blocks_128;
 
-    /* 
-     * PICO SAFETY CLAMP:
-     * If Profile is PICO, strictly cap effective capacity to 2GB (MS-DOS Limit).
-     */
-    if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
-        #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
-        if (cap_128.hi > 0 || cap_128.lo > HN4_PICO_HARD_LIMIT) {
-            cap_128.hi = 0;
-            cap_128.lo = HN4_PICO_HARD_LIMIT;
+        if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
+            #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
+            if (cap_128.hi > 0 || cap_128.lo > HN4_PICO_HARD_LIMIT) {
+                cap_128.hi = 0;
+                cap_128.lo = HN4_PICO_HARD_LIMIT;
+            }
         }
-    }
 
-    if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
-        if (vol->vol_block_size == 1) {
-             blocks_128 = cap_128; /* Shift is 0 */
+        if ((vol->vol_block_size & (vol->vol_block_size - 1)) == 0) {
+            if (vol->vol_block_size == 1) {
+                 blocks_128 = cap_128;
+            } else {
+                int shift = _hn4_ctz64(vol->vol_block_size);
+                if (shift >= 64) {
+                    blocks_128.lo = (cap_128.hi >> (shift - 64));
+                    blocks_128.hi = 0;
+                } else {
+                    blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
+                    blocks_128.hi = (cap_128.hi >> shift);
+                }
+            }
         } else {
-            int shift = __builtin_ctz(vol->vol_block_size);
-            
-            /* Safe shift logic */
-            blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
-            blocks_128.hi = (cap_128.hi >> shift);
+            blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
         }
-    } else {
-        blocks_128 = hn4_u128_div_u64(cap_128, vol->vol_block_size);
-    }
-    
-    hn4_u128_t lim_gen_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_GENESIS), 100);
-    hn4_u128_t lim_upd_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_UPDATE), 100);
-    hn4_u128_t lim_rec_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, (HN4_SATURATION_GENESIS - 5)), 100);
+        
+        hn4_u128_t lim_gen_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_GENESIS), 100);
+        hn4_u128_t lim_upd_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, HN4_SATURATION_UPDATE), 100);
+        hn4_u128_t lim_rec_128 = hn4_u128_div_u64(hn4_u128_mul_u64(blocks_128, (HN4_SATURATION_GENESIS - 5)), 100);
 
-    /* 
-     * Comparison logic: Used blocks (u64) vs Limit (u128). 
-     * If limit > u64 max, we are definitely not saturated by a u64 counter.
-     */
-    if (lim_gen_128.hi > 0) limit_genesis = UINT64_MAX; else limit_genesis = lim_gen_128.lo;
-    if (lim_upd_128.hi > 0) limit_update  = UINT64_MAX; else limit_update  = lim_upd_128.lo;
-    if (lim_rec_128.hi > 0) limit_recover = UINT64_MAX; else limit_recover = lim_rec_128.lo;
+        l_gen = (lim_gen_128.hi > 0) ? UINT64_MAX : lim_gen_128.lo;
+        l_upd = (lim_upd_128.hi > 0) ? UINT64_MAX : lim_upd_128.lo;
+        l_rec = (lim_rec_128.hi > 0) ? UINT64_MAX : lim_rec_128.lo;
 
 #else
-    uint64_t cap_64 = vol->vol_capacity_bytes;
-    
-    /* 
-     * PICO SAFETY CLAMP:
-     * If Profile is PICO, strictly cap effective capacity to 2GB (MS-DOS Limit).
-     */
-    if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
-        #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
-        if (cap_64 > HN4_PICO_HARD_LIMIT) {
-            cap_64 = HN4_PICO_HARD_LIMIT;
+        uint64_t cap_64 = vol->vol_capacity_bytes;
+        
+        if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
+            #define HN4_PICO_HARD_LIMIT (2ULL * 1024 * 1024 * 1024)
+            if (cap_64 > HN4_PICO_HARD_LIMIT) {
+                cap_64 = HN4_PICO_HARD_LIMIT;
+            }
         }
-    }
 
-    cap_blocks = cap_64 / vol->vol_block_size;
-    if (cap_blocks == 0) return true;
-    
-    if (cap_blocks <= (UINT64_MAX / HN4_SATURATION_UPDATE)) {
-        limit_genesis = (cap_blocks * HN4_SATURATION_GENESIS) / 100;
-        limit_update  = (cap_blocks * HN4_SATURATION_UPDATE) / 100;
-        limit_recover = (cap_blocks * (HN4_SATURATION_GENESIS - 5)) / 100;
-    } else {
-        limit_genesis = (cap_blocks / 100) * HN4_SATURATION_GENESIS;
-        limit_update  = (cap_blocks / 100) * HN4_SATURATION_UPDATE;
-        limit_recover = (cap_blocks / 100) * (HN4_SATURATION_GENESIS - 5);
-    }
+        uint64_t cap_blocks = cap_64 / vol->vol_block_size;
+        
+        if (cap_blocks <= (UINT64_MAX / HN4_SATURATION_UPDATE)) {
+            l_gen = (cap_blocks * HN4_SATURATION_GENESIS) / 100;
+            l_upd = (cap_blocks * HN4_SATURATION_UPDATE) / 100;
+            l_rec = (cap_blocks * (HN4_SATURATION_GENESIS - 5)) / 100;
+        } else {
+            l_gen = (cap_blocks / 100) * HN4_SATURATION_GENESIS;
+            l_upd = (cap_blocks / 100) * HN4_SATURATION_UPDATE;
+            l_rec = (cap_blocks / 100) * (HN4_SATURATION_GENESIS - 5);
+        }
 #endif
+        /* Atomic Commit to Cache (Struct fields updated here) */
+        vol->alloc.limit_genesis = l_gen;
+        vol->alloc.limit_update  = l_upd;
+        vol->alloc.limit_recover = l_rec;
+    }
 
-    /* 1. Update Global State Flags (Side Effect) */
+    uint64_t used = atomic_load_explicit(&vol->alloc.used_blocks, memory_order_relaxed);
+    
     uint32_t flags = atomic_load_explicit(&vol->sb.info.state_flags, memory_order_relaxed);
     bool flag_set = (flags & HN4_VOL_RUNTIME_SATURATED) != 0;
 
-    if (used >= limit_genesis) {
+    if (used >= l_gen) {
         if (!flag_set) {
             atomic_fetch_or_explicit(&vol->sb.info.state_flags, 
                                      HN4_VOL_RUNTIME_SATURATED, 
-                                     memory_order_seq_cst);
+                                     memory_order_relaxed);
             flag_set = true;
         }
-    } else if (used < limit_recover) {
+    } else if (used < l_rec) {
         if (flag_set) {
             atomic_fetch_and_explicit(&vol->sb.info.state_flags, 
                                       ~HN4_VOL_RUNTIME_SATURATED, 
-                                      memory_order_seq_cst);
+                                      memory_order_relaxed);
             flag_set = false;
         }
     }
 
-    /* 2. Return Decision based on Intent */
-    if (is_genesis) {
-        /* New files blocked if Saturated (Flag Set) OR > 90% */
-        return (used >= limit_genesis) || flag_set;
-    } else {
-        /* Updates blocked only if > 95% (Hard Wall) */
-        return (used >= limit_update);
-    }
+    if (is_genesis) return flag_set || (used >= l_gen);
+
+    return (used >= l_upd);
 }
 
  /* 
@@ -596,9 +579,7 @@ bool _check_saturation(HN4_IN hn4_volume_t* vol, bool is_genesis) {
  * Cols: Quality Bits (00=Toxic, 01=Bronze, 10=Silver, 11=Gold)
  */
 static const hn4_result_t _quality_verdict_lut[2][4] = {
-    /* Relaxed (Data) */
     { HN4_ERR_MEDIA_TOXIC, HN4_OK,              HN4_OK, HN4_OK },
-    /* Strict (Meta)  */
     { HN4_ERR_MEDIA_TOXIC, HN4_ERR_MEDIA_TOXIC, HN4_OK, HN4_OK }
 };
 
@@ -612,9 +593,7 @@ hn4_result_t _check_quality_compliance(hn4_volume_t* vol, uint64_t lba, uint8_t 
     }
 
     uint32_t shift = (lba % 32) * 2;
-    /* Atomic load for consistency */
     uint64_t q_word = atomic_load_explicit((_Atomic uint64_t*)&vol->quality_mask[word_idx], memory_order_relaxed);
-    
     uint8_t q_val = (q_word >> shift) & 0x3;
 
     /* 
@@ -660,8 +639,6 @@ HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
 /* =========================================================================
  * 4. SECDED LOGIC
  * ========================================================================= */
-
- 
 
 /*
  * _calc_nano_trajectory
@@ -711,70 +688,50 @@ HN4_INLINE uint64_t _mul_mod_safe(uint64_t a, uint64_t b, uint64_t m) {
 }
 
 static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool is_set) {
+    uint64_t l2_idx      = block_idx >> 9;          /* block_idx / 512 */
+    uint64_t l2_word_idx = l2_idx >> 6;             /* l2_idx / 64 */
+    uint64_t l2_mask     = 1ULL << (l2_idx & 63);   /* l2_idx % 64 */
 
     /* =========================================================================
-     * PATH A: ALLOCATION (The Hot Path)
+     * PATH A: ALLOCATION (Hot Path)
      * ========================================================================= */
-    if (is_set) {
-        /* 
-         * SCALING OPTIMIZATION:
-         * Use relaxed ordering for the global counter. Strict consistency is not 
-         * required for space accounting; eventual consistency suffices.
-         * This prevents global bus locking during high-IOPS write storms.
-         */
+    if (HN4_LIKELY(is_set)) {
+
         atomic_fetch_add_explicit(&vol->alloc.used_blocks, 1, memory_order_relaxed);
 
         if (vol->locking.l2_summary_bitmap) {
-             uint64_t l2_idx  = block_idx / HN4_L2_COVERAGE_BITS;
-             uint64_t l2_word = l2_idx / 64;
-             uint64_t l2_mask = (1ULL << (l2_idx % 64));
-             
-             _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word];
-
-             /* 
-              * CACHE OPTIMIZATION (Read-For-Ownership Avoidance):
-              * Check if the bit is already set before issuing an atomic write.
-              * If the region is already "dirty", we avoid invalidating the cache 
-              * line for other cores sharing this L2 word.
-              */
+             _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word_idx];
              uint64_t curr = atomic_load_explicit(l2_ptr, memory_order_relaxed);
              if (!(curr & l2_mask)) {
-                 /* Upgrade to Release to ensure data visibility before marking present */
                  atomic_fetch_or_explicit(l2_ptr, l2_mask, memory_order_release);
              }
         }
     } 
     /* =========================================================================
-     * PATH B: DEALLOCATION (The Heavy Path)
+     * PATH B: DEALLOCATION (Heavy Path)
      * ========================================================================= */
     else {
 
-        uint64_t current = atomic_load(&vol->alloc.used_blocks);
-        do {
-            if (HN4_UNLIKELY(current == 0)) {
-                atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
-                HN4_LOG_ERR("Allocator Underflow! Used=0 but freeing block %llu.", (unsigned long long)block_idx);
-                return;
-            }
-        } while (!atomic_compare_exchange_weak(&vol->alloc.used_blocks, &current, current - 1));
+        uint64_t prev = atomic_fetch_sub_explicit(&vol->alloc.used_blocks, 1, memory_order_relaxed);
         
-        /* Update L2 Summary */
+        if (HN4_UNLIKELY(prev == 0)) {
+            /* Restore and log error - extremely rare slow path */
+            atomic_fetch_add_explicit(&vol->alloc.used_blocks, 1, memory_order_relaxed);
+            atomic_fetch_or(&vol->sb.info.state_flags, HN4_VOL_DIRTY);
+            HN4_LOG_ERR("Allocator Underflow! Used=0 but freeing block %llu.", (unsigned long long)block_idx);
+            return; 
+        }
+        
         if (vol->locking.l2_summary_bitmap) {
-            /* 
-             * SYSTEM PROFILE LOCKING:
-             * For OS Root volumes, we enforce strict serialization to prevent
-             * any possibility of "Ghost Free" regions during boot/update.
-             */
             bool use_lock = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
             if (use_lock) hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
 
-            uint64_t word_idx = block_idx / 64;
-            uint64_t start_w = (word_idx / 8) * 8; 
-            size_t total_words = vol->bitmap_size / sizeof(hn4_armored_word_t);
+            uint64_t word_idx = block_idx >> 6;
+            uint64_t start_w  = word_idx & ~7ULL; 
+            size_t total_words = vol->bitmap_size >> 4;
 
             bool region_empty = true;
             for (int i = 0; i < 8; i++) {
-
                 if ((start_w + i) >= total_words) break;
                 if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
                     memory_order_relaxed) != 0) {
@@ -783,48 +740,25 @@ static void _update_counters_and_l2(hn4_volume_t* vol, uint64_t block_idx, bool 
                 }
             }
 
-            /* 
-             * STRICT ORDERING: 
-             * 1. Scan L1 (Verify Empty).
-             * 2. If Empty -> Clear L2.
-             * 3. Re-Verify L1 (Race Check).
-             * 4. If Dirty -> Set L2.
-             */
             if (region_empty) {
-                uint64_t l2_idx = block_idx / HN4_L2_COVERAGE_BITS;
-                uint64_t l2_word_idx = l2_idx / 64;
-                uint64_t l2_mask = (1ULL << (l2_idx % 64));
                 _Atomic uint64_t* l2_ptr = (_Atomic uint64_t*)&vol->locking.l2_summary_bitmap[l2_word_idx];
 
+                atomic_fetch_and_explicit(l2_ptr, ~l2_mask, memory_order_release);
 
-                uint64_t old_val = atomic_load_explicit(l2_ptr, memory_order_relaxed);
-
-                while (old_val & l2_mask) {
-                    if (atomic_compare_exchange_weak_explicit(l2_ptr, &old_val, old_val & ~l2_mask,
-                                                              memory_order_release, memory_order_relaxed)) {
-                        break;
-                    }
-                }
-                
                 atomic_thread_fence(memory_order_seq_cst);
-                
+
                 bool oops_dirty = false;
                 for (int i = 0; i < 8; i++) {
+                    if ((start_w + i) >= total_words) break;
                     if (atomic_load_explicit((_Atomic uint64_t*)&vol->void_bitmap[start_w + i].data, 
                         memory_order_relaxed) != 0) {
                         oops_dirty = true;
                         break;
                     }
                 }
-                
-                if (oops_dirty) {
-                    uint64_t r_old = atomic_load_explicit(l2_ptr, memory_order_relaxed);
-                    while (!(r_old & l2_mask)) {
-                         if (atomic_compare_exchange_weak_explicit(l2_ptr, &r_old, r_old | l2_mask,
-                                                                   memory_order_relaxed, memory_order_relaxed)) {
-                             break;
-                         }
-                    }
+
+                if (HN4_UNLIKELY(oops_dirty)) {
+                    atomic_fetch_or_explicit(l2_ptr, l2_mask, memory_order_relaxed);
                 }
             }
 
@@ -978,7 +912,6 @@ hn4_result_t _bitmap_op(
 
     volatile void* target_addr = &vol->void_bitmap[word_idx];
 
-    /* 2. Atomic Loop State */
     hn4_aligned_u128_t  expected, desired;
     bool success = false;
     bool logic_change = false;      
@@ -1049,9 +982,9 @@ hn4_result_t _bitmap_op(
                 if (out_result) *out_result = false;
                 return HN4_OK;
             }
-            /* ECC Error found during No-Op -> Write back corrected data */
+
             desired.lo = safe_data;
-            is_healing_write = true; /* Mark as healing */
+            is_healing_write = true;
         } 
         else {
             desired.lo = (op == BIT_SET) ? (safe_data | bit_mask) : (safe_data & ~bit_mask);
@@ -1184,11 +1117,9 @@ _calc_trajectory_lba(
      uint64_t total_blocks;
 
 #ifdef HN4_USE_128BIT
-    /* Use primitive division for 128-bit capacity */
     hn4_u128_t cap_128 = vol->vol_capacity_bytes;
     hn4_u128_t blocks_128 = hn4_u128_div_u64(cap_128, bs);
     
-    /* Trajectory math uses 64-bit indices. If capacity > 18EB (2^64 blocks), we clamp. */
     if (HN4_UNLIKELY(blocks_128.hi > 0)) total_blocks = UINT64_MAX;
     else total_blocks = blocks_128.lo;
 #else
@@ -1213,7 +1144,6 @@ _calc_trajectory_lba(
         return HN4_LBA_INVALID;
     }
 
-    /* Phi is the size of the available addressing window */
     uint64_t available_blocks = total_blocks - flux_aligned_blk;
     uint64_t phi              = available_blocks / S;
     
@@ -1239,11 +1169,8 @@ _calc_trajectory_lba(
     uint64_t g_aligned   = G & ~(S - 1);
     uint64_t g_fractal   = g_aligned / S;
     uint64_t entropy_loss = G & (S - 1);
-    
-    /* Logical blocks (N) are clustered to keep small runs contiguous */
     uint64_t cluster_idx = N >> 4;
     uint64_t sub_offset  = N & 0xF;
-
     uint64_t term_n = cluster_idx % phi;
     uint64_t term_v = effective_V % phi;
     
@@ -1254,7 +1181,6 @@ _calc_trajectory_lba(
      */
     term_v = _project_coprime_vector(term_v, phi);
     
-    /* Calculate Offset using safe modular math to prevent overflow */
     uint64_t offset = _mul_mod_safe(term_n, term_v, phi);
     uint64_t theta = 0;
     
@@ -1271,27 +1197,19 @@ _calc_trajectory_lba(
     if (vol->sb.info.hw_caps_flags & HN4_HW_ZNS_NATIVE) is_linear = true;
 
     if (!is_linear && !is_system) {
-        /* If Phi is small, LUT modulo causes cycles. Use Linear Probe k. */
         if (HN4_UNLIKELY(phi < 32)) {
             theta = k % phi;
         } else {
-            /* Apply Inertial Damping from LUT */
             uint8_t safe_k = (k < 16) ? k : 15;
             theta = _theta_lut[safe_k] % phi;
         }
     }
     
     /* 7. Final Projection */
-    /* Target Fractal Index = Base + Offset + Jitter */
     uint64_t target_fractal_idx = (g_fractal + offset + theta) % phi;
     
-    /* Convert Fractal Index -> Physical Block Index */
     uint64_t rel_block_idx = (target_fractal_idx * S);
     
-    /* 
-     * Re-inject Entropy Loss (Sub-block alignment)
-     * This restores the original byte-offset alignment of G.
-     */
     if (HN4_UNLIKELY((UINT64_MAX - entropy_loss) < rel_block_idx)) return HN4_LBA_INVALID;
     
     rel_block_idx += entropy_loss;
@@ -1391,19 +1309,9 @@ _get_ai_affinity_bias(
     HN4_OUT uint64_t* out_lba_len
     ) 
 {
-    /* Validation: Feature only available in AI Profile with loaded map */
     if (vol->sb.info.format_profile != HN4_PROFILE_AI) return false;
     if (!vol->topo_map || vol->topo_count == 0) return false;
 
-    /*
-     * Query the Hardware Abstraction Layer for the accelerator ID bound 
-     * to the current thread context.
-     *
-     * PERFORMANCE NOTE:
-     * This relies on stable thread affinity. If the OS scheduler migrates 
-     * the thread to a different NUMA node mid-operation, this may result 
-     * in sub-optimal (remote) placement, but data integrity is preserved.
-     */
     uint32_t caller_id = hn4_hal_get_calling_gpu_id();
 
     /* 0xFFFFFFFF indicates generic CPU thread */
@@ -1544,7 +1452,6 @@ hn4_alloc_genesis(
                 uint64_t win_base = 0;
                 uint64_t win_phi  = phi; /* Default: Global Search */
 
-                /* Optimization: Metadata prefers the outer rim (lower LBAs) for latency */
                 if (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM) {
                     win_base = 0;
                     win_phi = phi / 10; /* Restrict to first 10% */
@@ -1559,7 +1466,7 @@ hn4_alloc_genesis(
                     if (gpu_id != 0xFFFFFFFF) {
                         for (uint32_t i = 0; i < vol->topo_count; i++) {
                             if (vol->topo_map[i].gpu_id == gpu_id) {
-                                /* Map physical topology to fractal index space */
+                                
                                 uint64_t range_start_blk = vol->topo_map[i].lba_start / sec_per_blk;
                                 uint64_t range_len_blk   = vol->topo_map[i].lba_len / sec_per_blk;
 
@@ -1568,7 +1475,6 @@ hn4_alloc_genesis(
                                 {
                                     uint64_t rel_start = range_start_blk - flux_aligned_blk;
                                     
-                                    /* Enforce alignment on window boundaries */
                                     uint64_t rel_aligned = (rel_start + (S - 1)) & ~(S - 1);
                                     
                                     if (rel_aligned < (rel_start + range_len_blk)) {
@@ -1694,16 +1600,13 @@ hn4_alloc_genesis(
                         if (leaked) continue; /* Retry with new V */
                     }
 
-                    /* 4d. Validate Head (N=0) against Bitmap */
                     uint64_t head_lba = _calc_trajectory_lba(vol, G, V, 0, fractal_scale, 0);
                     if (head_lba == HN4_LBA_INVALID) return HN4_ERR_GEOMETRY;
 
-                    /* Check Quality Mask (Media Health) */
                     hn4_result_t q_res = _check_quality_compliance(vol, head_lba, alloc_intent);
                     if (q_res == HN4_ERR_GEOMETRY) return q_res; 
                     if (q_res != HN4_OK) continue; /* Block is Toxic, skip */
 
-                    /* ATOMIC CLAIM: Try to set the bit */
                     bool head_claimed;
                     hn4_result_t res = _bitmap_op(vol, head_lba, BIT_SET, &head_claimed);
                     
@@ -1841,8 +1744,8 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
     uint32_t bs = vol->vol_block_size;
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     
-    /* Strict Validation */
     uint32_t ss = caps ? caps->logical_block_size : 512;
+
     if (ss == 0 || (bs % ss != 0)) {
         HN4_LOG_CRIT("Horizon: Block/Sector mismatch (BS=%u SS=%u)", bs, ss);
         return HN4_ERR_GEOMETRY;
@@ -1857,12 +1760,7 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
 
     hn4_u128_t diff_sectors = hn4_u128_sub(end_addr, start_addr);
     hn4_u128_t cap_blocks_128 = hn4_u128_div_u64(diff_sectors, spb);
-    
-    /* 
-     * Safety Check:
-     * The Block Index (offset into Horizon Ring) MUST fit in 64-bits.
-     * Max Capacity = 2^64 * 4KB = 73 Zettabytes. This is sufficient.
-     */
+  
     if (cap_blocks_128.hi > 0) {
         HN4_LOG_CRIT("Horizon Capacity exceeds 73 Zettabytes. Unsupported.");
         return HN4_ERR_GEOMETRY;
@@ -1897,11 +1795,8 @@ _Check_return_ hn4_result_t hn4_alloc_horizon(
          * Must use 128-bit aware addition.
          */
 #ifdef HN4_USE_128BIT
-        /* diff = offset * spb */
         hn4_u128_t offset_128 = hn4_u128_from_u64(block_offset);
         hn4_u128_t byte_off_128 = hn4_u128_mul_u64(offset_128, spb);
-        
-        /* Add to start address (u128 + u128) - Inline logic since hn4_addr_add takes u64 */
         hn4_addr_t abs_lba = start_addr;
         uint64_t old_lo = abs_lba.lo;
         abs_lba.lo += byte_off_128.lo;
@@ -2029,99 +1924,72 @@ hn4_alloc_block(
     HN4_OUT uint8_t* out_k
     ) 
 {
-    /* 1. Sanity & Security Checks */
+
     if (HN4_UNLIKELY(!vol || !anchor || !out_lba || !out_k)) {
         return HN4_ERR_INVALID_ARGUMENT;
     }
 
-    /* 
-     * Snapshot / Time Travel Guard:
-     * Modifications are forbidden if we are viewing a historical snapshot 
-     * (time_offset != 0) or if the volume is mounted Read-Only.
-     */
-    if (vol->read_only || vol->time_offset != 0) {
+    const bool is_ro = vol->read_only;
+    const uint64_t t_off = vol->time_offset;
+
+    if (HN4_UNLIKELY(is_ro || t_off != 0)) {
         return HN4_ERR_ACCESS_DENIED;
     }
 
-    /* 
-     * 2. Saturation Check (Event Horizon Logic)
-     * FIX [Spec 18.8]: D1 Lockout.
-     * If the volume is >95% full (updates), we mark the Flux Manifold (D1) 
-     * as unavailable. We do not error out immediately; we attempt to fall 
-     * through to the Horizon (D1.5) linear log.
-     */
-    bool d1_saturated = _check_saturation(vol, false);
+    const bool d1_saturated = _check_saturation(vol, false);
 
-    /* 3. Physics Extraction */
-    uint64_t G = hn4_le64_to_cpu(anchor->gravity_center);
-    uint64_t V = 0;
-    
-    /* V is stored as a 48-bit integer in a byte array */
-    memcpy(&V, anchor->orbit_vector, 6);
-    V = hn4_le64_to_cpu(V) & 0xFFFFFFFFFFFFULL;
-    
-    uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
-    
-    /* Determine intent for Quality of Service (QoS) checks */
-    uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
-    uint8_t alloc_intent = HN4_ALLOC_DEFAULT;
-    
-    if ((dclass & HN4_CLASS_VOL_MASK) == HN4_VOL_STATIC) {
-        alloc_intent = HN4_ALLOC_METADATA;
-    }
-
-    /* 
-     * 4. Device Constraints
-     * Resolve the maximum orbit depth (k).
-     * SSDs allow ballistic scattering (k=12).
-     * HDDs/Tape/ZNS enforce linear tracks (k=0) to prevent seek thrashing.
-     */
-    uint8_t max_k = _get_trajectory_limit(vol);
+    const uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
 
     /* 
      * =====================================================================
      * PHASE 1: THE FLUX MANIFOLD (D1)
-     * Ballistic Trajectory Calculation.
      * =====================================================================
      */
-    if (!d1_saturated) {
+    if (HN4_LIKELY(!d1_saturated)) {
+
+        const uint64_t G = hn4_le64_to_cpu(anchor->gravity_center);
+        
+        uint64_t V_raw = 0;
+
+        __builtin_memcpy(&V_raw, anchor->orbit_vector, 6);
+
+        const uint64_t V = hn4_le64_to_cpu(V_raw) & 0xFFFFFFFFFFFFULL;
+        const uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
+        const uint8_t alloc_intent = ((dclass & HN4_CLASS_VOL_MASK) == HN4_VOL_STATIC) 
+                                     ? HN4_ALLOC_METADATA 
+                                     : HN4_ALLOC_DEFAULT;
+
+        const uint8_t max_k = _get_trajectory_limit(vol);
+
+        /* Hot Loop */
         for (uint8_t k = 0; k <= max_k; k++) {
             
-            /* Calculate Candidate LBA using Equation of State */
             uint64_t lba = _calc_trajectory_lba(vol, G, V, logical_idx, M, k);
             
-            /* Check for geometry violations (OOB) */
-            if (lba == HN4_LBA_INVALID) continue;
+            if (HN4_UNLIKELY(lba == HN4_LBA_INVALID)) continue;
 
-            /* 
-             * Quality Mask Check (Media Health):
-             * Ensure the calculated block isn't on a Toxic (Dead) or 
-             * Bronze (Slow) region if high-performance is required.
-             */
             hn4_result_t q_res = _check_quality_compliance(vol, lba, alloc_intent);
-            if (HN4_UNLIKELY(q_res == HN4_ERR_GEOMETRY)) return q_res; /* Panic Exit */
-            if (q_res != HN4_OK) continue; /* Soft Reject (Try next k) */
+            
+            if (HN4_LIKELY(q_res == HN4_OK)) {
+                bool claimed;
+                hn4_result_t res = _bitmap_op(vol, lba, BIT_SET, &claimed);
+                
+                if (HN4_LIKELY(res == HN4_OK && claimed)) {
+                    #ifdef HN4_USE_128BIT
+                        *out_lba = hn4_addr_from_u64(lba);
+                    #else
+                        *out_lba = lba; 
+                    #endif
+                    *out_k = k;
+                    return HN4_OK;
+                }
 
-            /* Atomic Reservation */
-            bool claimed;
-            hn4_result_t res = _bitmap_op(vol, lba, BIT_SET, &claimed);
-            
-            if (res == HN4_OK && claimed) {
-                /* 
-                 * Success: Trajectory Locked.
-                 * Convert internal block index to abstract address type.
-                 */
-                #ifdef HN4_USE_128BIT
-                    *out_lba = hn4_addr_from_u64(lba); /* lba is already physical index */
-                #else
-                    *out_lba = lba; 
-                #endif
-                *out_k = k;
-                return HN4_OK;
+                /* Fatal Bitmap Corruption check */
+                if (HN4_UNLIKELY(res == HN4_ERR_BITMAP_CORRUPT)) return res;
+            } else {
+                /* Optimization: Check fatal geometry error only on failure path */
+                if (HN4_UNLIKELY(q_res == HN4_ERR_GEOMETRY)) return q_res;
             }
-            
-            /* Fatal Bitmap Corruption (ECC Error) implies we stop immediately */
-            if (HN4_UNLIKELY(res == HN4_ERR_BITMAP_CORRUPT)) return res;
         }
     }
 
@@ -2132,23 +2000,15 @@ hn4_alloc_block(
      * =====================================================================
      */
 
-    /*
-     * Constraint Check:
-     * Horizon is a dense linear log of 4KB blocks. It does not support
-     * Fractal Scaling (M > 0). If the file requires large blocks, we fail.
-     */
-    if (M > 0) return HN4_ERR_GRAVITY_COLLAPSE;
+    if (HN4_UNLIKELY(M > 0)) {
+        return HN4_ERR_GRAVITY_COLLAPSE;
+    }
 
-    /* 
-     * Policy Enforcement:
-     * System Files (OS Root) and Critical Metadata MUST reside in the Flux
-     * for performance and bootloader compatibility. We deny spillover unless
-     * the volume is already in a Panic state (Emergency Writes).
-     */
-    bool is_system = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM) ||
-                     (alloc_intent == HN4_ALLOC_METADATA);
-                     
-    if (is_system && !(vol->sb.info.state_flags & HN4_VOL_PANIC)) {
+    const bool is_sys_profile = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
+    const uint64_t dclass_raw = hn4_le64_to_cpu(anchor->data_class);
+    const bool is_meta_intent = ((dclass_raw & HN4_CLASS_VOL_MASK) == HN4_VOL_STATIC);
+
+    if ((is_sys_profile || is_meta_intent) && !(vol->sb.info.state_flags & HN4_VOL_PANIC)) {
         return HN4_ERR_ENOSPC;
     }
 
@@ -2156,15 +2016,14 @@ hn4_alloc_block(
     uint64_t hlba;
     if (hn4_alloc_horizon(vol, &hlba) == HN4_OK) {
         #ifdef HN4_USE_128BIT
-            *out_lba = hn4_addr_from_u64(hlba); /* Horizon is unscaled (4KB base) */
+            *out_lba = hn4_addr_from_u64(hlba);
         #else
             *out_lba = hlba;
         #endif
-        *out_k = HN4_HORIZON_FALLBACK_K; /* 15 */
-        
+        *out_k = HN4_HORIZON_FALLBACK_K;
         return HN4_OK;
     }
 
-    /* Total Saturation: Both D1 and D1.5 are full or collided */
+    /* Total Saturation */
     return HN4_ERR_GRAVITY_COLLAPSE;
 }

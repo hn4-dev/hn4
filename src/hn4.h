@@ -673,17 +673,17 @@ typedef struct {
      * Forces this struct to start on a new 64-byte Cache Line.
      * Prevents writes here from invalidating 'health' cache lines.
      */
-    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+   struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
         _Atomic uint64_t    used_blocks; 
+        
+        uint64_t            limit_genesis; /* 90% */
+        uint64_t            limit_update;  /* 95% */
+        uint64_t            limit_recover; /* 85% */
+
         _Atomic uint64_t    horizon_write_head;
         _Atomic uint64_t    last_alloc_g;
         uint64_t            cortex_search_head;
         uint64_t            scavenger_cursor; 
-         uint64_t            cache_limit_genesis; /* 90% Limit */
-        uint64_t            cache_limit_update;  /* 95% Limit */
-        uint64_t            cache_limit_recover; /* 85% Limit */
-        uint64_t            cached_flux_start;   /* Block Index of Flux Start */
-        uint64_t            cached_total_blocks; /* Total Blocks in Volume */
     } alloc;
 
     /* --- HOT ZONE B: HEALTH & RECOVERY (Scavenger/Monitor Path) --- */
@@ -698,6 +698,7 @@ typedef struct {
         _Atomic uint64_t    barrier_failures;
         _Atomic uint32_t    trajectory_collapse_counter;
     } health;
+    
 
     /* --- COLD ZONE (Topology) --- */
     struct {

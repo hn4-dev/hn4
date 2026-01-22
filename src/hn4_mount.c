@@ -1609,7 +1609,7 @@ static hn4_result_t _verify_and_heal_root_anchor(
  * We don't need to scan disk blocks to find files; we just recalculate
  * where they MUST be.
  */
-static hn4_result_t _reconstruct_cortex_state(
+hn4_result_t _reconstruct_cortex_state(
     HN4_IN hn4_hal_device_t* dev,
     HN4_INOUT hn4_volume_t* vol
 )
@@ -2391,7 +2391,31 @@ hn4_result_t hn4_mount(
         }
     }
 
-    vol->read_only = force_ro;
+     vol->read_only = force_ro;
+
+    /* 
+     * [OPTIMIZATION] Pre-calculate Allocator Saturation Limits.
+     * We do the expensive division here so the Allocator is O(1).
+     */
+    {
+        uint64_t cap_blocks;
+        
+        #ifdef HN4_USE_128BIT
+            hn4_u128_t b_128 = hn4_u128_div_u64(vol->vol_capacity_bytes, vol->vol_block_size);
+            /* Clamp to u64 max. If drive is >18 Exabytes, we saturate at u64 max */
+            cap_blocks = (b_128.hi > 0) ? UINT64_MAX : b_128.lo;
+        #else
+            cap_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+        #endif
+
+        /* Calculate Percentages (90%, 95%, 85%) */
+        /* Safe math: (Total / 100) * Percent to avoid overflow before division */
+        uint64_t one_pct = cap_blocks / 100;
+        
+        vol->alloc.limit_genesis = one_pct * 90;
+        vol->alloc.limit_update  = one_pct * 95;
+        vol->alloc.limit_recover = one_pct * 85;
+    }
     
     /* Initialize Ref Count to 1 (The Mount itself) */
     atomic_store(&vol->health.ref_count, 1);
