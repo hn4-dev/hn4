@@ -99,6 +99,25 @@ static const uint8_t _prof_policy_lut[8] = {
  * INTERNAL HELPERS
  * ========================================================================= */
 
+/* Internal Helper for Spatial Sorting */
+typedef struct {
+    uint64_t lba;
+    uint8_t  k_index;
+} hn4_orbit_target_t;
+
+static void _sort_orbits_spatial(hn4_orbit_target_t* targets, int count) {
+    /* Insertion sort for small N (max 12) is faster than qsort overhead */
+    for (int i = 1; i < count; i++) {
+        hn4_orbit_target_t key = targets[i];
+        int j = i - 1;
+        while (j >= 0 && targets[j].lba > key.lba) {
+            targets[j + 1] = targets[j];
+            j--;
+        }
+        targets[j + 1] = key;
+    }
+}
+
 HN4_INLINE void _pack_header(hn4_block_header_t* h, hn4_u128_t id, 
                                 uint64_t seq, uint64_t gen, 
                                 uint32_t dcrc, uint32_t meta)
@@ -201,16 +220,11 @@ static bool _verify_block_at_lba(
 
 /**
  * _resolve_residency_verified
- *
- * Scans the volume to find the current physical location of a logical block.
- * Handles both Ballistic (D1) and Horizon (D1.5) addressing modes.
- *
- * Returns: Physical Block Index or HN4_LBA_INVALID.
  */
 uint64_t _resolve_residency_verified(
     HN4_IN hn4_volume_t* vol,
     HN4_IN hn4_anchor_t* anchor,
-    HN4_OUT uint64_t  block_idx
+    HN4_IN uint64_t  block_idx
 )
 {
     /* 1. Unpack Anchor Physics */
@@ -225,27 +239,18 @@ uint64_t _resolve_residency_verified(
                  ((uint64_t)raw_v[5] << 40);
 
     uint16_t M = hn4_le16_to_cpu(anchor->fractal_scale);
-
-    /* Load Data Class Flags */
     uint64_t dclass = hn4_le64_to_cpu(anchor->data_class);
 
     hn4_u128_t my_well_id = hn4_le128_to_cpu(anchor->seed_id);
-    uint32_t bs = vol->vol_block_size;
 
-    /* Extract Current Generation for Verification */
+    uint32_t bs = vol->vol_block_size;
     uint64_t current_gen = (uint64_t)hn4_le32_to_cpu(anchor->write_gen);
 
     /* 2. Allocate Verification Buffer */
     void* check_buf = hn4_hal_mem_alloc(bs);
 
-    /*
-     * Resource Safety:
-     * Explicitly check for allocation failure to prevent dereferencing NULL.
-     */
-    if (!check_buf) {
-        return HN4_LBA_INVALID;
-    }
-
+    if (!check_buf) return HN4_LBA_INVALID;
+    
     uint64_t found_lba = HN4_LBA_INVALID;
 
     /* =====================================================================
@@ -267,20 +272,13 @@ uint64_t _resolve_residency_verified(
                     uint64_t linear_lba = G + offset_sectors;
                 
                     bool in_bounds = false;
-    #ifdef HN4_USE_128BIT
-                /* 
-                 * We can safely assume linear_lba (u64) fits in capacity 
-                 * if capacity.hi > 0 or capacity.lo is large enough.
-                 * To be precise: max_blocks = capacity / block_size.
-                 * Since we don't have a u128_div available here easily, 
-                 * check if linear_lba * bs < capacity.
-                 */
+        #ifdef HN4_USE_128BIT
                 hn4_u128_t limit_chk = hn4_u128_mul_u64(hn4_u128_from_u64(linear_lba), vol->vol_block_size);
                 if (hn4_u128_cmp(limit_chk, vol->vol_capacity_bytes) < 0) in_bounds = true;
-#else
+        #else
                 uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
                 if (linear_lba < max_vol_blocks) in_bounds = true;
-#endif
+        #endif
 
                 if (in_bounds) {
                     if (_verify_block_at_lba(vol, linear_lba, check_buf, my_well_id, block_idx, current_gen)) {
@@ -297,11 +295,32 @@ uint64_t _resolve_residency_verified(
     /* =====================================================================
      * PATH B: BALLISTIC ORBIT SCAN (Standard)
      * Scan shells k=0..12 for the block.
+     * OPTIMIZATION: Spatial Sort (C-LOOK) for Rotational Media.
      * ===================================================================== */
+    
+    hn4_orbit_target_t candidates[HN4_ORBIT_LIMIT];
+    int valid_count = 0;
+
+    /* 1. Generate Candidates */
     for (uint8_t k = 0; k < HN4_ORBIT_LIMIT; k++) {
         uint64_t lba = _calc_trajectory_lba(vol, G, V, block_idx, M, k);
+        
+        if (lba != HN4_LBA_INVALID) {
+            candidates[valid_count].lba = lba;
+            candidates[valid_count].k_index = k;
+            valid_count++;
+        }
+    }
 
-        /* _verify_block_at_lba performs bounds check, bitmap check, and ID check */
+    /* 2. Spatial Sort (Only if Rotational) */
+    if (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) {
+        _sort_orbits_spatial(candidates, valid_count);
+    }
+
+    /* 3. Probe in Physical Order */
+    for (int i = 0; i < valid_count; i++) {
+        uint64_t lba = candidates[i].lba;
+        
         if (_verify_block_at_lba(vol, lba, check_buf, my_well_id, block_idx, current_gen)) {
             found_lba = lba;
             goto Cleanup;
@@ -312,7 +331,6 @@ Cleanup:
     hn4_hal_mem_free(check_buf);
     return found_lba;
 }
-
 
 /* =========================================================================
  * CORE WRITE LOGIC

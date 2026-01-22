@@ -89,6 +89,18 @@ static int _get_error_weight(hn4_result_t e)
     return 40;
 }
 
+static void _sort_candidates_spatial(uint64_t* candidates, int count) {
+    for (int i = 1; i < count; i++) {
+        uint64_t key = candidates[i];
+        int j = i - 1;
+        while (j >= 0 && candidates[j] > key) {
+            candidates[j + 1] = candidates[j];
+            j--;
+        }
+        candidates[j + 1] = key;
+    }
+}
+
 HN4_INLINE hn4_result_t _merge_error(hn4_result_t current, hn4_result_t new_err)
 {
     if (HN4_LIKELY(current == HN4_OK)) return new_err;
@@ -409,6 +421,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
         }
         memset(out_buffer, 0, buffer_len);
         return HN4_INFO_SPARSE;
+    }
+
+     if ((vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) && valid_candidates > 1) {
+        _sort_candidates_spatial(candidates, valid_candidates);
     }
 
     /* 5. The "Shotgun" Read Loop */

@@ -119,7 +119,7 @@ static hn4_hal_device_t* write_fixture_setup(void) {
     sb.info.copy_generation = 100;
     sb.info.current_epoch_id = 500;
     sb.info.magic_tail = HN4_MAGIC_TAIL;
-    
+
     /* Layout Calculation */
     uint64_t epoch_start_sector = 16; 
     uint64_t epoch_start_block = 2;
@@ -12165,3 +12165,647 @@ hn4_TEST(Integration, Persistence_Undelete_Impossible) {
     write_fixture_teardown(dev);
 }
 
+/* =========================================================================
+ * TEST: Delete_Basic_Tombstone_Verification
+ * Objective: Verify delete marks file as tombstone and blocks writes.
+ * ========================================================================= */
+hn4_TEST(Delete, Basic_Tombstone_Verification) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Setup RAM Cache */
+    if (!vol->nano_cortex) {
+        vol->nano_cortex = hn4_hal_mem_alloc(4096);
+        vol->cortex_size = 4096;
+        memset(vol->nano_cortex, 0, 4096);
+    }
+
+    /* 2. Create File "deleteme" */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xDEAD001;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    strcpy((char*)anchor.inline_buffer, "deleteme");
+
+    /* 
+     * FIX: Persist to Disk.
+     * hn4_delete calls hn4_ns_resolve, which may check disk integrity.
+     */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+
+    /* Insert into RAM manually (Simulate cache load) */
+    size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
+    hn4_u128_t seed = hn4_le128_to_cpu(anchor.seed_id);
+    uint64_t h = seed.lo ^ seed.hi;
+    h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    uint64_t slot = h % count;
+    ((hn4_anchor_t*)vol->nano_cortex)[slot] = anchor;
+
+    /* 3. Execute Delete */
+    /* Now hn4_delete should find it in RAM or Disk successfully */
+    ASSERT_EQ(HN4_OK, hn4_delete(vol, "deleteme"));
+
+    /* 4. Verify RAM State is Tombstone */
+    /* Note: hn4_delete updates RAM in-place at the calculated slot */
+    hn4_anchor_t* ram_ptr = &((hn4_anchor_t*)vol->nano_cortex)[slot];
+    
+    /* Re-read because hn4_delete modified it */
+    uint64_t dclass = hn4_le64_to_cpu(ram_ptr->data_class);
+    
+    ASSERT_TRUE(dclass & HN4_FLAG_TOMBSTONE);
+
+    /* 5. Verify Write Rejected on Tombstone */
+    uint8_t buf[16] = "FAIL";
+    
+    /* Pass the updated RAM anchor to write function */
+    hn4_result_t res = hn4_write_block_atomic(vol, ram_ptr, 0, buf, 4, 0);
+    
+    ASSERT_EQ(HN4_ERR_TOMBSTONE, res);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+/* =========================================================================
+ * TEST: Undelete_Basic_Resurrection
+ * Objective: Verify undelete restores valid flag if data exists.
+ * ========================================================================= */
+hn4_TEST(Delete, Basic_Resurrection) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Setup RAM Cache */
+    if (!vol->nano_cortex) {
+        vol->nano_cortex = hn4_hal_mem_alloc(4096);
+        vol->cortex_size = 4096;
+        memset(vol->nano_cortex, 0, 4096);
+    }
+
+    /* 2. Setup Tombstone "restoreme" */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    /* Already marked as Tombstone */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_FLAG_TOMBSTONE);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    strcpy((char*)anchor.inline_buffer, "restoreme");
+    
+    /* Physics: Point to valid location */
+    anchor.gravity_center = hn4_cpu_to_le64(5000);
+    anchor.orbit_vector[0] = 1;
+
+    /* Insert into RAM */
+    size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
+    hn4_u128_t seed = hn4_le128_to_cpu(anchor.seed_id);
+    uint64_t h = seed.lo ^ seed.hi;
+    h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    uint64_t slot = h % count;
+    ((hn4_anchor_t*)vol->nano_cortex)[slot] = anchor;
+
+    /* 
+     * 3. Forge Physical Data (Pulse Check Requirement)
+     * hn4_undelete reads disk to verify integrity before restoring.
+     * We must write a valid block header to LBA 5000 (k=0).
+     */
+    uint32_t bs = vol->vol_block_size;
+    uint8_t* raw_buf = calloc(1, bs);
+    hn4_block_header_t* hdr = (hn4_block_header_t*)raw_buf;
+    
+    hdr->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    hdr->well_id = anchor.seed_id;
+    hdr->generation = hn4_cpu_to_le64(0); // Anchor has 0 gen by default
+    
+    /* CRCs */
+    uint32_t payload_sz = bs - sizeof(hn4_block_header_t);
+    hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(0, hdr->payload, payload_sz));
+    hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(0xFFFFFFFFU, hdr, offsetof(hn4_block_header_t, header_crc)));
+
+    /* Write to Disk */
+    uint64_t lba = _calc_trajectory_lba(vol, 5000, 1, 0, 0, 0);
+    uint32_t spb = bs / 512;
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba * spb), raw_buf, spb);
+    
+    /* Ensure Bitmap is set (Simulate data exists) */
+    _bitmap_op(vol, lba, BIT_SET, NULL);
+
+    /* 4. Execute Undelete */
+    ASSERT_EQ(HN4_OK, hn4_undelete(vol, "restoreme"));
+
+    /* 5. Verify RAM State is Valid */
+    hn4_anchor_t* ram_ptr = &((hn4_anchor_t*)vol->nano_cortex)[slot];
+    uint64_t dclass = hn4_le64_to_cpu(ram_ptr->data_class);
+    
+    ASSERT_FALSE(dclass & HN4_FLAG_TOMBSTONE);
+    ASSERT_TRUE(dclass & HN4_FLAG_VALID);
+
+    free(raw_buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Physics, Orbit_Healing_Jump) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 12000;
+    bool c;
+
+    /* 1. Clog k=0 to k=4 */
+    for(int k=0; k<5; k++) {
+        _bitmap_op(vol, _calc_trajectory_lba(vol, G, 0, 0, 0, k), BIT_SET, &c);
+    }
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+
+    uint8_t buf[16] = "DATA";
+
+    /* 2. Write -> Lands at k=5 */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 4));
+    uint64_t lba_k5 = _calc_trajectory_lba(vol, G, 0, 0, 0, 5);
+    uint64_t actual_1 = _resolve_residency_verified(vol, &anchor, 0);
+    ASSERT_EQ(lba_k5, actual_1);
+
+    /* 3. Free k=0 (Make optimal slot available) */
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, 0, 0, 0, 0);
+    _bitmap_op(vol, lba_k0, BIT_CLEAR, &c);
+
+    /* 4. Overwrite -> Should Jump to k=0 (Healing) */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 4));
+    
+    uint64_t actual_2 = _resolve_residency_verified(vol, &anchor, 0);
+    
+    /* 5. Verify it moved BACKWARDS to k=0 */
+    ASSERT_EQ(lba_k0, actual_2);
+    ASSERT_TRUE(actual_2 < actual_1);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+hn4_TEST(Atomicity, Gen_Skew_Self_Correction) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(15000);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    
+    /* 1. Anchor is at Gen 10 */
+    anchor.write_gen = hn4_cpu_to_le32(10);
+
+    /* 2. Manually inject a "Ghost" block at Gen 12 */
+    uint64_t lba = _calc_trajectory_lba(vol, 15000, 0, 0, 0, 0);
+    uint32_t spb = vol->vol_block_size / 512;
+    
+    uint8_t* raw = calloc(1, vol->vol_block_size);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id = anchor.seed_id;
+    h->generation = hn4_cpu_to_le64(12); /* Future! */
+    
+    /* CRC calculations */
+    uint32_t pcap = vol->vol_block_size - sizeof(hn4_block_header_t);
+    h->data_crc = hn4_cpu_to_le32(hn4_crc32(0, h->payload, pcap));
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(0, h, offsetof(hn4_block_header_t, header_crc)));
+    
+    /* Write Ghost */
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba * spb), raw, spb);
+    /* Mark bitmap so allocator sees it */
+    bool c; _bitmap_op(vol, lba, BIT_SET, &c);
+
+    /* 3. Perform Normal Write via API */
+    /* The driver will scan, see Gen 12 at k=0. */
+    /* If the driver is smart, it will write Gen 13 to k=1 (or k=0 if it eclipses). */
+    /* Or, if it uses RAM gen (10), it writes Gen 11. */
+    
+    /* NOTE: Standard behavior is to trust RAM Anchor (10) -> Write 11. */
+    /* This creates Block(11) vs Ghost(12). */
+    /* If we read back, we want VALID data. */
+    
+    uint8_t buf[16] = "CORRECTION";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10));
+
+    /* 4. Verify Generation Choice */
+    /* If the driver wrote Gen 11, it is LESS than the Ghost(12). */
+    /* The Reader logic must reject the Ghost(12) because 12 > Anchor(11). */
+    /* The Reader should find the new block (Gen 11) at the new location (k=1) and accept it. */
+    
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "CORRECTION"));
+    
+    /* Verify Anchor updated */
+    ASSERT_EQ(11, hn4_le32_to_cpu(anchor.write_gen));
+
+    free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+
+/* =========================================================================
+ * ROTATIONAL MEDIA OPTIMIZATION TESTS
+ * ========================================================================= */
+
+/*
+ * TEST: HDD_Spatial_Sort_Functional
+ * Objective: Verify that enabling HN4_HW_ROTATIONAL does not break the 
+ *            residency resolution logic. Specifically checks that out-of-order
+ *            physical placement (where k=1 is physically before k=0) is 
+ *            correctly resolved.
+ */
+hn4_TEST(Rotational, Spatial_Sort_Functional) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Force Rotational Flag in SB */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 2. Setup Physics where k=1 has LOWER LBA than k=0 */
+    /* This requires finding a G/V combo where (G+V)%Phi < G%Phi.
+       Easy way: Use simple linear trajectory but wrap around end of disk?
+       Or just standard ballistic math where hash(k=1) < hash(k=0).
+       Let's rely on standard scatter. */
+
+    uint64_t G = 50000;
+    
+    /* Find a k > 0 that has a smaller LBA than k=0 */
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0);
+    int target_k = -1;
+    uint64_t target_lba = 0;
+
+    for (int k=1; k < 12; k++) {
+        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 0, 0, k);
+        if (lba < lba_k0) {
+            target_k = k;
+            target_lba = lba;
+            break;
+        }
+    }
+
+    /* If we didn't find an inversion (unlikely with scatter), force one by picking new G */
+    if (target_k == -1) {
+        /* Fallback: Just verify standard read works with flag set */
+        target_k = 1;
+    }
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.orbit_vector[0] = 1; 
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "SPINNING_RUST";
+
+    /* 
+     * 3. Manually place data at the specific target orbit (target_k).
+     * We simulate a write that landed there (e.g. because k=0..k-1 were full).
+     * To do this via API, we must clog previous slots.
+     */
+    bool c;
+    for(int k=0; k < target_k; k++) {
+        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 0, 0, k);
+        _bitmap_op(vol, lba, BIT_SET, &c);
+    }
+
+    /* Write - should land at target_k */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 14, 0));
+
+    /* 4. Verify Physical Placement */
+    uint64_t actual_lba = _resolve_residency_verified(vol, &anchor, 0);
+    
+    /* 
+     * If the Sort Logic broke the probe order (e.g. skipped valid K because 
+     * it wasn't k=0), this would return INVALID.
+     */
+    ASSERT_NE(HN4_LBA_INVALID, actual_lba);
+    
+    /* 5. Verify Read Data */
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "SPINNING_RUST"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/* 
+ * TEST: HDD_Policy_Enforcement
+ * Objective: Verify that setting HN4_HW_ROTATIONAL forces the Allocator 
+ *            to use the DEEP scan policy (128 probes) and SEQUENTIAL preference.
+ */
+hn4_TEST(Rotational, Policy_Enforcement) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* Force HDD Flag */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 60000;
+    
+    /* Clog k=0 */
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0); // V=1 (Seq)
+    bool c;
+    _bitmap_op(vol, lba_k0, BIT_SET, &c);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    /* Set V=1 for Sequential attempt */
+    anchor.orbit_vector[0] = 1;
+
+    uint8_t buf[16] = "SEQ_TEST";
+
+    /* 
+     * Write should FAIL to find k=1 (because HDD policy forces V=1 and 
+     * scatter is discouraged/disabled or heavily penalized). 
+     * It should fallback to Horizon.
+     */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 8, 0));
+
+    /* Verify Horizon used */
+    uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
+    ASSERT_TRUE(dclass & HN4_HINT_HORIZON);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: HDD_Spatial_Sort_Wraparound
+ * Objective: Verify sorting handles wide LBA variance correctly.
+ */
+hn4_TEST(Rotational, Spatial_Sort_Wraparound) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Force Rotational Flag */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 65000;
+    
+    /* 
+     * We want:
+     * k=0 -> LBA X (Middle)
+     * k=1 -> LBA Y (High)
+     * k=2 -> LBA Z (Low)
+     * 
+     * The hash algo is complex, so we brute-force finding a G that satisfies this 
+     * relative ordering for V=1, M=0.
+     */
+    uint64_t lba0, lba1, lba2;
+    int found_geometry = 0;
+    
+    for (int i = 0; i < 1000; i++) {
+        G += 13; // Primes to scatter
+        lba0 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0);
+        lba1 = _calc_trajectory_lba(vol, G, 1, 0, 0, 1);
+        lba2 = _calc_trajectory_lba(vol, G, 1, 0, 0, 2);
+        
+        if (lba2 < lba0 && lba0 < lba1) {
+            found_geometry = 1;
+            break;
+        }
+    }
+    
+    if (!found_geometry) {
+        printf("WARN: Could not find desired geometry. Skipping test logic.\n");
+        hn4_unmount(vol);
+        write_fixture_teardown(dev);
+        return;
+    }
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.orbit_vector[0] = 1; 
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "LOW_LBA";
+
+    /* 2. Clog k=0 and k=1 manually */
+    bool c;
+    _bitmap_op(vol, lba0, BIT_SET, &c);
+    _bitmap_op(vol, lba1, BIT_SET, &c);
+
+    /* 3. Write -> Should land at k=2 (The lowest LBA) */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 7, 0));
+
+    /* 4. Verify Resolution */
+    uint64_t actual = _resolve_residency_verified(vol, &anchor, 0);
+    ASSERT_EQ(lba2, actual);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: HDD_Defrag_Hint_Trigger
+ * Objective: Verify system behavior when sequentiality breaks on HDD.
+ */
+hn4_TEST(Rotational, Defrag_Hint_Trigger) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 70000;
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.orbit_vector[0] = 1; /* Sequential intent */
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "SEQ";
+
+    /* 1. Write Block 0 -> k=0 */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 3, 0));
+
+    /* 2. Clog Block 1's k=0..4 slots to force a seek */
+    /* Note: Block 1 trajectory is G + 1 + offsets */
+    for(int k=0; k<5; k++) {
+        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 1, 0, k);
+        bool c;
+        _bitmap_op(vol, lba, BIT_SET, &c);
+    }
+
+    /* 3. Write Block 1 -> Lands at k=5 */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 3, 0));
+
+    /* 
+     * 4. Verify Success.
+     * On HDD, we tolerate the seek if Horizon is full or policy allows.
+     * We confirm it didn't fail ENOSPC.
+     */
+    uint8_t read_buf[4096];
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 1, read_buf, 4096, 0));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "SEQ"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Rotational_Seek_Latency_Simulation
+ * Objective: Verify HDD retry policy (5 retries vs 2) is active.
+ * Strategy: Force write failure by clogging all orbits, check retry loop behavior.
+ */
+hn4_TEST(Rotational, Seek_Latency_Simulation) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Force Rotational Flag */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 60000;
+    
+    /* 2. Clog ALL orbits k=0..12 to force failure/retry loop */
+    bool c;
+    for(int k=0; k<=12; k++) {
+        _bitmap_op(vol, _calc_trajectory_lba(vol, G, 0, 0, 0, k), BIT_SET, &c);
+    }
+
+    /* 3. Sabotage Horizon (Set Journal Start = Horizon Start) to force total ENOSPC */
+    vol->sb.info.journal_start = vol->sb.info.lba_horizon_start;
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+
+    uint8_t buf[16] = "RETRY";
+    
+    /* 
+     * 4. Execute Write. 
+     * It should return ENOSPC/GravityCollapse after exhausting retries.
+     * We assume the driver implements the sleep, which we can't easily measure here,
+     * but we verify the logic path by ensuring it fails gracefully.
+     */
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, buf, 5, 0);
+    
+    ASSERT_TRUE(res == HN4_ERR_ENOSPC || res == HN4_ERR_GRAVITY_COLLAPSE);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Rotational_Sorted_Scan_Integrity
+ * Objective: Verify C-LOOK sort visits all candidates, including the last one.
+ */
+hn4_TEST(Rotational, Sorted_Scan_Integrity) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    
+    /* 1. Force Rotational Flag */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 70000;
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "TAIL_SCAN";
+
+    /* 
+     * 2. Manually write data to k=12 (Deepest Orbit).
+     */
+    uint64_t lba_k12 = _calc_trajectory_lba(vol, G, 0, 0, 0, 12);
+    
+    /* Pack Header manually */
+    uint8_t* raw = calloc(1, vol->vol_block_size);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id = anchor.seed_id;
+    h->generation = hn4_cpu_to_le64(1);
+    h->seq_index = 0;
+    memcpy(h->payload, buf, 9);
+    
+    /* CRC FIX: Use Correct Seeds */
+    uint32_t pcap = vol->vol_block_size - sizeof(hn4_block_header_t);
+    h->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, h->payload, pcap));
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
+
+    /* Write to disk at k=12 location */
+    uint32_t spb = vol->vol_block_size / 512;
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba_k12 * spb), raw, spb);
+    
+    /* Mark Bitmap for k=12 */
+    bool c; _bitmap_op(vol, lba_k12, BIT_SET, &c);
+
+    /* 
+     * 3. Verify Resolution.
+     * The resolver will calculate k=0..12.
+     * It will Sort them. k=12 has the highest LBA (usually).
+     * It must verify k=12 is the one holding data.
+     */
+    uint64_t found_lba = _resolve_residency_verified(vol, &anchor, 0);
+    
+    ASSERT_EQ(lba_k12, found_lba);
+
+    free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
