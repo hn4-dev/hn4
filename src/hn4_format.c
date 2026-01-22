@@ -62,6 +62,9 @@ static const uint32_t PREF_IO_SIZES[] = {
  * Device Resolution Matrix
  * Maps [Profile][HW_Traits] -> Device Type
  * 
+ * POLICY UPDATE: SSD is Default.
+ * ZNS is only active if the hardware supports it AND the profile is HYPER_CLOUD.
+ * 
  * Columns (HW Traits Index):
  * [0] = SSD (None)
  * [1] = HDD (Rotational)
@@ -69,36 +72,41 @@ static const uint32_t PREF_IO_SIZES[] = {
  * [3] = ZNS + HDD (Zoned Priority)
  */
 static const uint8_t _resolve_dev_lut[8][4] = {
-    /* 0: GENERIC */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 1: GAMING  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 2: AI      */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 3: ARCHIVE */ { HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE }, /* Force Tape */
-    /* 4: PICO    */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 5: SYSTEM  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 6: USB     */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  },
-    /* 7: CLOUD   */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  }
+    /* 0: GENERIC */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_SSD,  HN4_DEV_SSD  }, /* ZNS -> SSD */
+    /* 1: GAMING  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_SSD,  HN4_DEV_SSD  }, /* ZNS -> SSD */
+    /* 2: AI      */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  }, /* AI inherits ZNS */
+    /* 3: ARCHIVE */ { HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE, HN4_DEV_TAPE }, 
+    /* 4: PICO    */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_SSD,  HN4_DEV_SSD  }, /* ZNS -> SSD */
+    /* 5: SYSTEM  */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_SSD,  HN4_DEV_SSD  }, /* ZNS -> SSD */
+    /* 6: USB     */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_SSD,  HN4_DEV_SSD  }, /* ZNS -> SSD */
+    /* 7: CLOUD   */ { HN4_DEV_SSD,  HN4_DEV_HDD,  HN4_DEV_ZNS,  HN4_DEV_ZNS  }  /* ZNS Active */
 };
 
 static uint32_t _resolve_device_type(uint64_t hw_flags, uint32_t profile_id) {
-    /* Mask profile to safety limits (0-7) */
-    uint32_t p = profile_id & 0x7;
+    /* Safety: Clamp profile to the lookup table size (8 rows) */
+    uint32_t safe_profile = profile_id & 0x7;
 
     /* 
-     * Compress 64-bit flags into 2-bit Index:
-     * Bit 0: Rotational (HDD)
-     * Bit 1: ZNS (Zoned)
-     * 
-     * Logic:
-     * (flags & ROT) is bit 2 -> shift down 2 -> index bit 0
-     * (flags & ZNS) is bit 0 -> shift up 1   -> index bit 1
+     * Determine the Hardware Trait Index for the LUT.
+     * We map hardware capabilities to a 2-bit index:
+     * 0 = SSD (Standard)
+     * 1 = HDD (Rotational)
+     * 2 = ZNS (Zoned)
+     * 3 = ZNS + HDD (Hybrid / Priority)
      */
-    uint32_t is_rot = (uint32_t)((hw_flags & HN4_HW_ROTATIONAL) >> 2); /* Bit 2 -> 0 */
-    uint32_t is_zns = (uint32_t)((hw_flags & HN4_HW_ZNS_NATIVE) << 1); /* Bit 0 -> 1 */
-    
-    uint32_t idx = (is_zns | is_rot) & 0x3;
+    uint32_t hw_index = 0;
 
-    return _resolve_dev_lut[p][idx];
+    if (hw_flags & HN4_HW_ROTATIONAL) {
+        hw_index |= 1;
+    }
+
+    if (hw_flags & HN4_HW_ZNS_NATIVE) {
+        hw_index |= 2;
+    }
+
+    return _resolve_dev_lut[safe_profile][hw_index];
 }
+
 
 /* =========================================================================
  * PROFILE DEFINITIONS (TABLE LOOKUP)
@@ -161,83 +169,77 @@ static const hn4_profile_spec_t PROFILE_SPECS[] = {
  * Performs strict zone-aligned resets.
  * Resets critical Zone 0 first, guarantees SB location clear.
  */
-static hn4_result_t _sanitize_zns(hn4_hal_device_t* dev, 
-                                  hn4_size_t capacity_bytes, 
-                                  uint32_t zone_size_bytes,
-                                  uint32_t logical_block_size) 
+static hn4_result_t _sanitize_zns(
+    hn4_hal_device_t* dev, 
+    hn4_size_t capacity_bytes, 
+    uint32_t zone_size_bytes,
+    uint32_t logical_block_size
+) 
 {
+    /* 1. Validation & Geometry Setup */
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    
     if (!caps || logical_block_size != caps->logical_block_size) {
-        HN4_LOG_CRIT("ZNS Sanitize: Logical Block Size mismatch with HAL Caps");
+        HN4_LOG_CRIT("ZNS Sanitize: Logical Block Size mismatch (Param: %u vs HW: %u)", 
+                     logical_block_size, caps ? caps->logical_block_size : 0);
         return HN4_ERR_INTERNAL_FAULT;
     }
-    if (zone_size_bytes == 0 || logical_block_size == 0) return HN4_ERR_GEOMETRY;
 
-    uint32_t zone_sectors = zone_size_bytes / logical_block_size;
+    if (zone_size_bytes == 0 || logical_block_size == 0) {
+        return HN4_ERR_GEOMETRY;
+    }
 
-    /* Initialize Offset Iterator */
-#ifdef HN4_USE_128BIT
-    hn4_u128_t offset = {0, 0};
-#else
-    uint64_t aligned_cap = HN4_ALIGN_DOWN(capacity_bytes, zone_size_bytes);
-    uint64_t offset = 0;
-#endif
+    uint32_t sectors_per_zone = zone_size_bytes / logical_block_size;
 
-    /* Critical - Reset SB Zone First (Zone 0) */
-    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, hn4_addr_from_u64(0), NULL, zone_sectors);
+    /* 
+     * 2. Critical: Reset Zone 0 (Superblock Location) First.
+     * We do this outside the loop to fail-fast if the drive is unresponsive.
+     */
+    hn4_result_t res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, hn4_addr_from_u64(0), NULL, sectors_per_zone);
     if (res != HN4_OK) return res;
 
     hn4_hal_barrier(dev); 
 
-    /* Advance Offset past Zone 0 */
-#ifdef HN4_USE_128BIT
-    offset.lo += zone_size_bytes;
-    if (offset.lo < zone_size_bytes) offset.hi++; /* Carry */
-#else
-    offset += zone_size_bytes;
-#endif
-
-    /* Loop until End of Capacity */
-   /* Calculate Aligned Capacity for 128-bit logic */
-#ifdef HN4_USE_128BIT
-    hn4_u128_t aligned_cap_128;
-    {
-        hn4_u128_t zones = hn4_u128_div_u64(capacity_bytes, zone_size_bytes);
-        aligned_cap_128 = hn4_u128_mul_u64(zones, zone_size_bytes);
-    }
-#endif
-
-    /* Loop until End of Aligned Capacity */
-    while (
-#ifdef HN4_USE_128BIT
-        hn4_u128_cmp(offset, aligned_cap_128) < 0
-#else
-        offset < aligned_cap
-#endif
-    ) {
-        hn4_addr_t lba;
+    /* 3. Sanitize Remaining Zones */
 
 #ifdef HN4_USE_128BIT
-        /* Calculate LBA: offset / logical_block_size */
-        hn4_u128_t tmp = hn4_u128_div_u64(offset, logical_block_size);
-        lba = tmp;
-#else
-        lba = hn4_lba_from_sectors(offset / logical_block_size);
-#endif
-        
-        res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, zone_sectors);
+    /* --- 128-BIT PATH (Quettabyte Support) --- */
+    hn4_u128_t zone_sz_128 = hn4_u128_from_u64(zone_size_bytes);
+    
+    /* Calculate Aligned Capacity (truncate partial tail zone) */
+    hn4_u128_t total_zones = hn4_u128_div_u64(capacity_bytes, zone_size_bytes);
+    hn4_u128_t limit_bytes = hn4_u128_mul_u64(total_zones, zone_size_bytes);
+
+    /* Start at Zone 1 (offset = zone_size) */
+    hn4_u128_t offset = zone_sz_128;
+
+    while (hn4_u128_cmp(offset, limit_bytes) < 0) {
+        /* LBA = ByteOffset / SectorSize */
+        hn4_addr_t lba = hn4_u128_div_u64(offset, logical_block_size);
+
+        res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, sectors_per_zone);
         if (res != HN4_OK) return res;
 
-        /* Advance Offset */
-#ifdef HN4_USE_128BIT
+        /* offset += zone_size (Manual 128-bit add) */
         uint64_t old_lo = offset.lo;
         offset.lo += zone_size_bytes;
         if (offset.lo < old_lo) offset.hi++;
-#else
-        offset += zone_size_bytes;
-#endif
     }
+
+#else
+    /* --- 64-BIT PATH (Standard) --- */
+    uint64_t limit_bytes = HN4_ALIGN_DOWN(capacity_bytes, zone_size_bytes);
     
+    /* Start at Zone 1 */
+    for (uint64_t offset = zone_size_bytes; offset < limit_bytes; offset += zone_size_bytes) {
+        
+        hn4_addr_t lba = hn4_lba_from_sectors(offset / logical_block_size);
+        
+        res = hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, sectors_per_zone);
+        if (res != HN4_OK) return res;
+    }
+#endif
+
     hn4_hal_barrier(dev);
     return HN4_OK;
 }
@@ -704,7 +706,15 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
      * If the device is ZNS, the Logical Block Size MUST match the Physical Zone Size.
      * We override the profile default to prevent random write errors.
      */
-    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+     uint32_t resolved_type = _resolve_device_type(caps->hw_flags, pid);
+
+    /* 
+     * FIX [Spec 13.2]: ZNS Macro-Blocking.
+     * Only enforce Zone Size locking if the hardware is ZNS *AND* the profile 
+     * resolved to ZNS mode (i.e., HYPER_CLOUD). 
+     * If resolved_type is SSD, we treat it as a conventional namespace.
+     */
+    if ((caps->hw_flags & HN4_HW_ZNS_NATIVE) && (resolved_type == HN4_DEV_ZNS)) {
         if (caps->zone_size_bytes == 0) {
             HN4_LOG_CRIT("ZNS Format Error: Device reported 0-byte Zone Size.");
             return HN4_ERR_GEOMETRY;
