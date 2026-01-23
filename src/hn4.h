@@ -426,6 +426,32 @@ typedef struct HN4_PACKED {
 
 /* 8.6 Extension Blocks */
 
+/* Semantic Type Flags for Anchors */
+#define HN4_AI_TYPE_MASK        (0xF000000ULL)
+#define HN4_AI_TYPE_WEIGHTS     (0x1000000ULL)
+#define HN4_AI_TYPE_KV_CACHE    (0x2000000ULL)
+#define HN4_AI_TYPE_GRAPH       (0x3000000ULL)
+#define HN4_AI_TYPE_MANIFEST    (0x4000000ULL)
+#define HN4_AI_TYPE_TAG_DEF     (0x5000000ULL)
+
+/* Extension Types */
+#define HN4_EXT_TYPE_VECTOR     0xAA
+
+/* NEW: Vector Embedding Payload (Fits in 512B Block) */
+typedef struct HN4_PACKED {
+    uint32_t    dims;           /* Dimensions (e.g., 384, 768) */
+    uint32_t    model_id;       /* ID of embedding model */
+    float       vector[];       /* Raw float array */
+} hn4_vector_payload_t;
+
+/* NEW: Manifest Payload (Fits in D1 Blocks) */
+typedef struct HN4_PACKED {
+    uint64_t    count;          /* Number of UUIDs */
+    uint64_t    reserved;
+    hn4_u128_t  entries[];      /* List of Anchor IDs */
+} hn4_manifest_header_t;
+
+/* Existing Extension Header remains... */
 typedef struct HN4_PACKED {
     uint32_t    magic;              /* HN4_MAGIC_META */
     uint32_t    type;               /* HN4_EXT_TYPE_* */
@@ -489,7 +515,7 @@ typedef struct HN4_PACKED {
 #define HN4_CHRONICLE_OP_WORMHOLE   3
 #define HN4_CHRONICLE_OP_FORK       4
 
-/* 
+/*
  * Aligned to ensure it never splits across a 512-byte sector boundary.
  */
 typedef struct HN4_PACKED {
@@ -518,8 +544,6 @@ typedef struct HN4_PACKED {
     uint32_t    error_type;
     uint32_t    action_taken;
 } hn4_triage_log_entry_t;
-
-
 
 _Static_assert(sizeof(hn4_chronicle_entry_t) == 64, "Chronicle Entry must be 64 bytes");
 
@@ -562,17 +586,15 @@ typedef struct HN4_PACKED HN4_ALIGNED(16) {
     #include <stdatomic.h>
 #endif
 
-
 typedef struct {
     atomic_flag flag;
-    uint32_t    pad; 
+    uint32_t    pad;
 } hn4_spinlock_t;
 
 #define HN4_MEDIC_QUEUE_SIZE 64
 
 #define HN4_CORTEX_SHARD_BITS   6
 #define HN4_CORTEX_SHARDS       (1 << HN4_CORTEX_SHARD_BITS) /* 64 */
-
 
 typedef struct {
     uint32_t anchor_idx;
@@ -584,7 +606,6 @@ typedef struct {
     uint32_t count;
     hn4_spinlock_t lock;
 } hn4_medic_queue_t;
-
 
 /* The Synapse Handle (Open File Context) */
 typedef struct {
@@ -601,18 +622,18 @@ typedef struct {
     _Atomic uint64_t old_lba; /* Key */
     _Atomic uint64_t new_lba; /* Value */
     _Atomic uint32_t version;
-    _Atomic uint64_t seed_hash; 
-    _Atomic uint64_t slot_epoch; 
+    _Atomic uint64_t seed_hash;
+    _Atomic uint64_t slot_epoch;
 } hn4_delta_entry_t;
 
-#define HN4_DELTA_TABLE_SIZE 1024 
+#define HN4_DELTA_TABLE_SIZE 1024
 
 static hn4_delta_entry_t _delta_table[HN4_DELTA_TABLE_SIZE];
 
 typedef struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
     hn4_spinlock_t lock;
-    /* 
-     * Padding ensures that acquiring lock[i] does not invalidate 
+    /*
+     * Padding ensures that acquiring lock[i] does not invalidate
      * the cache line for lock[i+1] on other cores.
      */
     uint8_t        pad[HN4_CACHE_LINE_SIZE - sizeof(hn4_spinlock_t)];
@@ -628,57 +649,55 @@ typedef struct {
     uint32_t    mode;            /* HN4_ARRAY_MODE_* */
     uint32_t    count;           /* Active devices */
     hn4_drive_t devices[HN4_MAX_ARRAY_DEVICES];
-    
+
     /* Aggregated Geometry */
     hn4_size_t  total_pool_capacity;
 } hn4_array_ctx_t;
 
-
-
-/* Runtime Volumfe Handle */
+/* Runtime Volume Handle */
 typedef struct {
     /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
     void*               target_device;
-    
+
     uint8_t             _pad0[7];         /* Keep alignment */
 
     /* Superblock & Geometry */
     hn4_superblock_t    sb;
-    uint64_t            sb_offsets_bytes[4]; 
+    uint64_t            sb_offsets_bytes[4];
 
     /* MATH OPTIMIZATION: Shift/Masks replace CPU Division */
-    uint32_t            block_shift;      
-    hn4_size_t          cap_mask;         
-    
+    uint32_t            block_shift;
+    hn4_size_t          cap_mask;
+
     hn4_size_t          vol_capacity_bytes;
     uint32_t            vol_block_size;
 
-   /* --- SPATIAL ARRAY ZONE --- */
-    hn4_array_ctx_t array; 
+    /* --- SPATIAL ARRAY ZONE --- */
+    hn4_array_ctx_t array;
 
     /* Memory Structures */
     hn4_armored_word_t* void_bitmap;    /* Physical Allocator Bitmap (L1) */
     size_t              bitmap_size;
-    uint64_t*           quality_mask;   
+    uint64_t*           quality_mask;
     size_t              qmask_size;
-    
+
     /* D0 Cortex Cache (Optional) */
     void*               nano_cortex;
-    size_t              cortex_size; 
-    
+    size_t              cortex_size;
+
     /* Time & State */
     int64_t             time_offset;
     bool                read_only;
 
     /* --- HOT ZONE A: ALLOCATOR (Core Write Path) --- */
-    /* 
-     * ALIGNMENT CRITICAL: 
+    /*
+     * ALIGNMENT CRITICAL:
      * Forces this struct to start on a new 64-byte Cache Line.
      * Prevents writes here from invalidating 'health' cache lines.
      */
-   struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
-        _Atomic uint64_t    used_blocks; 
-        
+    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+        _Atomic uint64_t    used_blocks;
+
         uint64_t            limit_genesis; /* 90% */
         uint64_t            limit_update;  /* 95% */
         uint64_t            limit_recover; /* 85% */
@@ -686,22 +705,21 @@ typedef struct {
         _Atomic uint64_t    horizon_write_head;
         _Atomic uint64_t    last_alloc_g;
         uint64_t            cortex_search_head;
-        uint64_t            scavenger_cursor; 
+        uint64_t            scavenger_cursor;
     } alloc;
 
     /* --- HOT ZONE B: HEALTH & RECOVERY (Scavenger/Monitor Path) --- */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
-        _Atomic uint32_t    taint_counter; 
-        _Atomic uint64_t    toxic_blocks;  
+        _Atomic uint32_t    taint_counter;
+        _Atomic uint64_t    toxic_blocks;
         _Atomic uint32_t    ref_count;
-        
+
         /* Flattened stats */
         _Atomic uint64_t    heal_count;
         _Atomic uint64_t    crc_failures;
         _Atomic uint64_t    barrier_failures;
         _Atomic uint32_t    trajectory_collapse_counter;
     } health;
-    
 
     /* --- COLD ZONE (Topology) --- */
     struct {
@@ -716,20 +734,20 @@ typedef struct {
     hn4_medic_queue_t   medic_queue;
     int64_t             last_log_ts;
 
-     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
+    struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
         hn4_delta_entry_t delta_table[HN4_DELTA_TABLE_SIZE];
     } redirect;
 
     /* --- HIGH-THROUGHPUT LOCKING ZONE --- */
     struct HN4_ALIGNED(HN4_CACHE_LINE_SIZE) {
-        
+
         hn4_shard_lock_t    shards[HN4_CORTEX_SHARDS];
-        hn4_spinlock_t      l2_lock;     
-        uint64_t*           l2_summary_bitmap; 
-        uint64_t            cortex_bitmap_words; 
+        hn4_spinlock_t      l2_lock;
+        uint64_t*           l2_summary_bitmap;
+        uint64_t            cortex_bitmap_words;
         _Atomic(uint64_t*)  cortex_occupancy_bitmap;
 
-        bool                in_eviction_path; 
+        bool                in_eviction_path;
     } locking;
 
 } hn4_volume_t;
@@ -744,10 +762,11 @@ typedef struct HN4_PACKED {
     uint8_t     payload[];      /* Offset 40 (8-byte aligned) */
 } hn4_nano_quantum_t;
 
-/* 
+/*
  * Recalculates automatically: 512 - 40 = 472 bytes max payload.
  */
 #define HN4_NANO_MAX_PAYLOAD (512 - sizeof(hn4_nano_quantum_t))
+
 /* =========================================================================
  * 8. API, FORMATTING & BALLISTICS
  * ========================================================================= */
@@ -809,16 +828,16 @@ typedef struct {
 typedef struct {
     const char* label;
     uint32_t    target_profile;
-    
+
     /* Wormhole: Identity Cloning */
-    bool        clone_uuid;         
-    hn4_u128_t  specific_uuid;      
-    
+    bool        clone_uuid;
+    hn4_u128_t  specific_uuid;
+
     /* Wormhole: Mount Intent */
-    uint64_t    mount_intent_flags; 
-    
+    uint64_t    mount_intent_flags;
+
     /* Wormhole: Genesis Perms */
-    uint32_t    root_perms_or;      
+    uint32_t    root_perms_or;
 
     /* Wormhole: Spatial Overlay (Virtual Geometry) */
     hn4_size_t  override_capacity_bytes;
@@ -828,7 +847,7 @@ typedef struct {
  * SHARED TYPES
  * ========================================================================= */
 
-/* 
+/*
  * 16-byte aligned 128-bit value for Atomic CAS operations.
  * Unlike hn4_u128_t, this is NOT packed.
  */
@@ -838,11 +857,11 @@ typedef struct HN4_ALIGNED(16) {
 } hn4_aligned_u128_t;
 
 /* Bitmap Operation Codes */
-typedef enum { 
-    BIT_SET, 
-    BIT_CLEAR, 
-    BIT_TEST, 
-    BIT_FORCE_CLEAR /* Non-Panic Rollback */ 
+typedef enum {
+    BIT_SET,
+    BIT_CLEAR,
+    BIT_TEST,
+    BIT_FORCE_CLEAR /* Non-Panic Rollback */
 } hn4_bit_op_t;
 
 #define HN4_CORTEX_SLOT_SIZE    128
@@ -879,7 +898,7 @@ typedef struct HN4_PACKED {
 }
 #endif
 
-/* 
+/*
  * CRITICAL: MSVC PACKING RESTORATION
  * This must be unconditional regarding the HN4_PACKED macro.
  * It is tied solely to the _MSC_VER condition used at the top of the file.
