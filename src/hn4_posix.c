@@ -28,6 +28,7 @@
 #define HN4_EBADF        9
 #define HN4_ENOMEM       12
 #define HN4_EACCES       13
+#define HN4_EBUSY        16
 #define HN4_EEXIST       17
 #define HN4_ENOTDIR      20
 #define HN4_EISDIR       21
@@ -137,7 +138,7 @@ static void _imp_strncpy_safe(char* dst, const char* src, size_t n) {
     if (n == 0) return;
     size_t i;
     for (i = 0; i < n && src[i] != '\0'; i++) dst[i] = src[i];
-    for (; i < n; i++) dst[i] = '\0'; /* Zero-fill rest */
+    if (i < n) dst[i] = '\0';
 }
 
 static int _imp_strcmp(const char* s1, const char* s2) {
@@ -164,6 +165,7 @@ static bool _imp_safe_add_signed(int64_t base, int64_t offset, int64_t* res) {
 #define HN4_FLAG_IS_DIRECTORY  (1ULL << 63)
 #define HN4_EXT_TYPE_TETHER     0x03 
 #define HN4_FLAG_EXTENDED       (1ULL << 23)
+#define HN4_EXT_TYPE_LONGNAME   0x02
 
 typedef struct {
     hn4_anchor_t    cached_anchor;
@@ -219,140 +221,59 @@ static hn4_mode_t _perms_to_mode(uint32_t p) {
 
 static int _resolve_path(hn4_volume_t* vol, const char* path, hn4_lookup_ctx_t* ctx) {
     if (HN4_UNLIKELY(!path)) return -HN4_EINVAL;
-    if (!vol->nano_cortex) return -HN4_EIO;
     
     _imp_memset(ctx, 0, sizeof(hn4_lookup_ctx_t));
-    
-    size_t len = _imp_strlen(path);
-    if (HN4_UNLIKELY(len == 0)) return -HN4_ENOENT;
-    if (HN4_UNLIKELY(len >= HN4_MAX_PATH)) return -HN4_ENAMETOOLONG;
 
-    /* Root Detection */
-    bool is_root = false;
-    if (_imp_strcmp(path, "/") == 0 || _imp_strcmp(path, ".") == 0 || _imp_strcmp(path, "..") == 0) is_root = true;
-    else {
-        const char* s = path;
-        while (*s == '/') s++;
-        if (*s == '\0') is_root = true;
-    }
-
-    if (is_root) {
+        /* 1. Root Handling */
+        if (_imp_strcmp(path, "/") == 0) {
         ctx->is_root = true;
         ctx->found = true;
+    
+        /* Synthesize Root Metadata */
+        _imp_memset(&ctx->anchor, 0, sizeof(hn4_anchor_t));
+        ctx->anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_FLAG_IS_DIRECTORY | HN4_VOL_STATIC);
+        ctx->anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_EXEC | HN4_PERM_SOVEREIGN);
+    
         return 0;
     }
 
-    const char* p = path;
-    while (*p == '/') p++;
+    /* 2. Delegate to Resonance Engine (Handles tags, nested paths, slicing) */
+    hn4_result_t res = hn4_ns_resolve(vol, path, &ctx->anchor);
 
-    size_t name_len = 0;
-    const char* end = p;
-    while (*end != '\0' && *end != '/') {
-        name_len++;
-        end++;
-    }
-
-    const char* check = end;
-    while (*check == '/') check++;
-    if (*check != '\0') return -HN4_ENOENT; /* Subdirs forbidden */
-    
-    if (name_len == 0) return -HN4_ENOENT;
-    if (*end == '/') ctx->trailing_slash = true;
-
-    char search_name[HN4_MAX_PATH];
-    if (name_len >= HN4_MAX_PATH) return -HN4_ENAMETOOLONG;
-    
-    _imp_memcpy(search_name, p, name_len);
-    search_name[name_len] = '\0';
-
-    hn4_anchor_t* anchors = (hn4_anchor_t*)vol->nano_cortex;
-    size_t count = vol->cortex_size / sizeof(hn4_anchor_t);
-
-    for (size_t i = 0; i < count; i++) {
-
-        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+    if (res == HN4_OK) {
+        ctx->found = true;
         
-        hn4_anchor_t cand = anchors[i]; /* Stack Snapshot */
+        /* 
+         * 3. Reverse Lookup for Slot Index 
+         * POSIX write ops need the physical RAM slot index to update cache.
+         * hn4_ns_resolve gives us the data; we hash the ID to find the slot.
+         */
+        uint64_t slot_idx;
+        hn4_u128_t seed = hn4_le128_to_cpu(ctx->anchor.seed_id);
         
-        uint64_t dclass = _imp_atomic_load_u64(&anchors[i].data_class); // Use volatile source for checks
-        dclass = hn4_le64_to_cpu(dclass);
-
-        /* Skip Invalid entries immediately */
-        if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
-            hn4_hal_spinlock_release(&vol->locking.l2_lock);
-            continue;
+        /* Use the internal cortex scanner to find *where* this anchor lives */
+        if (_ns_scan_cortex_slot(vol, seed, NULL, &slot_idx) == HN4_OK) {
+            ctx->slot_idx = slot_idx;
+        } else {
+            /* Desync: Found by resolve but missing in scan? */
+            return -HN4_EIO;
         }
 
-        bool match = false;
-
-        if (dclass & HN4_FLAG_EXTENDED) {
-            /* 
-             * SLOW PATH: Extended Attributes
-             * We must drop the lock to perform I/O resolution.
-             */
-            hn4_hal_spinlock_release(&vol->locking.l2_lock);
-            
-            char resolved_name[HN4_MAX_PATH];
-            if (hn4_ns_get_name(vol, &cand, resolved_name, sizeof(resolved_name)) == HN4_OK) {
-                if (_imp_strcmp(resolved_name, search_name) == 0) {
-                    match = true;
-                }
-            }
-            
-            if (match) {
-                /* Re-verify ownership (Race Condition check) */
-                hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-                
-                /* Check if slot changed while we were doing I/O */
-                if (anchors[i].seed_id.lo == cand.seed_id.lo && 
-                    anchors[i].seed_id.hi == cand.seed_id.hi &&
-                    anchors[i].write_gen == cand.write_gen) 
-                {
-                    /* Confirmed Match */
-                    ctx->anchor = cand;
-                    ctx->slot_idx = i;
-                    ctx->found = true;
-                    hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                    goto check_dir;
-                }
-                
-                /* Slot changed, our match is invalid. Continue loop. */
-                hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                continue; 
-            }
-        } 
-        else {
-            /* 
-             * FAST PATH: Inline Name
-             * Safe to compare inside spinlock.
-             */
-            char tmp[HN4_INLINE_NAME_MAX + 1];
-            _imp_memcpy(tmp, cand.inline_buffer, HN4_INLINE_NAME_MAX);
-            tmp[HN4_INLINE_NAME_MAX] = '\0';
-
-            if (_imp_strcmp(tmp, search_name) == 0) {
-                ctx->anchor = cand;
-                ctx->slot_idx = i;
-                ctx->found = true;
-                hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                goto check_dir;
-            }
-            
-            hn4_hal_spinlock_release(&vol->locking.l2_lock);
-        }
-    }
-
-    return -HN4_ENOENT;
-
-check_dir:
-    /* Directory Flag Check */
-    {
+        /* 4. Directory Semantics */
+        size_t len = _imp_strlen(path);
+        if (len > 0 && path[len-1] == '/') ctx->trailing_slash = true;
+        
         uint64_t dc = hn4_le64_to_cpu(ctx->anchor.data_class);
-        if (ctx->trailing_slash) {
-            if (!(dc & HN4_FLAG_IS_DIRECTORY)) return -HN4_ENOTDIR;
+        if (ctx->trailing_slash && !(dc & HN4_FLAG_IS_DIRECTORY)) {
+            return -HN4_ENOTDIR;
         }
+
+        /* Cache the name for creation logic if needed */
+        _imp_strncpy_safe(ctx->name, path, HN4_INLINE_NAME_MAX);
+        return 0;
     }
-    return 0;
+
+    return _map_err(res);
 }
 
 
@@ -371,6 +292,8 @@ static int _find_free_slot(hn4_volume_t* vol, uint64_t* slot_idx) {
         dclass = hn4_le64_to_cpu(dclass);
 
         if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
+            /* Claim Slot Immediately */
+            anchors[i].data_class = hn4_cpu_to_le64(HN4_FLAG_VALID); // Temporary reservation
             *slot_idx = i;
             vol->alloc.cortex_search_head = i + 1;
             hn4_hal_spinlock_release(&vol->locking.l2_lock);
@@ -394,7 +317,9 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
     hn4_lookup_ctx_t lk;
     int err = _resolve_path(vol, path, &lk);
 
-    /* CASE 1: TARGET EXISTS */
+    /* ---------------------------------------------------------
+     * CASE 1: TARGET EXISTS
+     * --------------------------------------------------------- */
     if (err == 0 && lk.found) {
         if ((flags & HN4_O_CREAT) && (flags & HN4_O_EXCL)) return -HN4_EEXIST;
 
@@ -416,24 +341,19 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         if ((flags & HN4_O_ACCMODE) != HN4_O_RDONLY) {
             /* Write Access Required */
             if (vol->read_only) return -HN4_EROFS;
-            
-            /* Must check Write/Append permission BEFORE checking Immutable */
             if (!(perms & (HN4_PERM_WRITE | HN4_PERM_APPEND))) return -HN4_EACCES;
-            
-            /* If writing, Immutable blocks it */
             if (perms & HN4_PERM_IMMUTABLE) return -HN4_EPERM;
         } else {
             /* Read Access Required */
             if (!(perms & HN4_PERM_READ)) return -HN4_EACCES;
         }
 
-        /* O_TRUNC Logic (Files only, Write access already confirmed) */
+        /* O_TRUNC Logic */
         if (flags & HN4_O_TRUNC) {
             if ((flags & HN4_O_ACCMODE) == HN4_O_RDONLY) return -HN4_EINVAL;
             if (is_dir) return -HN4_EISDIR;
 
             lk.anchor.mass = 0;
-            lk.anchor.mod_clock = hn4_cpu_to_le64(hn4_hal_get_time_ns());
             
             /* Increment generation to invalidate old blocks */
             uint32_t g = hn4_le32_to_cpu(lk.anchor.write_gen);
@@ -449,7 +369,9 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
             hn4_hal_spinlock_release(&vol->locking.l2_lock);
         }
     }
-    /* CASE 2: TARGET MISSING (CREATE) */
+    /* ---------------------------------------------------------
+     * CASE 2: TARGET MISSING (CREATE)
+     * --------------------------------------------------------- */
     else if (err == -HN4_ENOENT) {
         if (!(flags & HN4_O_CREAT)) return -HN4_ENOENT;
         if (vol->read_only) return -HN4_EROFS;
@@ -464,128 +386,142 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         hn4_anchor_t new_anc;
         _imp_memset(&new_anc, 0, sizeof(hn4_anchor_t));
 
+        /* --- SUB-STEP 2A: Find Free Slot --- */
         while (attempts++ < 1000) {
-            /* 1. Generate Candidate Identity */
+            /* Generate Candidate Identity */
             new_anc.seed_id.lo = hn4_hal_get_random_u64();
             new_anc.seed_id.hi = hn4_hal_get_random_u64();
             new_anc.public_id  = new_anc.seed_id;
 
-            /* 2. Calculate Deterministic Slot (Match hn4_write_anchor_atomic logic) */
+            /* Calculate Slot */
             uint64_t h = new_anc.seed_id.lo ^ new_anc.seed_id.hi;
             h ^= (h >> 33);
             h *= HN4_NS_HASH_CONST;
             h ^= (h >> 33);
             target_slot = h % cortex_cnt;
 
-            /* 3. Check Availability & Name Collision (Atomic Step) */
+            /* Check Availability */
             hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
             
-            /* Check Slot Availability */
             hn4_anchor_t* slot_ptr = &ram_base[target_slot];
             uint64_t dclass = _imp_atomic_load_u64(&slot_ptr->data_class);
             dclass = hn4_le64_to_cpu(dclass);
 
             if (!(dclass & HN4_FLAG_VALID) || (dclass & HN4_FLAG_TOMBSTONE)) {
-                /* Slot is physically free. Now check for Logical Name Collision. */
-                bool name_collision = false;
-                
-                for (size_t k = 0; k < cortex_cnt; k++) {
-                    hn4_anchor_t* check = &ram_base[k];
-                    uint64_t dc = _imp_atomic_load_u64(&check->data_class);
-                    dc = hn4_le64_to_cpu(dc);
-
-                    if ((dc & HN4_FLAG_VALID) && !(dc & HN4_FLAG_TOMBSTONE)) {
-                        /* Check inline name */
-                        if (_imp_strcmp((char*)check->inline_buffer, lk.name) == 0) {
-                            name_collision = true;
-                            break;
-                        }
-                    }
-                }
-
-                if (name_collision) {
-                    hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                    return -HN4_EEXIST; /* Race condition: File created between resolve and now */
-                }
-
+                /* Slot is physically free. Reserve it. */
                 memset(slot_ptr->inline_buffer, 0, sizeof(slot_ptr->inline_buffer));
                 slot_ptr->permissions = 0;
                 slot_ptr->gravity_center = 0;
                 slot_ptr->mass = 0;
-                
                 slot_ptr->seed_id = new_anc.seed_id; 
                 slot_ptr->data_class = hn4_cpu_to_le64(HN4_FLAG_VALID); 
                 slot_reserved = true;
 
                 hn4_hal_spinlock_release(&vol->locking.l2_lock);
-                break; /* Success */
+                break; 
             }
             
             hn4_hal_spinlock_release(&vol->locking.l2_lock);
-            /* Slot occupied, retry with new UUID */
         }
 
-        if (HN4_UNLIKELY(!slot_reserved)) {
-            return -HN4_ENOSPC; /* Cortex Saturated or Bad Luck */
+        if (HN4_UNLIKELY(!slot_reserved)) return -HN4_ENOSPC;
+
+        /* --- SUB-STEP 2B: Populate Metadata & Name --- */
+        
+        /* Prepare Name Logic */
+        size_t path_len = _imp_strlen(path);
+        const char* store_name = (path[0] == '/') ? path + 1 : path;
+        size_t store_len = _imp_strlen(store_name);
+        
+        uint64_t dclass_accum = HN4_FLAG_VALID | HN4_VOL_ATOMIC;
+
+        if (store_len <= HN4_INLINE_NAME_MAX) {
+            /* Short Name: Inline */
+            _imp_strncpy_safe((char*)new_anc.inline_buffer, store_name, HN4_INLINE_NAME_MAX);
+        } 
+        else {
+            /* Long Name: Allocate Extension */
+            hn4_addr_t ext_phys;
+            if (hn4_alloc_horizon(vol, &ext_phys) == HN4_OK) {
+                
+                uint32_t bs = vol->vol_block_size;
+                void* ext_buf = hn4_hal_mem_alloc(bs);
+                
+                if (ext_buf) {
+                    _imp_memset(ext_buf, 0, bs);
+                    hn4_extension_header_t* hdr = (hn4_extension_header_t*)ext_buf;
+                    hdr->magic = hn4_cpu_to_le32(HN4_MAGIC_META);
+                    hdr->type  = hn4_cpu_to_le32(HN4_EXT_TYPE_LONGNAME);
+                    
+                    /* Copy Full Path */
+                    _imp_strncpy_safe((char*)hdr->payload, store_name, bs - sizeof(hn4_extension_header_t));
+                    
+                    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+                    uint32_t spb = bs / caps->logical_block_size;
+                    
+                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, ext_phys, ext_buf, spb) == HN4_OK) {
+                        /* Link Extension */
+                        uint64_t ext_ptr_le = hn4_cpu_to_le64(hn4_addr_to_u64(ext_phys));
+                        _imp_memcpy(new_anc.inline_buffer, &ext_ptr_le, sizeof(uint64_t));
+                        _imp_strncpy_safe((char*)(new_anc.inline_buffer + 8), store_name, 16);
+                        
+                        dclass_accum |= HN4_FLAG_EXTENDED;
+                    }
+                    hn4_hal_mem_free(ext_buf);
+                }
+            }
         }
 
-        /* 
-         * 4. Populate Anchor Metadata 
-         * We now own the slot in RAM (it's marked valid but has no useful data yet).
-         */
-        _imp_strncpy_safe((char*)new_anc.inline_buffer, lk.name, HN4_INLINE_NAME_MAX);
+        /* Directory Logic (mkdir vs open) */
+        if (flags & HN4_O_DIRECTORY) {
+            dclass_accum |= HN4_FLAG_IS_DIRECTORY;
+            new_anc.mass = 0; /* Directories have no mass */
+        }
+
+        /* Finalize Anchor Fields */
         new_anc.permissions = hn4_cpu_to_le32(_mode_to_perms(mode));
+        new_anc.data_class  = hn4_cpu_to_le64(dclass_accum);
         
         uint64_t now = hn4_hal_get_time_ns();
         new_anc.create_clock = hn4_cpu_to_le32((uint32_t)(now / 1000000000ULL));
         new_anc.mod_clock = hn4_cpu_to_le64(now);
         new_anc.write_gen = hn4_cpu_to_le32(1);
         new_anc.orbit_vector[0] = 1;
-        
-        /* Set Flags (Dir/File) */
-        uint64_t dclass_final = HN4_FLAG_VALID | HN4_VOL_ATOMIC;
-        if (flags & HN4_O_DIRECTORY) dclass_final |= HN4_FLAG_IS_DIRECTORY;
-        new_anc.data_class = hn4_cpu_to_le64(dclass_final);
 
-        /* 
-         * 5. Write to Disk 
-         * This will write to 'target_slot' because we used the same hash logic.
-         */
+        /* --- SUB-STEP 2C: Persistence --- */
         if (HN4_UNLIKELY(hn4_write_anchor_atomic(vol, &new_anc) != HN4_OK)) {
-            /* Rollback Reservation */
+            /* Rollback */
             hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-            /* Mark as Tombstone or Invalid to free it */
             ram_base[target_slot].data_class = 0; 
             hn4_hal_spinlock_release(&vol->locking.l2_lock);
             return -HN4_EIO;
         }
 
-        /* 
-         * 6. Finalize RAM Cache
-         * Write the full anchor details to the reserved slot.
-         */
+        /* Update RAM Cache */
         hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
         ram_base[target_slot] = new_anc;
         _imp_dcache_flush(&ram_base[target_slot], sizeof(hn4_anchor_t));
         hn4_hal_spinlock_release(&vol->locking.l2_lock);
 
-        /* Update Context for Handle */
+        /* Populate Handle Context */
         lk.anchor = new_anc;
         lk.slot_idx = target_slot;
         lk.is_root = false;
     }
     else {
-        /* Other error (Name too long, etc) */
         return err;
     }
 
-    /* Allocate Handle */
+    /* ---------------------------------------------------------
+     * CASE 3: ALLOCATE HANDLE
+     * --------------------------------------------------------- */
     hn4_vfs_handle_t* fh = hn4_hal_mem_alloc(sizeof(hn4_vfs_handle_t));
     if (!fh) return -HN4_ENOMEM;
 
     fh->cached_anchor = lk.anchor;
     fh->anchor_idx = lk.slot_idx;
     fh->open_flags = flags;
+    fh->session_perms = hn4_le32_to_cpu(lk.anchor.permissions); 
     fh->dirty = false;
     fh->is_directory = lk.is_root || (hn4_le64_to_cpu(lk.anchor.data_class) & HN4_FLAG_IS_DIRECTORY);
     fh->unlinked = false;
@@ -621,7 +557,19 @@ hn4_ssize_t hn4_posix_read(hn4_volume_t* vol, hn4_handle_t* handle, void* buf, s
     uint32_t payload = HN4_BLOCK_PayloadSize(bs);
     if (payload == 0) return -HN4_EIO;
 
+      if (vol->nano_cortex) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        hn4_anchor_t* live = &((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+        uint32_t live_gen = hn4_le32_to_cpu(live->write_gen);
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+        if (live_gen != fh->cached_gen) {
+            return -HN4_EIO; /* File modified externally */
+        }
+    }
+
     uint64_t size = hn4_le64_to_cpu(fh->cached_anchor.mass);
+
     if (fh->current_offset >= size) return 0;
 
     size_t to_read = count;
@@ -757,6 +705,9 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         }
 
         uint64_t b_idx = fh->current_offset / payload;
+        
+        if (b_idx > (UINT64_MAX / bs)) return -HN4_EFBIG;
+
         uint32_t b_off = fh->current_offset % payload;
         uint32_t chunk = payload - b_off;
         if (chunk > rem) chunk = rem;
@@ -807,7 +758,7 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
         /* Execute Atomic Write */
         hn4_result_t w = hn4_write_block_atomic(vol, target_anchor, b_idx, io, valid_len, fh->session_perms);
         
-        if (HN4_UNLIKELY(w != HN4_OK)) {
+        if (HN4_UNLIKELY(w < 0)) { /* Error is negative */
             ret_code = _map_err(w);
             goto cleanup;
         }
@@ -818,12 +769,14 @@ hn4_ssize_t hn4_posix_write(hn4_volume_t* vol, hn4_handle_t* handle, const void*
          * We must refresh our local handle cache to stay consistent.
          */
         if (vol->nano_cortex) {
-            /* 
-             * Relaxed load is fine here because we just performed a successful write, 
-             * implying we observed the latest state during the CAS loop.
-             */
+            uint32_t target_gen = hn4_le32_to_cpu(target_anchor->write_gen);
+            if (target_gen < fh->cached_gen) {
+                ret_code = -HN4_EIO;
+                goto cleanup;
+            }
             fh->cached_anchor = *target_anchor;
-        } 
+            fh->cached_gen = target_gen;
+        }
         /* 
          * Note: If no Cortex (Direct-IO mode), target_anchor was already &fh->cached_anchor,
          * so it was updated in-place by the write function.
@@ -851,6 +804,16 @@ hn4_off_t hn4_posix_lseek(hn4_volume_t* vol, hn4_handle_t* handle, hn4_off_t off
     hn4_vfs_handle_t* fh = (hn4_vfs_handle_t*)handle;
     if (fh->is_directory) return -HN4_EISDIR;
 
+    if (vol->nano_cortex) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        hn4_anchor_t* live = &((hn4_anchor_t*)vol->nano_cortex)[fh->anchor_idx];
+    
+        /* Only update if ID matches (prevent UAF) */
+        if (live->seed_id.lo == fh->cached_anchor.seed_id.lo) {
+            fh->cached_anchor.mass = live->mass;
+        }
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    }
     uint64_t size = hn4_le64_to_cpu(fh->cached_anchor.mass);
     int64_t current = (int64_t)fh->current_offset;
     int64_t target = 0;
@@ -943,8 +906,19 @@ int hn4_posix_readdir(hn4_volume_t* vol, const char* path, void* buf,
             dir_snap_t* snap = &batch[items_in_batch];
             
             /* Extract Name */
+            if (dclass & HN4_FLAG_EXTENDED) {
+            hn4_anchor_t temp_anchor = *a;
+            hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    
+            hn4_ns_get_name(vol, &temp_anchor, snap->name, HN4_INLINE_NAME_MAX + 1);
+    
+            /* Re-acquire lock to continue iteration */
+            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+    
+        } else {
             _imp_memcpy(snap->name, a->inline_buffer, HN4_INLINE_NAME_MAX);
             snap->name[HN4_INLINE_NAME_MAX] = '\0';
+        }
             
             /* Skip empty names (shouldn't happen for valid files, but safe guard) */
             if (snap->name[0] == '\0') continue;
@@ -1002,7 +976,8 @@ int hn4_posix_unlink(hn4_volume_t* vol, const char* path) {
     hn4_lookup_ctx_t lk;
     int err = _resolve_path(vol, path, &lk);
     if (err != 0) return err;
-    if (lk.is_root) return -HN4_EISDIR;
+    if (lk.is_root) return -HN4_EBUSY; /* Root is busy */
+    if (hn4_le64_to_cpu(lk.anchor.data_class) & HN4_FLAG_IS_DIRECTORY) return -HN4_EISDIR;
 
     uint32_t perms = hn4_le32_to_cpu(lk.anchor.permissions);
     if (perms & HN4_PERM_IMMUTABLE) return -HN4_EPERM;
@@ -1034,11 +1009,11 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
     if (perms & HN4_PERM_IMMUTABLE) return -HN4_EPERM;
 
     const char* p = newpath;
-    while (*p == '/') p++;
-    const char* check = p;
-    while (*check) {
-        if (*check == '/') return -HN4_EINVAL;
-        check++;
+    while (*p == '/') p++; /* Skip leading root slash */
+
+    /* Check for directory separators in filename */
+    for (const char* c = p; *c; c++) {
+        if (*c == '/') return -HN4_EINVAL; /* Flat namespace violation */
     }
     if (_imp_strlen(p) >= HN4_INLINE_NAME_MAX) return -HN4_ENAMETOOLONG;
 
@@ -1047,7 +1022,22 @@ int hn4_posix_rename(hn4_volume_t* vol, const char* oldpath, const char* newpath
         if (dst.is_root) return -HN4_EEXIST;
         uint32_t dp = hn4_le32_to_cpu(dst.anchor.permissions);
         if (dp & HN4_PERM_IMMUTABLE) return -HN4_EPERM;
-        hn4_posix_unlink(vol, newpath);
+        hn4_chronicle_append(vol->target_device, vol, HN4_CHRONICLE_OP_FORK, 
+                     hn4_addr_from_u64(src.slot_idx), 
+                     hn4_addr_from_u64(dst.slot_idx), 
+                     0);
+
+/* Perform Swap in Memory */
+if (dst.found) {
+    /* Mark destination as Tombstone */
+    dst.anchor.data_class |= hn4_cpu_to_le64(HN4_FLAG_TOMBSTONE);
+    hn4_write_anchor_atomic(vol, &dst.anchor);
+}
+
+/* Update Source Name */
+_imp_memset(src.anchor.inline_buffer, 0, HN4_INLINE_NAME_MAX);
+_imp_strncpy_safe((char*)src.anchor.inline_buffer, p, HN4_INLINE_NAME_MAX);
+hn4_write_anchor_atomic(vol, &src.anchor);
     }
 
     if (vol->nano_cortex) {
