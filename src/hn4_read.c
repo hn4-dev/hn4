@@ -7,7 +7,7 @@
  * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
  * ENGINEERING CONTRACT:
- * 1. O(1) EXECUTION: All loops are bounded by HN4_SHOTGUN_DEPTH (12).
+ * 1. O(1) EXECUTION: All loops are bounded by HN4_ORBIT_LIMIT (12).
  * 2. ATOMICITY: Reads are verified against Anchor Generation to prevent
  *    Phantom Reads (reading data from a future/past transaction).
  * 3. SELF-HEALING: "Auto-Medic" repairs corrupted replicas if a valid
@@ -133,12 +133,6 @@ static const hn4_read_policy_t _read_policy_lut[32] = {
 #endif
 
 /* =========================================================================
- * CONSTANTS & MACROS
- * ========================================================================= */
-
-#define HN4_SHOTGUN_DEPTH           12
-
-/* =========================================================================
  * ERROR PRIORITY LOGIC (LOOKUP TABLE OPTIMIZATION)
  * ========================================================================= */
 
@@ -158,6 +152,7 @@ static const hn4_error_weight_t _error_weights[] = {
     { HN4_ERR_PHANTOM_BLOCK,     82  },
 
     /* DATA INTEGRITY (75-80) */
+    { HN4_ERR_TAMPERED,          88  }, 
     { HN4_ERR_DATA_ROT,          80  },
     { HN4_ERR_HEADER_ROT,        80  },
     { HN4_ERR_PAYLOAD_ROT,       80  },
@@ -238,6 +233,7 @@ static hn4_result_t _validate_block(
     HN4_IN const void*   buffer,
     HN4_IN uint32_t      len,
     HN4_IN hn4_u128_t    expected_well_id,
+    HN4_IN uint64_t      logical_seq,
     HN4_IN uint64_t      expected_gen,
     HN4_IN uint64_t      anchor_dclass
 )
@@ -285,9 +281,12 @@ static hn4_result_t _validate_block(
 
     /* 3. Identity Check (Anti-Collision) */
     hn4_u128_t disk_id = hn4_le128_to_cpu(hdr->well_id);
+
     if (HN4_UNLIKELY(disk_id.lo != expected_well_id.lo || disk_id.hi != expected_well_id.hi)) {
         return HN4_ERR_ID_MISMATCH;
     }
+
+    if (hn4_le64_to_cpu(hdr->seq_index) != logical_seq) return false;
 
      /* 
      * 4. Freshness Check (STRICT ATOMICITY)
@@ -428,13 +427,13 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 4. Candidate Generation */
-    uint64_t     candidates[HN4_SHOTGUN_DEPTH] = {0};
-    hn4_result_t candidate_errors[HN4_SHOTGUN_DEPTH];
+    uint64_t     candidates[HN4_ORBIT_LIMIT] = {0};
+    hn4_result_t candidate_errors[HN4_ORBIT_LIMIT];
     hn4_result_t probe_error = HN4_OK;
     int          valid_candidates = 0;
     uint64_t     max_blocks = vol->vol_capacity_bytes / bs;
 
-    for (int i = 0; i < HN4_SHOTGUN_DEPTH; i++) candidate_errors[i] = HN4_ERR_NOT_FOUND;
+    for (int i = 0; i < HN4_ORBIT_LIMIT; i++) candidate_errors[i] = HN4_ERR_NOT_FOUND;
 
     if (dclass & HN4_HINT_HORIZON) {
         uint16_t safe_M = (M > 63) ? 63 : M;
@@ -458,7 +457,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
         if (HN4_UNLIKELY(dev_type == HN4_DEV_TAPE)) return HN4_ERR_GEOMETRY;
 
         /* Determine target Orbit (k) from Anchor Hint (2 bits per cluster) */
-        uint8_t  target_k   = 0;
+        uint8_t target_k = 0;
         uint64_t cluster_idx = block_idx >> 4;
 
         if (cluster_idx < 16) {
@@ -505,7 +504,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                 }
 
                 if (is_allocated) {
-                    if (valid_candidates < HN4_SHOTGUN_DEPTH) {
+                    if (valid_candidates < HN4_ORBIT_LIMIT) {
                         candidates[valid_candidates++] = lba;
                     }
                 }
@@ -530,7 +529,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
     
      if (is_hdd && valid_candidates > 1) {
-        _sort_candidates_mechanical(candidates, valid_candidates);
+        _sort_orbits_spatial(candidates, valid_candidates);
     }
 
 
@@ -595,7 +594,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             );
 
             if (HN4_LIKELY(io_res == HN4_OK)) {
-                hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, anchor_gen, dclass);
+                hn4_result_t val_res = _validate_block(vol, io_buf, bs, well_id, block_idx, anchor_gen, dclass);
 
                 if (HN4_LIKELY(val_res == HN4_OK)) {
                     if (io_res == HN4_INFO_HEALED) {
@@ -672,41 +671,45 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             if (HN4_LIKELY(HN4_IS_OK(decomp_res))) {
                 winner_idx = i;
                 deep_error = decomp_res;
+     
+                int pf_mode = 0;
+                
+                if ((vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) || (dev_type == HN4_DEV_HDD)) {
+                    pf_mode = 2; /* HDD Priority */
+                } else if (profile == HN4_PROFILE_GAMING || profile == HN4_PROFILE_HYPER_CLOUD) {
+                    pf_mode = 1; /* SSD Streaming */
+                }
 
-                /* 
-                 * PREFETCH OPTIMIZATION:
-                 * - GAMING: Prefetch for asset streaming.
-                 * - HYPER_CLOUD: Prefetch for database table scans / blob streaming.
-                 */
-               bool is_hdd = (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) || 
-                          (dev_type == HN4_DEV_HDD);
-            
-            bool is_streaming = (profile == HN4_PROFILE_GAMING || 
-                                 profile == HN4_PROFILE_HYPER_CLOUD);
+                 uint32_t pf_len_sectors = 0;
 
-            if (is_hdd || is_streaming) {
-                uint32_t pf_len_sectors = 0;
-
-                if (is_hdd) {
-
-                    int shift = 0;
-                    uint32_t v = vol->vol_block_size;
-                    while (v >>= 1) shift++;
-
-                    if (shift >= 32) shift = 31;
+                switch (pf_mode) {
+                    case 2: /* HDD: Adaptive Lookahead via LUT */
+                    {
+                        uint32_t shift = vol->block_shift;
+                        if (shift > 31) shift = 31;
+                        
+                        if (sectors > 0) {
+                            pf_len_sectors = _hdd_prefetch_lut[shift] * sectors;
+                        }
+                        break;
+                    }
                     
-                    pf_len_sectors = _hdd_prefetch_lut[shift] * sectors;
-                } else {
-                    pf_len_sectors = sectors;
+                    case 1: /* SSD Streaming: Simple N+1 Fetch */
+                        pf_len_sectors = sectors;
+                        break;
+
+                    default: 
+                        break;
                 }
 
                 if (pf_len_sectors > 0) {
                     uint8_t next_k = 0;
                     uint64_t next_cluster = (block_idx + 1) >> 4;
-                    
+
                     if (next_cluster < 16) {
                         uint32_t h = hn4_le32_to_cpu(anchor.orbit_hints);
-                        next_k = (h >> (next_cluster * 2)) & 0x3;
+                        uint32_t shift = (uint32_t)(next_cluster * 2);
+                        next_k = (uint8_t)((h >> shift) & 0x3u);
                     }
 
                     uint64_t next_lba = _calc_trajectory_lba(vol, G, V, block_idx + 1, M, next_k);
@@ -722,8 +725,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                          hn4_hal_prefetch(vol->target_device, pf_phys, pf_len_sectors);
                     }
                 }
-            }
-
+            
                 break;
             } else {
                 failed_mask |= (1ULL << i);
@@ -762,10 +764,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                      * We calculate based on the RAW payload in the buffer (compressed or not).
                      */
                     size_t h_bound = offsetof(hn4_block_header_t, header_crc);
-                    uint32_t saved_crc = w_hdr->header_crc;
 
-                    /* Use payload_cap which matches the on-disk size */
+                    uint32_t saved_crc = w_hdr->header_crc;
                     uint32_t d_len = HN4_BLOCK_PayloadSize(vol->vol_block_size);
+
                     w_hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, w_hdr->payload, d_len));
                     w_hdr->header_crc = 0;
                     w_hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, w_hdr, h_bound));

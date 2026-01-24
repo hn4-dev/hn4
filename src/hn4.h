@@ -193,6 +193,8 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_POL_SEQ   (1 << 0) /* Force V=1 */
 #define HN4_POL_DEEP  (1 << 1) /* Force 128 Probes */
 
+#define HN4_ORBIT_LIMIT           12
+#define HN4_ZNS_TIMEOUT_NS        (30ULL * 1000000000ULL)
 
 /* Quality Tiers */
 #define HN4_Q_TOXIC             0x00 /* 00 - DEAD/UNSAFE */
@@ -674,7 +676,7 @@ typedef struct {
     /* --- READ-MOSTLY ZONE (Rarely modified after mount) --- */
     void*               target_device;
 
-    uint8_t             _pad0[7];         /* Keep alignment */
+    uint8_t             _pad0[8];         /* Keep alignment */
 
     /* Superblock & Geometry */
     hn4_superblock_t    sb;
