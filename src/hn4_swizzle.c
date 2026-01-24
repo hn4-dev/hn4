@@ -14,6 +14,13 @@
 #include "hn4_swizzle.h"
 #include "hn4_constants.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+    #if defined(__BMI2__) || (defined(_MSC_VER) && defined(__AVX2__))
+        #include <immintrin.h>
+        #define HN4_HW_PDEP 1
+    #endif
+#endif
+
 /* 
  * Magic constant for Gravity Assist.
  * Alternating bit pattern (10100101...) used to decorrelate address bits.
@@ -47,17 +54,20 @@ uint64_t hn4_swizzle_gravity_assist(uint64_t orbit_vector)
 /*
  * Helper: _spread_bits_16
  * Spreads the lower 16 bits of x to even positions.
- * Input:  ......ab cdefghij
- * Output: .a.b.c.d .e.f.g.h .i.j....
  */
 HN4_INLINE uint32_t _spread_bits_16(uint16_t x) 
 {
+#if defined(HN4_HW_PDEP)
+    return _pdep_u32(x, 0x55555555);
+#else
+    /* Fallback: Generic Magic Numbers (~15 cycles) */
     uint32_t n = x;
     n = (n | (n << 8)) & 0x00FF00FF;
     n = (n | (n << 4)) & 0x0F0F0F0F;
     n = (n | (n << 2)) & 0x33333333;
     n = (n | (n << 1)) & 0x55555555;
     return n;
+#endif
 }
 
 /* 

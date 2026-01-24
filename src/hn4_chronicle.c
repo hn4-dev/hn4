@@ -205,14 +205,8 @@ hn4_result_t hn4_chronicle_append(
     hn4_result_t read_res = hn4_hal_sync_io(dev, HN4_IO_READ, prev_lba, io_buf, 1);
     
     if (HN4_LIKELY(read_res == HN4_OK)) {
-        /* 
-         * Use shared helper to check if LBA fits in u64 for validation.
-         * The validation function _is_sector_valid currently expects u64.
-         */
-        uint64_t prev_lba_u64;
-        bool lba_fits = hn4_addr_try_u64(prev_lba, &prev_lba_u64);
 
-        if (lba_fits && _is_sector_valid(io_buf, ss, prev_lba_u64)) {
+        if (_is_sector_valid(io_buf, ss, prev_lba)) {
             hn4_chronicle_header_t* prev = (hn4_chronicle_header_t*)io_buf;
             uint64_t prev_seq_val = hn4_le64_to_cpu(prev->sequence);
 

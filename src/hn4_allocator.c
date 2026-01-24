@@ -182,6 +182,7 @@ _hn4_cas128(volatile void *dst,
 #else
     /* 
      * Provides binary compatibility for 32-bit/Embedded targets (Pico).
+     */
     static atomic_flag _hn4_global_cas_lock = ATOMIC_FLAG_INIT;
     
     /* Spin-Wait */
@@ -453,20 +454,17 @@ HN4_INLINE uint64_t _project_coprime_vector(uint64_t v, uint64_t phi) {
  * Returns a number in range [0, upper_bound - 1].
  */
 static uint64_t _get_random_uniform(uint64_t upper_bound) {
-    if (upper_bound <= 1) return 0;
+    if (HN4_UNLIKELY(upper_bound <= 1)) return 0;
 
+#if defined(__SIZEOF_INT128__)
+    uint64_t rng = hn4_hal_get_random_u64();
+    return (uint64_t)(((__uint128_t)rng * upper_bound) >> 64);
+#else
     if ((upper_bound & (upper_bound - 1)) == 0) {
         return hn4_hal_get_random_u64() & (upper_bound - 1);
     }
-
-    /* Slow Path: Rejection Sampling */
-    uint64_t max_usable = (UINT64_MAX / upper_bound) * upper_bound;
-    uint64_t rng;
-    do {
-        rng = hn4_hal_get_random_u64();
-    } while (rng >= max_usable);
-
-    return rng % upper_bound;
+    return hn4_hal_get_random_u64() % upper_bound;
+#endif
 }
 
 /*
@@ -822,7 +820,7 @@ hn4_result_t _bitmap_op(
 
         hn4_result_t res = HN4_OK;
 
-        uint32_t lock_idx = (block_idx / 64) % HN4_CORTEX_SHARDS;
+        uint32_t lock_idx = (uint32_t)(hn4_addr_to_u64(io_lba) % HN4_CORTEX_SHARDS);
         hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
         if (alloc_size < (sectors_to_io * ss)) {
@@ -1061,15 +1059,10 @@ Routine Description:
 Arguments:
 
     vol - Pointer to the volume device extension.
-    
     G   - Gravity Center (Start LBA of the file/object).
-    
     V   - Orbit Vector (Stride/Velocity).
-    
     N   - Logical Block Index (Offset).
-    
     M   - Fractal Scale (Power of 2 alignment, where BlockSize = 2^M).
-    
     k   - Orbit Index (Collision attempt counter, 0..12).
 
 Return Value:
@@ -1148,7 +1141,16 @@ _calc_trajectory_lba(
     }
 
     uint64_t available_blocks = total_blocks - flux_aligned_blk;
-    uint64_t phi              = available_blocks / S;
+    
+    /* 
+     * OPTIMIZATION 4: Division Elimination
+     * Replaced: phi = available_blocks / S;
+     * With:     phi = available_blocks >> M;
+     * 
+     * Since S is defined as (1 << M), division by S is equivalent to right-shift by M.
+     * This saves ~40-80 CPU cycles on 64-bit platforms.
+     */
+    uint64_t phi = available_blocks >> M;
     
     if (HN4_UNLIKELY(phi == 0)) return HN4_LBA_INVALID;
 
@@ -1170,10 +1172,19 @@ _calc_trajectory_lba(
      * The Entropy Loss is re-injected at the end to preserve byte alignment.
      */
     uint64_t g_aligned   = G & ~(S - 1);
-    uint64_t g_fractal   = g_aligned / S;
+    
+    /* 
+     * OPTIMIZATION 4 (Cont.): Division Elimination 
+     * Replaced: g_fractal = g_aligned / S;
+     * With:     g_fractal = g_aligned >> M;
+     */
+    uint64_t g_fractal   = g_aligned >> M;
+    
     uint64_t entropy_loss = G & (S - 1);
     uint64_t cluster_idx = N >> 4;
-    uint64_t sub_offset  = N & 0xF;
+    
+    /* UNUSED: uint64_t sub_offset  = N & 0xF; */
+    
     uint64_t term_n = cluster_idx % phi;
     uint64_t term_v = effective_V % phi;
     
@@ -1216,8 +1227,7 @@ _calc_trajectory_lba(
     
     /* 7. Final Projection */
     uint64_t target_fractal_idx = (g_fractal + offset + theta) % phi;
-    
-    uint64_t rel_block_idx = (target_fractal_idx * S);
+    uint64_t rel_block_idx = (target_fractal_idx << M);
     
     if (HN4_UNLIKELY((UINT64_MAX - entropy_loss) < rel_block_idx)) return HN4_LBA_INVALID;
     
@@ -1358,20 +1368,33 @@ _get_ai_affinity_bias(
 static int _scan_word_for_gap(hn4_volume_t* vol, uint64_t block_idx) {
     uint64_t word_idx = block_idx / 64;
     
-    /* 1. Bulk Load (Atomic 128-bit to get Data + ECC) */
+    /* 
+     * OPTIMIZATION: Optimistic 64-bit Peek
+     * We load ONLY the data word using a relaxed atomic load.
+     * This avoids the expensive 'lock cmpxchg16b' instruction on x86.
+     */
+    uint64_t raw_data = atomic_load_explicit(
+        (_Atomic uint64_t*)&vol->void_bitmap[word_idx].data, 
+        memory_order_relaxed
+    );
+
+    /* Fail fast if physically full (ignoring potential ECC errors for now) */
+    if (raw_data == 0xFFFFFFFFFFFFFFFFULL) return -1;
+
+    /* 
+     * Candidate found. NOW pay the cost for full 128-bit atomic load 
+     * to get consistent Data + ECC + Version for validation.
+     */
     hn4_aligned_u128_t raw = _hn4_load128(&vol->void_bitmap[word_idx]);
     
-    /* 2. Fast Fail: If word is all 1s (Full), skip */
+    /* Re-check data after atomic load (race condition handling) */
     if (raw.lo == 0xFFFFFFFFFFFFFFFFULL) return -1;
-    
-    /* 3. ECC Validation (Amortized cost) */
+
+    /* ECC Validation */
     uint64_t data;
     if (_ecc_check_and_fix(vol, raw.lo, (uint8_t)(raw.hi & 0xFF), &data, NULL) != HN4_OK) return -1;
     
-    /* 4. Bitmask Logic: Invert to find 0s */
     uint64_t free_mask = ~data;
-    
-    /* 5. Intrinsic: Count Trailing Zeros */
     return _hn4_ctz64(free_mask);
 }
 

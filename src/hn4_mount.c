@@ -849,7 +849,15 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
      hn4_hal_mem_free(io_buf);
 
     if (original_sb.info.state_flags & HN4_VOL_CLEAN) {
-        atomic_fetch_and(&vol->health.taint_counter, vol->health.taint_counter / 2);
+        uint32_t old, new;
+
+        do {
+            old = atomic_load(&vol->health.taint_counter);
+            new = old >> 1;  /* divide by 2 */
+        } while (!atomic_compare_exchange_weak(
+             &vol->health.taint_counter,
+             &old,
+             new));
     }
 
     vol->sb = dirty_sb;

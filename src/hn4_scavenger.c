@@ -450,8 +450,15 @@ static hn4_result_t _reap_tombstone(
                 if (candidate == UINT64_MAX) continue;
                 bool is_set;
                 if (_bitmap_op(vol, candidate, BIT_TEST, &is_set) == HN4_OK && is_set) {
-                    hn4_addr_t phys = hn4_lba_from_blocks(candidate * sectors_per_blk);
-                    if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, vbuf, sectors_per_blk) == HN4_OK) {
+                hn4_addr_t phys;
+                #ifdef HN4_USE_128BIT
+                    hn4_u128_t blk_128 = hn4_u128_from_u64(candidate);
+                    phys = hn4_u128_mul_u64(blk_128, sectors_per_blk);
+                #else
+                    phys = hn4_lba_from_blocks(candidate * sectors_per_blk);
+                #endif
+
+                if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys, vbuf, sectors_per_blk) == HN4_OK) {
                         hn4_block_header_t* h = (hn4_block_header_t*)vbuf;
                         hn4_u128_t disk_id = hn4_le128_to_cpu(h->well_id);
                         uint64_t disk_gen = hn4_le64_to_cpu(h->generation);
@@ -1179,13 +1186,15 @@ static void _perform_leak_audit(hn4_volume_t* vol) {
             bool shadow_alloc = (shadow_map[j / 8] >> (j % 8)) & 1;
 
             if (real_alloc && !shadow_alloc) {
-                /* 
-                 * CANDIDATE LEAK: 
-                 * Real bitmap says USED. No scanned anchor claimed it.
-                 */
                 bool safe_to_free = false;
                 
-                hn4_addr_t phys_lba = hn4_lba_from_blocks(abs_lba * sectors_per_blk);
+                hn4_addr_t phys_lba;
+                #ifdef HN4_USE_128BIT
+                    hn4_u128_t blk_128 = hn4_u128_from_u64(abs_lba);
+                    phys_lba = hn4_u128_mul_u64(blk_128, sectors_per_blk);
+                #else
+                    phys_lba = hn4_lba_from_blocks(abs_lba * sectors_per_blk);
+                #endif
                 
                 if (hn4_hal_sync_io(vol->target_device, HN4_IO_READ, phys_lba, io_buf, sectors_per_blk) == HN4_OK) {
                     hn4_block_header_t* h = (hn4_block_header_t*)io_buf;

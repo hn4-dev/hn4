@@ -931,8 +931,8 @@ retry_transaction:;
                      * Since Index=0, New_G = Actual_LBA.
                      */
                     uint64_t new_G = actual_lba_idx;
-                    
-                    txn_anchor.gravity_center = hn4_cpu_to_le64(new_G);
+
+                    anchor->gravity_center = hn4_cpu_to_le64(new_G);
                     
                     /* Update Bitmap: Release 'target' */
                     _bitmap_op(vol, target_lba, BIT_CLEAR, NULL);

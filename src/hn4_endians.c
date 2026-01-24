@@ -14,6 +14,11 @@
 #include "hn4_endians.h"
 #include <assert.h>
 
+#if defined(__AVX2__)
+    #include <immintrin.h>
+    #define HN4_HW_AVX2 1
+#endif
+
 /* =========================================================================
  * BULK CONVERSION (CACHE LINE OPTIMIZED)
  * ========================================================================= */
@@ -24,29 +29,56 @@
  * Used for: Armored Bitmap loading, Sector Translation.
  */
 void hn4_bulk_le64_to_cpu(uint64_t* __restrict data, size_t count) {
-    /* Hard Assertion: Data must be aligned to 8 bytes */
-    assert(((uintptr_t)data & 7) == 0 && "HN4: Bulk pointer unaligned!");
-
 #if HN4_IS_BIG_ENDIAN
-    size_t i;
-    /*
-     * 4-way Loop Unrolling.
-     * Allows superscalar CPUs to dispatch multiple BSWAP instructions.
+    size_t i = 0;
+
+    /* 
+     * OPTIMIZATION: AVX2 Byte Shuffle (Vector Swap) 
+     * Handles 4x 64-bit integers (32 bytes) per cycle.
      */
-    for (i = 0; i < (count & ~3); i += 4) {
+#if defined(HN4_HW_AVX2)
+    /* 
+     * Shuffle Mask: Reverses bytes within each 64-bit element.
+     * _mm256_shuffle_epi8 operates on independent 128-bit lanes.
+     * Mask values 0-15 apply to each lane separately.
+     *
+     * Desired byte order per 128-bit lane:
+     * High Qword (Bytes 15..8) -> Reversed (8..15)
+     * Low Qword  (Bytes 7..0)  -> Reversed (0..7)
+     */
+    __m256i rev64_mask = _mm256_set_epi8(
+        /* Upper 128-bit lane: [Q1][Q0] */
+        15,14,13,12, 11,10, 9, 8, /* Reverses Q1 */
+         7, 6, 5, 4,  3, 2, 1, 0, /* Reverses Q0 */
+        
+        /* Lower 128-bit lane: [Q1][Q0] */
+        15,14,13,12, 11,10, 9, 8, /* Reverses Q1 */
+         7, 6, 5, 4,  3, 2, 1, 0  /* Reverses Q0 */
+    );
+
+    for (; i + 4 <= count; i += 4) {
+        /* Use unaligned load/store (safe for uint64_t* input) */
+        __m256i v = _mm256_loadu_si256((const __m256i*)&data[i]);
+        v = _mm256_shuffle_epi8(v, rev64_mask);
+        _mm256_storeu_si256((__m256i*)&data[i], v);
+    }
+#endif
+
+    /* Scalar Fallback (4-way Unroll) */
+    for (; i + 3 < count; i += 4) {
         data[i]     = hn4_bswap64(data[i]);
         data[i+1]   = hn4_bswap64(data[i+1]);
         data[i+2]   = hn4_bswap64(data[i+2]);
         data[i+3]   = hn4_bswap64(data[i+3]);
     }
-    /* Handle tail elements */
+    
+    /* Tail Handling */
     for (; i < count; i++) {
         data[i] = hn4_bswap64(data[i]);
     }
 #else
-    /* No-Op on Little Endian Systems */
-    (void)data;
-    (void)count;
+    /* Little Endian: No-op */
+    (void)data; (void)count;
 #endif
 }
 
@@ -117,45 +149,68 @@ bool hn4_endian_sanity_check(void) {
  * ========================================================================= */
 
 void hn4_sb_to_cpu(hn4_superblock_t* sb) {
-    /* Optimizes out completely on LE systems */
+    /* 
+     * NOTE: This function assumes the hn4_superblock_t layout is 
+     * strictly packed (which it is via HN4_PACKED). 
+     * On Little Endian systems, this entire function compiles to nothing (nop).
+     */
 #if HN4_IS_BIG_ENDIAN
-    sb->info.magic = hn4_bswap64(sb->info.magic);
-    sb->info.version = hn4_bswap32(sb->info.version);
-    sb->info.block_size = hn4_bswap32(sb->info.block_size);
+    /* Identity */
+    sb->info.magic       = hn4_bswap64(sb->info.magic);
+    sb->info.version     = hn4_bswap32(sb->info.version);
+    sb->info.block_size  = hn4_bswap32(sb->info.block_size);
     sb->info.volume_uuid = hn4_bswap128(sb->info.volume_uuid);
-    
-    sb->info.lba_epoch_start = hn4_bswap128(sb->info.lba_epoch_start);
-    sb->info.total_capacity = hn4_bswap128(sb->info.total_capacity);
-    sb->info.lba_cortex_start = hn4_bswap128(sb->info.lba_cortex_start);
-    sb->info.lba_bitmap_start = hn4_bswap128(sb->info.lba_bitmap_start);
-    sb->info.lba_flux_start = hn4_bswap128(sb->info.lba_flux_start);
-    sb->info.lba_horizon_start = hn4_bswap128(sb->info.lba_horizon_start);
-    sb->info.lba_stream_start = hn4_bswap128(sb->info.lba_stream_start);
-    
-    sb->info.current_epoch_id = hn4_bswap64(sb->info.current_epoch_id);
-    sb->info.epoch_ring_block_idx = hn4_bswap128(sb->info.epoch_ring_block_idx);
-    sb->info.copy_generation = hn4_bswap64(sb->info.copy_generation);
-    
-    sb->info.sentinel_cursor = hn4_bswap128(sb->info.sentinel_cursor);
-    sb->info.hw_caps_flags = hn4_bswap64(sb->info.hw_caps_flags);
-    sb->info.state_flags = hn4_bswap32(sb->info.state_flags);
-    
-    sb->info.compat_flags = hn4_bswap64(sb->info.compat_flags);
-    sb->info.incompat_flags = hn4_bswap64(sb->info.incompat_flags);
+
+    /* Geometry (Addresses) */
+    /* Note: hn4_addr_t swap handles 128-bit vs 64-bit internally via macro logic */
+    sb->info.lba_epoch_start   = hn4_addr_to_cpu(sb->info.lba_epoch_start);
+    sb->info.total_capacity    = hn4_addr_to_cpu(sb->info.total_capacity);
+    sb->info.lba_cortex_start  = hn4_addr_to_cpu(sb->info.lba_cortex_start);
+    sb->info.lba_bitmap_start  = hn4_addr_to_cpu(sb->info.lba_bitmap_start);
+    sb->info.lba_flux_start    = hn4_addr_to_cpu(sb->info.lba_flux_start);
+    sb->info.lba_horizon_start = hn4_addr_to_cpu(sb->info.lba_horizon_start);
+    sb->info.lba_stream_start  = hn4_addr_to_cpu(sb->info.lba_stream_start);
+    sb->info.lba_qmask_start   = hn4_addr_to_cpu(sb->info.lba_qmask_start);
+
+    /* Recovery */
+    sb->info.current_epoch_id     = hn4_bswap64(sb->info.current_epoch_id);
+    sb->info.epoch_ring_block_idx = hn4_addr_to_cpu(sb->info.epoch_ring_block_idx);
+    sb->info.copy_generation      = hn4_bswap64(sb->info.copy_generation);
+
+    /* Helix State */
+    sb->info.sentinel_cursor = hn4_addr_to_cpu(sb->info.sentinel_cursor);
+    sb->info.hw_caps_flags   = hn4_bswap64(sb->info.hw_caps_flags);
+    sb->info.state_flags     = hn4_bswap32(sb->info.state_flags);
+
+    /* Feature Compatibility */
+    sb->info.compat_flags    = hn4_bswap64(sb->info.compat_flags);
+    sb->info.incompat_flags  = hn4_bswap64(sb->info.incompat_flags);
     sb->info.ro_compat_flags = hn4_bswap64(sb->info.ro_compat_flags);
-    sb->info.mount_intent = hn4_bswap64(sb->info.mount_intent);
-    sb->info.dirty_bits = hn4_bswap64(sb->info.dirty_bits);
+    sb->info.mount_intent    = hn4_bswap64(sb->info.mount_intent);
+    sb->info.dirty_bits      = hn4_bswap64(sb->info.dirty_bits);
     sb->info.last_mount_time = hn4_bswap64(sb->info.last_mount_time);
-    sb->info.journal_ptr = hn4_bswap128(sb->info.journal_ptr);
-    sb->info.endian_tag = hn4_bswap32(sb->info.endian_tag);
-    sb->info.format_profile = hn4_bswap32(sb->info.format_profile);
-    sb->info.device_type_tag = hn4_bswap32(sb->info.device_type_tag);
-    sb->info.generation_ts = hn4_bswap64(sb->info.generation_ts);
-    sb->info.magic_tail = hn4_bswap64(sb->info.magic_tail);
     
+    sb->info.journal_ptr     = hn4_addr_to_cpu(sb->info.journal_ptr);
+    sb->info.journal_start   = hn4_addr_to_cpu(sb->info.journal_start);
+    
+    sb->info.endian_tag      = hn4_bswap32(sb->info.endian_tag);
+    /* volume_label is byte array (UTF-8), no swap needed */
+    
+    sb->info.format_profile  = hn4_bswap32(sb->info.format_profile);
+    sb->info.device_type_tag = hn4_bswap32(sb->info.device_type_tag);
+    sb->info.generation_ts   = hn4_bswap64(sb->info.generation_ts);
+    sb->info.magic_tail      = hn4_bswap64(sb->info.magic_tail);
+    
+    sb->info.boot_map_ptr    = hn4_addr_to_cpu(sb->info.boot_map_ptr);
+    sb->info.last_journal_seq = hn4_bswap64(sb->info.last_journal_seq);
+
     sb->raw.sb_crc = hn4_bswap32(sb->raw.sb_crc);
 #else
-    (void)sb; /* Zero Cost */
+    /* 
+     * LITTLE ENDIAN OPTIMIZATION:
+     * Zero cost. The function call itself will likely be inlined and removed.
+     */
+    (void)sb;
 #endif
 }
 

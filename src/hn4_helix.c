@@ -126,24 +126,48 @@ static const uint8_t _helix_solve_lut[4] = {
     size_t i = 0;
 
     /* 
-     * UNROLLED BLOCK LOOP (32 bytes per iteration)
-     * Proof of Linearity: 4x u64 operations per iteration.
-     * No alignment checks inside loop (memcpy handles misalignment via hardware/compiler).
+     * OPTIMIZATION: Aligned Fast Path
+     * If both buffers are 8-byte aligned, process directly without memcpy overhead.
      */
-    while (i + 32 <= len) {
-        uint64_t v_dst[4];
-        uint64_t v_src[4];
+    if (HN4_LIKELY(((uintptr_t)d8 & 7) == 0 && ((uintptr_t)s8 & 7) == 0)) {
+        uint64_t* d64 = (uint64_t*)d8;
+        const uint64_t* s64 = (const uint64_t*)s8;
+        
+        while (i + 32 <= len) {
+            /* 
+             * Compiler will auto-vectorize this into AVX/NEON 
+             * because pointer aliasing is resolved via function logic.
+             */
+            d64[0] ^= s64[0];
+            d64[1] ^= s64[1];
+            d64[2] ^= s64[2];
+            d64[3] ^= s64[3];
+            
+            d64 += 4;
+            s64 += 4;
+            i += 32;
+        }
+        /* Update byte pointers for tail handling */
+        d8 = (uint8_t*)d64;
+        s8 = (const uint8_t*)s64;
+    } 
+    else {
+        /* Misaligned Fallback (Original Logic) */
+        while (i + 32 <= len) {
+            uint64_t v_dst[4];
+            uint64_t v_src[4];
 
-        memcpy(v_dst, d8 + i, 32);
-        memcpy(v_src, s8 + i, 32);
+            memcpy(v_dst, d8 + i, 32);
+            memcpy(v_src, s8 + i, 32);
 
-        v_dst[0] ^= v_src[0];
-        v_dst[1] ^= v_src[1];
-        v_dst[2] ^= v_src[2];
-        v_dst[3] ^= v_src[3];
+            v_dst[0] ^= v_src[0];
+            v_dst[1] ^= v_src[1];
+            v_dst[2] ^= v_src[2];
+            v_dst[3] ^= v_src[3];
 
-        memcpy(d8 + i, v_dst, 32);
-        i += 32;
+            memcpy(d8 + i, v_dst, 32);
+            i += 32;
+        }
     }
 
     /* Tail handling (Linear residue) */

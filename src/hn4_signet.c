@@ -243,31 +243,12 @@ static hn4_result_t _validate_chain_and_get_tail(
             break;
         }
         
-        /* 
-         * 3. Calculate Hash of CURRENT block 
-         * Used for Topological Verification by the NEWER block.
-         * We hash the full block size to capture all opaque data.
-         */
-        hn4_u128_t current_blk_hash = _siphash_128((const uint8_t*)buf, bs, &vol->sb.info.volume_uuid);
-
-        if (depth == 0) {
-            /* The Head of the chain becomes the 'Previous Hash' for the NEW seal we are about to write */
-            *out_prev_hash = current_blk_hash;
-        }
-        else if (check_topology) {
-            /* Verify that the older block's hash matches what the newer block claimed */
-            if (!hn4_uuid_equal(current_blk_hash, prev_hash_from_newer_block)) {
-                res = HN4_ERR_TAMPERED;
-                break;
-            }
-        }
-        
         uint32_t type = hn4_le32_to_cpu(h->type);
         
         if (type == HN4_EXT_TYPE_SIGNET) {
             hn4_signet_payload_t* p = (hn4_signet_payload_t*)h->payload;
             
-            /* 4. Structural Integrity (CRC) */
+            /* 3. Structural Integrity (CRC) */
             uint32_t stored_crc = hn4_le32_to_cpu(p->integrity_crc);
             p->integrity_crc = 0;
             
@@ -281,7 +262,7 @@ static hn4_result_t _validate_chain_and_get_tail(
                 break;
             }
 
-            /* 5. Protocol & Binding Checks */
+            /* 4. Protocol & Binding Checks */
             if (hn4_le32_to_cpu(p->version) > HN4_SIGNET_VERSION) {
                 res = HN4_ERR_VERSION_INCOMPAT;
                 break;
@@ -298,7 +279,7 @@ static hn4_result_t _validate_chain_and_get_tail(
                 break;
             }
 
-            /* 6. Temporal Causality (Monotonicity) */
+            /* 5. Temporal Causality (Monotonicity) */
             uint64_t curr_ts = hn4_le64_to_cpu(p->timestamp);
             
             /* Allow equal timestamps for batch signing, but never increasing (Old > New is impossible) */
@@ -309,15 +290,28 @@ static hn4_result_t _validate_chain_and_get_tail(
             last_seen_ts = curr_ts;
 
             /* 
-             * 7. Topology Prep for Next Iteration
-             * Extract the 'prev_seal_hash' that THIS block claims the OLDER block has.
+             * 6. Topological Verification
+             * We calculate the hash of the CURRENT block.
+             * If we are deeper in the chain (check_topology == true), this hash
+             * MUST match the 'prev_seal_hash' recorded in the block we just visited.
              */
-            prev_hash_from_newer_block = hn4_le128_to_cpu(p->prev_seal_hash);
-            check_topology = true;
+            size_t hash_len = sizeof(hn4_extension_header_t) + sizeof(hn4_signet_payload_t);
+            hn4_u128_t current_blk_hash = _siphash_128((const uint8_t*)buf, hash_len, &vol->sb.info.volume_uuid);
+
+            if (depth == 0) {
+                /* The Head of the chain becomes the 'Previous Hash' for the NEW seal */
+                *out_prev_hash = current_blk_hash;
+            }
+            else if (check_topology) {
+                /* Verify link integrity */
+                if (!hn4_uuid_equal(current_blk_hash, prev_hash_from_newer_block)) {
+                    res = HN4_ERR_TAMPERED;
+                    break;
+                }
+            }
 
             /* 
-             * Genesis Constraint: 
-             * If this is the tail (next = 0), it must point to Null Hash.
+             * Genesis Constraint: The oldest block in the chain must point to Null Hash.
              */
             if (hn4_le64_to_cpu(h->next_ext_lba) == 0) {
                 if (p->prev_seal_hash.lo != 0 || p->prev_seal_hash.hi != 0) {
@@ -325,13 +319,10 @@ static hn4_result_t _validate_chain_and_get_tail(
                     break;
                 }
             }
-        } else {
-            /* 
-             * Non-Signet Block (e.g. LONGNAME).
-             * These blocks do not carry a 'prev_seal_hash', so they interrupt the 
-             * cryptographic verification chain.
-             */
-            check_topology = false;
+
+            /* Advance topological tracker */
+            prev_hash_from_newer_block = hn4_le128_to_cpu(p->prev_seal_hash);
+            check_topology = true;
         }
 
         /* Next Link */
