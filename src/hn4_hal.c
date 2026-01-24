@@ -488,14 +488,21 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
 {
     if (HN4_UNLIKELY(!dev || block_size == 0)) return HN4_ERR_INVALID_ARGUMENT;
 
+    /* Retrieve Geometry early for unit translation */
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
+    uint32_t ss = caps ? caps->logical_block_size : 512;
+    if (ss == 0) ss = 512; /* Safety fallback */
+
+    /* Calculate Sectors Per Block (Translation Factor) */
+    uint32_t spb = block_size / ss;
+    if (spb == 0) return HN4_ERR_ALIGNMENT_FAIL; /* Block size < Sector size is invalid */
+
     /*
      * SAFEGUARD #1: Alignment Check
      * If the total length is not a multiple of the block size, we cannot
      * subdivide it safely without a read-modify-write buffer.
-     * Fail fast to prevent infinite loops at the tail.
      */
 #ifdef HN4_USE_128BIT
-    /* Assumption: block_size is power-of-2 or small enough that .lo check works for now */
     if ((len_bytes.lo % block_size) != 0) return HN4_ERR_ALIGNMENT_FAIL;
 #else
     if ((len_bytes % block_size) != 0) return HN4_ERR_ALIGNMENT_FAIL;
@@ -539,38 +546,39 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
             chunk_bytes = (chunk_bytes / block_size) * block_size;
         }
 
-        /* 3. Convert to Blocks */
-        uint32_t chunk_blocks = (uint32_t)(chunk_bytes / block_size);
+        /* 3. Convert to FS Blocks */
+        uint32_t chunk_fs_blocks = (uint32_t)(chunk_bytes / block_size);
 
         /*
          * SAFEGUARD #3: Zero-Block Trap
          * If we have remaining data but calculated 0 blocks to transfer,
          * we are in an infinite loop (Zeno's Paradox). ABORT.
          */
-        if (chunk_blocks == 0) {
+        if (chunk_fs_blocks == 0) {
             HN4_LOG_CRIT("HAL Deadlock Detected: Remaining bytes < Block Size");
             return HN4_ERR_INTERNAL_FAULT;
         }
 
+        /* 
+         * FIX: Translate FS Blocks to Device Sectors 
+         * hn4_hal_sync_io expects 'len' in Sectors.
+         */
+        uint32_t io_sectors = chunk_fs_blocks * spb;
+
         /* 4. Execute IO */
-        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, (void*)buf_cursor, chunk_blocks);
+        hn4_result_t res = hn4_hal_sync_io(dev, op, current_lba, (void*)buf_cursor, io_sectors);
         if (res != HN4_OK) return res;
 
         /* 5. Advance State */
-        const hn4_hal_caps_t* caps = hn4_hal_get_caps(dev);
-        uint32_t ss = caps->logical_block_size;
-        if (ss == 0) ss = 512; /* Safety fallback */
-
-        /* Calculate Sectors Per Block for address scaling */
-        uint32_t spb = block_size / ss;
-        uint64_t bytes_transferred = (uint64_t)chunk_blocks * block_size;
+        uint64_t bytes_transferred = (uint64_t)chunk_fs_blocks * block_size;
 
         /* Advance Buffer */
         if (buf_cursor) {
             buf_cursor += bytes_transferred;
         }
 
-        current_lba = hn4_addr_add(current_lba, chunk_blocks * spb);
+        /* Advance LBA by the SECTOR count actually transferred */
+        current_lba = hn4_addr_add(current_lba, io_sectors);
 
         /* Decrement Remaining */
         #ifdef HN4_USE_128BIT
@@ -580,7 +588,7 @@ hn4_result_t hn4_hal_sync_io_large(hn4_hal_device_t* dev,
         #endif
 
         /* Yield on large transfers to prevent watchdog timeouts */
-        if (chunk_blocks > 1024) HN4_YIELD();
+        if (chunk_fs_blocks > 1024) HN4_YIELD();
     }
 
     return HN4_OK;

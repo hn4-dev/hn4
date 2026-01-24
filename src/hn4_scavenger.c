@@ -870,8 +870,19 @@ cleanup_deltas:
              uint64_t new_lba_phys = _resolve_residency_verified(vol, &new_anchor, n);
              
              if (new_lba_phys != HN4_LBA_INVALID) {
-                 /* Free the orphaned block */
-                 hn4_free_block(vol, hn4_addr_to_u64(new_lba_phys));
+
+                 const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+                 uint32_t spb = vol->vol_block_size / caps->logical_block_size;
+
+                 #ifdef HN4_USE_128BIT
+                     hn4_u128_t blk = hn4_u128_from_u64(new_lba_phys);
+                     hn4_addr_t phys = hn4_u128_mul_u64(blk, spb);
+                 #else
+                     hn4_addr_t phys = new_lba_phys * spb;
+                 #endif
+
+                 /* Free the orphaned block using Sector Address */
+                 hn4_free_block(vol, phys);
              }
              
              /* Calculate where data *was* (to clear delta key) */
@@ -1045,7 +1056,18 @@ static void _uptier_horizon_data(hn4_volume_t* vol, hn4_anchor_t* anchor) {
 
                     /* Only free if no active readers are redirected via delta table */
                     if (hn4_scavenger_lookup_delta(vol, hn4_addr_to_u64(old_lba_phys), current_gen, seed_hash) == 0) {
-                        hn4_free_block(vol, hn4_addr_to_u64(old_lba_phys));
+                        
+                        const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+                        uint32_t spb = vol->vol_block_size / caps->logical_block_size;
+
+                        #ifdef HN4_USE_128BIT
+                            hn4_u128_t blk = hn4_u128_from_u64(old_lba_phys);
+                            hn4_addr_t phys = hn4_u128_mul_u64(blk, spb);
+                        #else
+                            hn4_addr_t phys = old_lba_phys * spb;
+                        #endif
+
+                        hn4_free_block(vol, phys);
                     }
                 }
                 HN4_LOG_VAL("Scavenger: Up-Tiered Horizon File", 0);

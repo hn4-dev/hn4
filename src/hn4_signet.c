@@ -32,6 +32,26 @@
 #include <string.h>
 
 /* =========================================================================
+ * OPTIMIZATION: EXTENSION POLICY LUT
+ * ========================================================================= */
+
+#define SIG_ACT_SKIP        0
+#define SIG_ACT_VALIDATE    1
+
+/* 
+ * Maps Extension Type (LSB) to Action.
+ * 0x99 (SIGNET)   -> VALIDATE
+ * 0x02 (LONGNAME) -> SKIP
+ * Others          -> SKIP
+ */
+static const uint8_t _signet_policy_lut[256] = {
+    [HN4_EXT_TYPE_SIGNET]   = SIG_ACT_VALIDATE,
+    [HN4_EXT_TYPE_LONGNAME] = SIG_ACT_SKIP,
+    [HN4_EXT_TYPE_VECTOR]   = SIG_ACT_SKIP
+    /* All others 0 */
+};
+
+/* =========================================================================
  * 0. CONSTANTS & DATA LAYOUT
  * ========================================================================= */
 
@@ -190,7 +210,8 @@ static hn4_result_t _validate_chain_and_get_tail(
     hn4_volume_t* vol, 
     hn4_anchor_t* anchor,
     uint64_t start_block_idx,
-    hn4_u128_t* out_prev_hash
+    hn4_u128_t* out_prev_hash,
+    uint32_t* out_depth
 ) {
     /* Genesis Hash is 128-bit Zero */
     out_prev_hash->lo = 0;
@@ -245,7 +266,9 @@ static hn4_result_t _validate_chain_and_get_tail(
         
         uint32_t type = hn4_le32_to_cpu(h->type);
         
-        if (type == HN4_EXT_TYPE_SIGNET) {
+        uint8_t action = _signet_policy_lut[type & 0xFF];
+
+        if (action == SIG_ACT_VALIDATE) {
             hn4_signet_payload_t* p = (hn4_signet_payload_t*)h->payload;
             
             /* 3. Structural Integrity (CRC) */
@@ -276,6 +299,15 @@ static hn4_result_t _validate_chain_and_get_tail(
             /* Binds to Anchor Identity */
             if (!hn4_uuid_equal(p->bound_seed_id, anchor->seed_id)) {
                 res = HN4_ERR_TAMPERED; 
+                break;
+            }
+
+            /* The block says "I am at Index X". We must currently be reading Index X. */
+            if (hn4_le64_to_cpu(p->self_block_idx) != curr_lba) {
+                HN4_LOG_CRIT("Signet: Block Moved! Claimed LBA %llu != Actual %llu", 
+                             (unsigned long long)hn4_le64_to_cpu(p->self_block_idx),
+                             (unsigned long long)curr_lba);
+                res = HN4_ERR_ID_MISMATCH;
                 break;
             }
 
@@ -331,6 +363,7 @@ static hn4_result_t _validate_chain_and_get_tail(
     }
 
     hn4_hal_mem_free(buf);
+    *out_depth = depth;
     return res;
 }
 
@@ -433,17 +466,22 @@ hn4_result_t hn4_signet_brand_anchor(
 
     /* Verify existing chain logic and get Hash of the current Head */
     hn4_u128_t prev_hash = {0, 0};
-    hn4_result_t chain_res = _validate_chain_and_get_tail(vol, anchor, old_ext_idx, &prev_hash);
+    
+    uint32_t current_depth = 0;
+    
+    hn4_result_t chain_res = _validate_chain_and_get_tail(vol, anchor, old_ext_idx, &prev_hash, &current_depth);
     
     if (HN4_UNLIKELY(chain_res != HN4_OK)) return chain_res;
+
+     if (current_depth >= HN4_SIGNET_MAX_DEPTH) {
+        return HN4_ERR_ENOSPC; // Stop the 17th write
+    }
 
     /* 2. Allocation (D1.5 Horizon) for SIGNET */
     hn4_addr_t ext_phys_lba;
     hn4_result_t alloc_res = hn4_alloc_horizon(vol, &ext_phys_lba);
     if (HN4_UNLIKELY(alloc_res != HN4_OK)) return alloc_res;
-
-    /* ... (Rest of function remains unchanged) ... */
-    
+   
     uint64_t new_ext_idx;
     if (HN4_UNLIKELY(!_addr_to_u64_checked(ext_phys_lba, &new_ext_idx))) return HN4_ERR_GEOMETRY;
     new_ext_idx /= spb;
