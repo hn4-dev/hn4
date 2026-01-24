@@ -171,13 +171,12 @@ static uint32_t _calc_nano_crc(
     hn4_volume_t* vol,
     hn4_u128_t id, 
     uint64_t sequence, 
-    uint64_t epoch_salt,
     const void* data, 
     uint32_t len
 ) {
     /* Mix entropy sources into a 64-bit seed */
+    /* REMOVED: epoch_salt to ensure persistence across reboots */
     uint64_t s = id.lo ^ id.hi ^ sequence ^ vol->sb.info.volume_uuid.lo;
-    s ^= epoch_salt;
     
     /* Fold entropy to 32-bits for CRC seed */
     s ^= (s >> 32); 
@@ -331,7 +330,7 @@ hn4_result_t hn4_write_nano_ballistic(
             
             /* CRC with Epoch Salt */
             uint32_t crc = _calc_nano_crc(
-                vol, my_id, next_gen_64, vol->sb.info.current_epoch_id, slot->payload, len
+                vol, my_id, next_gen_64, slot->payload, len
             );
             slot->data_crc = hn4_cpu_to_le32(crc);
 
@@ -346,8 +345,11 @@ hn4_result_t hn4_write_nano_ballistic(
                 /* 
                  * Durability Fence (FUA)
                  * Ensure data is on NAND before we point the Anchor to it.
+                 * OPTIMIZATION: Skip if NVM, as HAL Sync IO already flushed CPU cache.
                  */
-                hn4_hal_barrier(vol->target_device);
+                if (!(vol->sb.info.hw_caps_flags & HN4_HW_NVM)) {
+                    hn4_hal_barrier(vol->target_device);
+                }
 
                 /* 5. Read-Back Verify (Paranoia Mode) */
                 void* verify_buf = hn4_hal_mem_alloc(ss);
@@ -386,7 +388,9 @@ hn4_result_t hn4_write_nano_ballistic(
                 /* 7. Atomic Anchor Switch */
                 res = hn4_write_anchor_atomic(vol, anchor);
                 
-                if (res != HN4_OK) {
+                hn4_result_t anchor_res = hn4_write_anchor_atomic(vol, anchor);
+                
+                if (anchor_res != HN4_OK) {
                     /* Log Orphan for Scavenger */
                     #ifdef HN4_USE_128BIT
                     HN4_LOG_WARN("LEAK: Nano Slot Orphaned @ LBA %llu (Gen %u)", 
@@ -396,6 +400,8 @@ hn4_result_t hn4_write_nano_ballistic(
                                  (unsigned long long)target_lba, next_gen_32);
                     #endif
                     res = HN4_ERR_HW_IO;
+                } else {
+                    res = HN4_OK;
                 }
                 break; /* Success */
             }
@@ -466,20 +472,17 @@ hn4_result_t hn4_read_nano_ballistic(
         
         /* Size Checks */
         else if (stored_len != (uint32_t)hn4_le64_to_cpu(anchor->mass)) status = NANO_VAL_SIZE_INVALID;
-        else if (stored_len == 0 || stored_len > (ss - offsetof(hn4_nano_quantum_t, payload))) {
+        else if (stored_len > (ss - offsetof(hn4_nano_quantum_t, payload))) {
             status = NANO_VAL_SIZE_INVALID;
         }
         else {
             /* CRC Check (Seeded) */
-            uint32_t stored_crc = hn4_le32_to_cpu(slot->data_crc);
+             uint32_t stored_crc = hn4_le32_to_cpu(slot->data_crc);
             uint32_t calc_crc = _calc_nano_crc(vol, my_id, slot_seq, 
-                                             vol->sb.info.current_epoch_id, 
                                              slot->payload, stored_len);
             
             if (stored_crc != calc_crc) {
-                /* Epoch Mismatch Detection (Try without epoch salt to diagnose) */
-                uint32_t unsalted_crc = _calc_nano_crc(vol, my_id, slot_seq, 0, slot->payload, stored_len);
-                status = (stored_crc == unsalted_crc) ? NANO_VAL_EPOCH_MISMATCH : NANO_VAL_CRC_FAIL;
+                status = NANO_VAL_CRC_FAIL;
             }
         }
 

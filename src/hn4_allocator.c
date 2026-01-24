@@ -883,6 +883,9 @@ hn4_result_t _bitmap_op(
                     res = HN4_ERR_HW_IO;
                     report_change = false;
                 }
+            }  else if (!(vol->sb.info.hw_caps_flags & HN4_HW_NVM)) {
+                    hn4_hal_barrier(vol->target_device);
+                
             }
         }
         
