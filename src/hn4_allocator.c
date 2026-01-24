@@ -502,9 +502,12 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
                 if (shift >= 64) {
                     blocks_128.lo = (cap_128.hi >> (shift - 64));
                     blocks_128.hi = 0;
-                } else {
+                } else if (shift > 0) { /* FIX: Ensure shift is non-zero before subtracting from 64 */
                     blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
                     blocks_128.hi = (cap_128.hi >> shift);
+                } else {
+                    /* Fallback for shift == 0 (should be covered by block_size==1 check, but safe) */
+                    blocks_128 = cap_128;
                 }
             }
         } else {
@@ -1659,8 +1662,9 @@ hn4_alloc_genesis(
 
                     bool head_claimed;
                     hn4_result_t res = _bitmap_op(vol, head_lba, BIT_SET, &head_claimed);
-                    
-                    if (res != HN4_OK) return res;
+
+                    if (HN4_IS_ERR(res)) return res;
+
                     if (!head_claimed) continue; /* Collision */
 
                     /* 

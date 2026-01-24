@@ -25,6 +25,8 @@
 #include <string.h>
 #include <stdatomic.h>
 
+#define HN4_NS_NAME_MAX         255     /* Max filename length */
+
 /* =========================================================================
  * INTERNAL HELPERS
  * ========================================================================= */
@@ -160,14 +162,50 @@ hn4_result_t hn4_undelete(
         if (!(dclass & HN4_FLAG_TOMBSTONE)) continue;
 
         /* Inline Name Match */
-        char tmp[25];
-        memcpy(tmp, cand->inline_buffer, 24);
-        tmp[24] = '\0';
+       /* Check 1: Inline Prefix Match (Fast Filter) */
+        /* If the name is short, it's fully in inline_buffer. 
+           If long, the first 16 bytes are in inline_buffer + 8 bytes of pointer. */
+        const char* inline_name_ptr = (char*)cand->inline_buffer;
+        
+        /* If EXTENDED, the name starts at offset 8 of inline buffer */
+        if (dclass & HN4_FLAG_EXTENDED) {
+            inline_name_ptr += 8; 
+        }
 
-        if (strcmp(tmp, path) == 0) {
+        /* Verify the visible part matches the path to avoid unnecessary I/O */
+        size_t visible_len = strnlen(inline_name_ptr, 16);
+        if (strncmp(inline_name_ptr, path, visible_len) != 0) continue;
+
+        /* Potential Match Found */
+        
+        /* 
+         * SAFETY: We must drop the lock to perform I/O (Name Resolution).
+         * Copy candidate to stack to persist across unlock.
+         */
+        hn4_anchor_t candidate_copy = *cand;
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+
+        char full_name_buf[HN4_NS_NAME_MAX];
+        hn4_result_t name_res = hn4_ns_get_name(vol, &candidate_copy, full_name_buf, sizeof(full_name_buf));
+
+        if (name_res == HN4_OK && strcmp(full_name_buf, path) == 0) {
+            /* CONFIRMED MATCH */
             found_idx = i;
+            
+            /* Re-acquire lock to finalize loop state, though we are breaking immediately */
+            hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
             break;
         }
+
+        /* False positive or I/O error. Re-acquire lock and continue scan. */
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        
+        /* 
+         * RE-VALIDATION:
+         * While we were unlocked, the array might have shifted if a hot-swap occurred.
+         * In HN4 v1 static arrays, indices are stable, but we must ensure we 
+         * haven't drifted past array bounds (checked by loop condition).
+         */
     }
     
     /* Create local working copy */

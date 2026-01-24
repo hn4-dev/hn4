@@ -417,29 +417,58 @@ static void _sync_cb(hn4_io_req_t* r, hn4_result_t res)
     ctx->done = true;
 }
 
+/* Defined elsewhere in hn4_hal.c, ensure it is available */
+#ifndef HN4_HAL_DEFAULT_TIMEOUT_NS
+#define HN4_HAL_DEFAULT_TIMEOUT_NS (30ULL * 1000000000ULL) // 30 Seconds
+#endif
+
 hn4_result_t hn4_hal_sync_io(hn4_hal_device_t* dev, uint8_t op, hn4_addr_t lba, void* buf, uint32_t len)
 {
-    sync_ctx_t   ctx = { .done = false, .res = HN4_OK };
-    hn4_io_req_t req = {0};
+    /* 1. Allocate Context on Heap (Safe to leak on timeout) */
+    /* Note: We need a request struct that persists too */
+    typedef struct {
+        sync_ctx_t ctx;
+        hn4_io_req_t req;
+    } io_bundle_t;
 
-    req.op_code  = op;
-    req.lba      = lba;
-    req.buffer   = buf;
-    req.length   = len;
-    req.user_ctx = &ctx;
+    io_bundle_t* bundle = hn4_hal_mem_alloc(sizeof(io_bundle_t));
+    if (HN4_UNLIKELY(!bundle)) return HN4_ERR_NOMEM;
 
-    hn4_hal_submit_io(dev, &req, _sync_cb);
+    /* Initialize */
+    bundle->ctx.done = false;
+    bundle->ctx.res = HN4_OK;
+    
+    bundle->req.op_code  = op;
+    bundle->req.lba      = lba;
+    bundle->req.buffer   = buf;
+    bundle->req.length   = len;
+    bundle->req.user_ctx = &bundle->ctx;
 
-    /* Acquire semantics enforced inside loop condition check */
-    /* Note: Casting volatile bool* to _Atomic bool* for standard compliance */
-    while (!atomic_load_explicit((_Atomic bool*)&ctx.done, memory_order_acquire)) {
+    /* 2. Submit */
+    hn4_hal_submit_io(dev, &bundle->req, _sync_cb);
+
+    /* 3. Wait with Timeout */
+    hn4_time_t start_ts = hn4_hal_get_time_ns();
+
+    while (!atomic_load_explicit((_Atomic bool*)&bundle->ctx.done, memory_order_acquire)) {
+        
+        /* Check Timeout */
+        if ((hn4_hal_get_time_ns() - start_ts) > HN4_HAL_DEFAULT_TIMEOUT_NS) {
+            HN4_LOG_CRIT("HAL: Sync IO Timeout (Op %u @ LBA %llu). Leaking context.", 
+                         op, (unsigned long long)hn4_addr_to_u64(lba));
+            return HN4_ERR_ATOMICS_TIMEOUT;
+        }
+
         HN4_YIELD();
         hn4_hal_poll(dev);
     }
 
-    /* Fence is now redundant due to load_acquire above, but harmless to keep */
+    /* 4. Cleanup on Success */
     HN4_BARRIER();
-    return ctx.res;
+    hn4_result_t res = bundle->ctx.res;
+    
+    hn4_hal_mem_free(bundle);
+    return res;
 }
 
 hn4_result_t hn4_hal_barrier(hn4_hal_device_t* dev)

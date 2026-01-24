@@ -233,6 +233,8 @@ typedef uint8_t  hn4_byte_t;
 #define HN4_HINT_BOOT           (1ULL << 21) /* Force allocation in Hot Zone (0-1GB) */
 #define HN4_FLAG_NANO           (1ULL << 22) /* Data resides in Cortex Slots */
 #define HN4_FLAG_EXTENDED       (1ULL << 23) /* Inline Buffer holds Ext LBA */
+#define HN4_FLAG_RESERVED       (1ULL << 26) /* Transient allocation lock */
+#define HN4_FLAG_UNLINKED       (1ULL << 27) /* Soft-delete state */
 
 /* Add to On-Disk Structures */
 #define HN4_MAGIC_NANO          0x4E414E4F   /* "NANO" - Magic for data slots */
@@ -379,6 +381,16 @@ typedef struct HN4_PACKED {
 #define HN4_TCC_CMD_FLAG_ECHO   0x80    /* Back-Reference Indicator */
 #define HN4_TCC_LEN_MASK        0x7F
 #define HN4_TCC_EXT_SENTINEL    0xFF    /* Extension Byte for VarInt */
+
+/* Spec 3.1: Hardware-optimized Hash Constant */
+#define HN4_NS_HASH_CONST 0xff51afd7ed558ccdULL
+#define HN4_EXT_TYPE_TAG 0x01
+#define HN4_EXT_TYPE_LONGNAME 0x02
+
+#define HN4_EXT_TYPE_SIGNET     0x99
+#define HN4_SIGNET_MAGIC        0x5349474E /* "SIGN" in ASCII */
+#define HN4_SIGNET_VERSION      3          
+#define HN4_SIGNET_MAX_DEPTH    16         /* Hard limit: 16 signatures max */
 
 
 /* 8.1 The Anchor Layout (128 Bytes) - Aligned to 2x CPU Cache Lines */
@@ -650,7 +662,10 @@ typedef struct {
     uint32_t    count;           /* Active devices */
     hn4_drive_t devices[HN4_MAX_ARRAY_DEVICES];
 
+    uint64_t    _pad_align;      
+    
     /* Aggregated Geometry */
+    /* Now at offset 392 + 8 = 400. 400 % 16 == 0. Aligned. */
     hn4_size_t  total_pool_capacity;
 } hn4_array_ctx_t;
 
@@ -889,9 +904,10 @@ typedef struct HN4_PACKED {
     _Static_assert(sizeof(hn4_tether_t) == 128, "HN4 Tether must be 128 bytes");
     _Static_assert(sizeof(hn4_armored_word_t) == 16, "HN4 Armored Word must be 16 bytes for 128-bit atomic CAS");
     _Static_assert(offsetof(hn4_tether_t, target_value) % 16 == 0, "Tether target_value misaligned!");
-    /* Use offsetof() for structs with flexible array members to ensure layout correctness */
     _Static_assert(offsetof(hn4_block_header_t, payload) == 48, "HN4 Block Header Payload offset wrong");
     _Static_assert(offsetof(hn4_stream_header_t, payload) == 64, "HN4 Stream Header Payload offset wrong");
+    _Static_assert(offsetof(hn4_array_ctx_t, total_pool_capacity) % 16 == 0, 
+               "HN4: Pool Capacity must be 16-byte aligned for atomic access");
 #endif
 
 #ifdef __cplusplus

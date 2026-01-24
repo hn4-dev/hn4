@@ -8,9 +8,7 @@
  * SAFETY CONTRACT:
  * 1. PRE-CONDITION: The caller (hn4_format) MUST have zeroed the Cortex region.
  *    This function only writes the Root Anchor (Block 0).
- * 2. IDEMPOTENCY: This is a DESTRUCTIVE GENESIS operation. It blindly overwrites
- *    the root slot. It is not safe for "Repair" operations, only "Format".
- * 3. CRC INVARIANT: The CRC calculation is STREAMED. It skips the checksum field
+ * 2. CRC INVARIANT: The CRC calculation is STREAMED. It skips the checksum field
  *    structurally, then updates with the inline buffer.
  */
 
@@ -29,12 +27,46 @@
 #define HN4_ANCHOR_CRC_LEN offsetof(hn4_anchor_t, checksum)
 
 /* 
- * Valid Permission Bits Mask
- * Used to sanitize overrides from compat_flags.
+ * GENESIS PERMISSION TABLE (LUT)
+ * Defines the baseline permissions granted to the Sovereign Root at creation.
  */
-static const uint32_t HN4_PERM_VALID_MASK = 
-    HN4_PERM_READ | HN4_PERM_WRITE | HN4_PERM_EXEC | HN4_PERM_APPEND |
-    HN4_PERM_IMMUTABLE | HN4_PERM_SOVEREIGN | HN4_PERM_ENCRYPTED;
+static const uint32_t _genesis_default_perms[] = {
+    HN4_PERM_READ,
+    HN4_PERM_WRITE,
+    HN4_PERM_EXEC,
+    HN4_PERM_IMMUTABLE,
+    HN4_PERM_SOVEREIGN,
+    0 /* Sentinel */
+};
+
+/* 
+ * OVERRIDE VALIDATION TABLE (LUT)
+ * Defines which permission bits can be safely injected via compat_flags
+ * during format. Replaces hardcoded bitmasks for maintainability.
+ */
+static const uint32_t _valid_override_perms[] = {
+    HN4_PERM_READ,
+    HN4_PERM_WRITE,
+    HN4_PERM_EXEC,
+    HN4_PERM_APPEND,
+    HN4_PERM_IMMUTABLE,
+    HN4_PERM_SOVEREIGN,
+    HN4_PERM_ENCRYPTED,
+    0 /* Sentinel */
+};
+
+/*
+ * Helper: Resolve Permission Mask
+ * Compiles a bitmask from a NULL-terminated LUT.
+ * Optimizing compilers will unroll and constant-fold this entire function.
+ */
+HN4_INLINE uint32_t _compile_perm_mask(const uint32_t* table) {
+    uint32_t mask = 0;
+    while (*table) {
+        mask |= *table++;
+    }
+    return mask;
+}
 
 hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superblock_t* sb) 
 {
@@ -141,13 +173,15 @@ hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superbloc
 
     /* 
      * 4. Permissions: Sovereign (Root) Control 
+     * Constructed via LUT aggregation for safety and clarity.
      */
-    uint32_t perms = HN4_PERM_READ | HN4_PERM_WRITE | HN4_PERM_EXEC | 
-                     HN4_PERM_IMMUTABLE | HN4_PERM_SOVEREIGN;
+    uint32_t perms = _compile_perm_mask(_genesis_default_perms);
     
-    /* Safely OR in the user-supplied overrides */
+    /* Safely OR in the user-supplied overrides using Validation LUT */
     uint32_t user_overrides = (uint32_t)(sb->info.compat_flags & 0xFFFFFFFF);
-    perms |= (user_overrides & HN4_PERM_VALID_MASK);
+    uint32_t valid_mask = _compile_perm_mask(_valid_override_perms);
+    
+    perms |= (user_overrides & valid_mask);
 
     root->permissions = hn4_cpu_to_le32(perms);
 
@@ -187,6 +221,7 @@ hn4_result_t hn4_anchor_write_genesis(hn4_hal_device_t* dev, const hn4_superbloc
  * 1. CHECKSUM: Updates the CRC32C before writing.
  * 2. LOCATION: Uses the Cortex Hash equation to find the physical block.
  * 3. ATOMICITY: Issues a single block write (4KB aligned).
+ * 4. COLLISION: Implements Linear Probing to find correct slot (Empty or Self).
  * 
  * @param vol     Volume context.
  * @param anchor  The modified anchor to persist.
@@ -197,29 +232,22 @@ hn4_result_t hn4_write_anchor_atomic(
     HN4_IN hn4_anchor_t* anchor
 )
 {
-    if (!vol || !anchor) return HN4_ERR_INVALID_ARGUMENT;
-    if (vol->read_only) return HN4_ERR_ACCESS_DENIED;
+    if (HN4_UNLIKELY(!vol || !anchor)) return HN4_ERR_INVALID_ARGUMENT;
+    if (HN4_UNLIKELY(vol->read_only)) return HN4_ERR_ACCESS_DENIED;
 
-    /* 1. Recalculate Checksum (Strict Mode: No Inline Buffer in CRC for consistency with Genesis?) */
-    /* Spec 8.1: Checksum covers 0x00 to 0x60 (offset of checksum field). Inline buffer is excluded in some contexts? */
-    /* Correction: Genesis uses Split-CRC. We must match that. */
-    
+    /* 1. Recalculate Checksum */
     anchor->checksum = 0;
     
     /* CRC Head (0x00 to 0x5F) */
     uint32_t crc = hn4_crc32(0, anchor, sizeof(hn4_anchor_t));
-    
     anchor->checksum = hn4_cpu_to_le32(crc);
 
-    /* 2. Locate Physical LBA (Cortex Mapping) */
-    /* LBA = Cortex_Start + (Hash(SeedID) % Cortex_Size_In_Anchors) */
-    
-    /* Calculate Cortex Geometry */
+    /* 2. Cortex Geometry */
     uint32_t bs = vol->vol_block_size;
-    uint32_t ss = 512; /* Assumed min sector for LBA calc if not available */
+    uint32_t ss = 512; 
     
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    if (caps) ss = caps->logical_block_size;
+    if (HN4_LIKELY(caps)) ss = caps->logical_block_size;
 
     hn4_addr_t cortex_start = vol->sb.info.lba_cortex_start;
     hn4_addr_t cortex_end   = vol->sb.info.lba_bitmap_start;
@@ -228,69 +256,114 @@ hn4_result_t hn4_write_anchor_atomic(
     uint64_t end_val   = hn4_addr_to_u64(cortex_end);
     
     /* Valid region check */
-    if (end_val <= start_val) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(end_val <= start_val)) return HN4_ERR_GEOMETRY;
     
     uint64_t region_bytes = (end_val - start_val) * ss;
     uint64_t total_slots  = region_bytes / sizeof(hn4_anchor_t);
     
-    if (total_slots == 0) return HN4_ERR_GEOMETRY;
+    if (HN4_UNLIKELY(total_slots == 0)) return HN4_ERR_GEOMETRY;
 
-    /* Hash the ID */
+    /* 3. Hash ID & Probe for Slot */
     hn4_u128_t seed = hn4_le128_to_cpu(anchor->seed_id);
     
     uint64_t h = seed.lo ^ seed.hi;
-    
     h ^= (h >> 33);
     h *= 0xff51afd7ed558ccdULL; /* HN4_NS_HASH_CONST */
     h ^= (h >> 33);
     
-    uint64_t slot_idx = h % total_slots;
-    
-    /* Calculate Physical Sector LBA */
-    uint64_t byte_offset = slot_idx * sizeof(hn4_anchor_t);
-    uint64_t sector_offset = byte_offset / ss;
-    uint64_t byte_in_sector = byte_offset % ss;
-    
-    hn4_addr_t write_lba = hn4_addr_add(cortex_start, sector_offset);
+    uint64_t start_slot = h % total_slots;
+    uint64_t target_slot = UINT64_MAX;
 
     /* 
-     * 3. Read-Modify-Write (RMW) 
-     * Since anchors are 128 bytes but sectors are 512/4096 bytes, we cannot write just the anchor.
-     * We must read the sector, update the slot, and write back.
+     * LINEAR PROBE LOGIC
+     * We must find either:
+     * A) An existing slot containing OUR ID (Update).
+     * B) An EMPTY slot (New Insertion).
+     * We cannot overwrite someone else's slot (Collision).
      */
-    /* 3. Read-Modify-Write (RMW) */
-   /* Calculate extent */
-    uint32_t sectors_to_io = 1;
-    if ((byte_in_sector + sizeof(hn4_anchor_t)) > ss) {
-        sectors_to_io = 2;
+     
+    /* Alloc IO buffer for RMW logic */
+    /* Calculate max extent needed (usually 1 or 2 sectors if anchor straddles boundary) */
+    uint32_t max_io_sectors = (sizeof(hn4_anchor_t) + ss - 1) / ss + 1;
+    void* io_buf = hn4_hal_mem_alloc(max_io_sectors * ss);
+    
+    if (HN4_UNLIKELY(!io_buf)) return HN4_ERR_NOMEM;
+
+    /* Probe Loop */
+    for (uint32_t i = 0; i < 1024; i++) {
+        uint64_t curr_slot = (start_slot + i) % total_slots;
+        
+        uint64_t p_byte_off = curr_slot * sizeof(hn4_anchor_t);
+        uint64_t p_sect_off = p_byte_off / ss;
+        uint32_t p_byte_in  = p_byte_off % ss;
+        
+        hn4_addr_t probe_lba = hn4_addr_add(cortex_start, p_sect_off);
+        
+        /* Read sector(s) containing the slot candidate */
+        uint32_t read_cnt = (p_byte_in + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
+        
+        if (HN4_UNLIKELY(hn4_hal_sync_io(vol->target_device, HN4_IO_READ, probe_lba, io_buf, read_cnt) != HN4_OK)) {
+             continue; /* Skip unreadable sectors */
+        }
+        
+        hn4_anchor_t* cand = (hn4_anchor_t*)((uint8_t*)io_buf + p_byte_in);
+        
+        /* Check 1: Is it empty? (Zero ID + Zero Class) */
+        bool is_empty = (cand->seed_id.lo == 0 && cand->seed_id.hi == 0 && cand->data_class == 0);
+        
+        /* Check 2: Is it us? (ID Match) */
+        bool is_us = (cand->seed_id.lo == anchor->seed_id.lo && 
+                      cand->seed_id.hi == anchor->seed_id.hi);
+        
+        if (is_empty || is_us) {
+            target_slot = curr_slot;
+            
+            /* 
+             * Optimization: Since we already read the sector into io_buf, 
+             * and we know where we want to write, we can just modify io_buf in place 
+             * and write it back immediately to avoid re-calculating everything.
+             * 
+             * We set write variables here to break the loop and proceed to write phase.
+             */
+             break;
+        }
+    }
+    
+    if (HN4_UNLIKELY(target_slot == UINT64_MAX)) {
+        hn4_hal_mem_free(io_buf);
+        return HN4_ERR_ENOSPC; /* Cortex saturated in this bucket region */
     }
 
-    void* io_buf = hn4_hal_mem_alloc(sectors_to_io * ss);
-    if (!io_buf) return HN4_ERR_NOMEM;
+    /* 
+     * 4. Perform Write 
+     * We reuse the geometry calculated in the successful probe iteration.
+     * target_slot is valid. io_buf holds the FRESH data from disk.
+     */
+    uint64_t final_byte_off = target_slot * sizeof(hn4_anchor_t);
+    uint64_t final_sect_off = final_byte_off / ss;
+    uint32_t final_byte_in  = final_byte_off % ss;
+    
+    hn4_addr_t write_lba = hn4_addr_add(cortex_start, final_sect_off);
+    uint32_t write_cnt = (final_byte_in + sizeof(hn4_anchor_t) > ss) ? 2 : 1;
 
-    /* Map Sector LBA to one of the 64 shard locks in the volume struct */
+    /* 
+     * RMW: Modify the specific slot in the sector buffer.
+     * Note: We MUST re-read if we didn't cache the exact buffer state or if 
+     * logic flow separated read/write. Here, io_buf holds the read data from the LAST 
+     * probe iteration, which corresponds to target_slot. It is safe to modify.
+     */
+    memcpy((uint8_t*)io_buf + final_byte_in, anchor, sizeof(hn4_anchor_t));
+
+    /* Lock Shard */
     uint64_t lock_idx = hn4_addr_to_u64(write_lba) % HN4_CORTEX_SHARDS;
     hn4_hal_spinlock_acquire(&vol->locking.shards[lock_idx].lock);
 
-    /* Read */
-    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_READ, write_lba, io_buf, sectors_to_io);
-    if (res != HN4_OK) {
-        hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
-        hn4_hal_mem_free(io_buf);
-        return res;
-    }
-
-    /* Modify */
-    memcpy((uint8_t*)io_buf + byte_in_sector, anchor, sizeof(hn4_anchor_t));
-
     /* Write */
-    res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, sectors_to_io);
+    hn4_result_t res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, write_lba, io_buf, write_cnt);
     
-    /* Release Lock immediately after IO submission */
     hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
     
-    /* Barrier to ensure metadata persistence */
-    if (res == HN4_OK) {
+    if (HN4_LIKELY(res == HN4_OK)) {
         hn4_hal_barrier(vol->target_device);
     }
 

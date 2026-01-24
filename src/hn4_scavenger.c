@@ -293,6 +293,16 @@ static void _reaper_add(hn4_volume_t* vol, _reaper_batch_t* batch, hn4_addr_t ph
      * We perform immediate synchronous free.
      */
     if (vol->sb.info.format_profile == HN4_PROFILE_PICO) {
+        if (batch->secure_shred) {
+            void* zero = hn4_hal_mem_alloc(batch->block_size);
+            if (zero) {
+                _secure_zero(zero, batch->block_size);
+                uint32_t ss = hn4_hal_get_caps(vol->target_device)->logical_block_size;
+                uint32_t spb = batch->block_size / ss;
+                hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, phys_sector_lba, zero, spb);
+                hn4_hal_mem_free(zero);
+            }
+        }
         hn4_free_block(vol, phys_sector_lba);
         return;
     }

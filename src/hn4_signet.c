@@ -35,11 +35,6 @@
  * 0. CONSTANTS & DATA LAYOUT
  * ========================================================================= */
 
-#define HN4_EXT_TYPE_SIGNET     0x99
-#define HN4_SIGNET_MAGIC        0x5349474E /* "SIGN" in ASCII */
-#define HN4_SIGNET_VERSION      3          
-#define HN4_SIGNET_MAX_DEPTH    16         /* Hard limit: 16 signatures max */
-
 /* 
  * The Watermark Payload.
  * This structure resides inside the payload[] area of a generic Extension Block.
@@ -248,12 +243,31 @@ static hn4_result_t _validate_chain_and_get_tail(
             break;
         }
         
+        /* 
+         * 3. Calculate Hash of CURRENT block 
+         * Used for Topological Verification by the NEWER block.
+         * We hash the full block size to capture all opaque data.
+         */
+        hn4_u128_t current_blk_hash = _siphash_128((const uint8_t*)buf, bs, &vol->sb.info.volume_uuid);
+
+        if (depth == 0) {
+            /* The Head of the chain becomes the 'Previous Hash' for the NEW seal we are about to write */
+            *out_prev_hash = current_blk_hash;
+        }
+        else if (check_topology) {
+            /* Verify that the older block's hash matches what the newer block claimed */
+            if (!hn4_uuid_equal(current_blk_hash, prev_hash_from_newer_block)) {
+                res = HN4_ERR_TAMPERED;
+                break;
+            }
+        }
+        
         uint32_t type = hn4_le32_to_cpu(h->type);
         
         if (type == HN4_EXT_TYPE_SIGNET) {
             hn4_signet_payload_t* p = (hn4_signet_payload_t*)h->payload;
             
-            /* 3. Structural Integrity (CRC) */
+            /* 4. Structural Integrity (CRC) */
             uint32_t stored_crc = hn4_le32_to_cpu(p->integrity_crc);
             p->integrity_crc = 0;
             
@@ -267,7 +281,7 @@ static hn4_result_t _validate_chain_and_get_tail(
                 break;
             }
 
-            /* 4. Protocol & Binding Checks */
+            /* 5. Protocol & Binding Checks */
             if (hn4_le32_to_cpu(p->version) > HN4_SIGNET_VERSION) {
                 res = HN4_ERR_VERSION_INCOMPAT;
                 break;
@@ -284,7 +298,7 @@ static hn4_result_t _validate_chain_and_get_tail(
                 break;
             }
 
-            /* 5. Temporal Causality (Monotonicity) */
+            /* 6. Temporal Causality (Monotonicity) */
             uint64_t curr_ts = hn4_le64_to_cpu(p->timestamp);
             
             /* Allow equal timestamps for batch signing, but never increasing (Old > New is impossible) */
@@ -295,28 +309,15 @@ static hn4_result_t _validate_chain_and_get_tail(
             last_seen_ts = curr_ts;
 
             /* 
-             * 6. Topological Verification
-             * We calculate the hash of the CURRENT block.
-             * If we are deeper in the chain (check_topology == true), this hash
-             * MUST match the 'prev_seal_hash' recorded in the block we just visited.
+             * 7. Topology Prep for Next Iteration
+             * Extract the 'prev_seal_hash' that THIS block claims the OLDER block has.
              */
-            size_t hash_len = sizeof(hn4_extension_header_t) + sizeof(hn4_signet_payload_t);
-            hn4_u128_t current_blk_hash = _siphash_128((const uint8_t*)buf, hash_len, &vol->sb.info.volume_uuid);
-
-            if (depth == 0) {
-                /* The Head of the chain becomes the 'Previous Hash' for the NEW seal */
-                *out_prev_hash = current_blk_hash;
-            }
-            else if (check_topology) {
-                /* Verify link integrity */
-                if (!hn4_uuid_equal(current_blk_hash, prev_hash_from_newer_block)) {
-                    res = HN4_ERR_TAMPERED;
-                    break;
-                }
-            }
+            prev_hash_from_newer_block = hn4_le128_to_cpu(p->prev_seal_hash);
+            check_topology = true;
 
             /* 
-             * Genesis Constraint: The oldest block in the chain must point to Null Hash.
+             * Genesis Constraint: 
+             * If this is the tail (next = 0), it must point to Null Hash.
              */
             if (hn4_le64_to_cpu(h->next_ext_lba) == 0) {
                 if (p->prev_seal_hash.lo != 0 || p->prev_seal_hash.hi != 0) {
@@ -324,10 +325,13 @@ static hn4_result_t _validate_chain_and_get_tail(
                     break;
                 }
             }
-
-            /* Advance topological tracker */
-            prev_hash_from_newer_block = hn4_le128_to_cpu(p->prev_seal_hash);
-            check_topology = true;
+        } else {
+            /* 
+             * Non-Signet Block (e.g. LONGNAME).
+             * These blocks do not carry a 'prev_seal_hash', so they interrupt the 
+             * cryptographic verification chain.
+             */
+            check_topology = false;
         }
 
         /* Next Link */
@@ -358,10 +362,83 @@ hn4_result_t hn4_signet_brand_anchor(
     if (HN4_UNLIKELY(sig_len != 64)) return HN4_ERR_INVALID_ARGUMENT;
     if (HN4_UNLIKELY(vol->read_only)) return HN4_ERR_ACCESS_DENIED;
 
-    /* Extract existing chain pointer (Head of Linked List) from Inline Buffer */
+    /* --- GEOMETRY SETUP (Moved Up) --- */
+    uint32_t bs = vol->vol_block_size;
+    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
+    uint32_t ss = caps->logical_block_size;
+    uint32_t spb = (bs / ss) > 0 ? (bs / ss) : 1;
+
+    /* Extract existing chain pointer (Head of Linked List) */
     uint64_t old_ext_idx = 0;
-    memcpy(&old_ext_idx, anchor->inline_buffer, 8);
-    old_ext_idx = hn4_le64_to_cpu(old_ext_idx);
+    uint64_t current_dclass = hn4_le64_to_cpu(anchor->data_class);
+    
+    if (current_dclass & HN4_FLAG_EXTENDED) {
+        memcpy(&old_ext_idx, anchor->inline_buffer, 8);
+        old_ext_idx = hn4_le64_to_cpu(old_ext_idx);
+    } else {
+        /* 
+         * MIGRATION LOGIC:
+         * Anchor is currently Inline. Check if it holds data (Name).
+         * If yes, move it to a new Extension Block so we can start a chain.
+         */
+        bool has_data = false;
+        for(size_t i=0; i<sizeof(anchor->inline_buffer); i++) {
+            if (anchor->inline_buffer[i] != 0) { has_data = true; break; }
+        }
+
+        if (has_data) {
+            /* 1. Allocate Horizon Block for the Name */
+            hn4_addr_t name_phys_lba;
+            hn4_result_t alloc_res = hn4_alloc_horizon(vol, &name_phys_lba);
+            if (alloc_res != HN4_OK) return alloc_res;
+
+            /* 2. Prepare Extension Block */
+            void* name_buf = hn4_hal_mem_alloc(bs);
+            if (!name_buf) {
+                /* Rollback alloc */
+                hn4_free_block(vol, hn4_addr_to_u64(name_phys_lba));
+                return HN4_ERR_NOMEM;
+            }
+            memset(name_buf, 0, bs);
+
+            hn4_extension_header_t* head = (hn4_extension_header_t*)name_buf;
+            head->magic = hn4_cpu_to_le32(HN4_MAGIC_META);
+            head->type  = hn4_cpu_to_le32(HN4_EXT_TYPE_LONGNAME); /* 0x02 */
+            head->next_ext_lba = 0; /* Tail of chain */
+
+            /* Copy inline data to payload */
+            /* Payload size check: bs - header (16) > 24. Safe for 512B+ blocks. */
+            memcpy(head->payload, anchor->inline_buffer, sizeof(anchor->inline_buffer));
+
+            /* Integrity */
+            /* Note: Extension blocks don't have a standard CRC field in the header struct 
+               defined in hn4.h, they rely on the payload structure. 
+               For raw LONGNAME, we don't have a specific CRC field defined in the 
+               generic header, but Signet validates its own blocks. 
+               Simple migration is trusted via Barrier. */
+
+            /* 3. Write to Disk */
+            hn4_result_t io_res = hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, name_phys_lba, name_buf, spb);
+            
+            hn4_hal_mem_free(name_buf);
+
+            if (io_res != HN4_OK) {
+                hn4_free_block(vol, hn4_addr_to_u64(name_phys_lba));
+                return io_res;
+            }
+            
+            /* Barrier ensuring migration persistence */
+            hn4_hal_barrier(vol->target_device);
+
+            /* 4. Convert Physical LBA to Block Index */
+            uint64_t name_idx;
+            if (!_addr_to_u64_checked(name_phys_lba, &name_idx)) return HN4_ERR_GEOMETRY;
+            name_idx /= spb;
+
+            /* 5. Set this new block as the "Old Head" for the Signet to link to */
+            old_ext_idx = name_idx;
+        }
+    }
 
     /* Verify existing chain logic and get Hash of the current Head */
     hn4_u128_t prev_hash = {0, 0};
@@ -369,26 +446,20 @@ hn4_result_t hn4_signet_brand_anchor(
     
     if (HN4_UNLIKELY(chain_res != HN4_OK)) return chain_res;
 
-    /* 2. Allocation (D1.5 Horizon) */
-    /* Extension blocks are small and strictly sequential; perfect for Horizon allocation */
+    /* 2. Allocation (D1.5 Horizon) for SIGNET */
     hn4_addr_t ext_phys_lba;
     hn4_result_t alloc_res = hn4_alloc_horizon(vol, &ext_phys_lba);
     if (HN4_UNLIKELY(alloc_res != HN4_OK)) return alloc_res;
 
-    uint32_t bs = vol->vol_block_size;
-    const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
-    uint32_t ss = caps->logical_block_size;
-    uint32_t spb = bs / ss;
+    /* ... (Rest of function remains unchanged) ... */
     
     uint64_t new_ext_idx;
-    /* Convert physical LBA back to block index for linking */
     if (HN4_UNLIKELY(!_addr_to_u64_checked(ext_phys_lba, &new_ext_idx))) return HN4_ERR_GEOMETRY;
     new_ext_idx /= spb;
 
     /* 3. Construct Seal (Extension Block) */
     void* ext_buf = hn4_hal_mem_alloc(bs);
     if (HN4_UNLIKELY(!ext_buf)) {
-        /* Rollback allocation to prevent leak */
         hn4_free_block(vol, hn4_addr_to_u64(ext_phys_lba));
         return HN4_ERR_NOMEM;
     }
@@ -495,7 +566,7 @@ hn4_result_t hn4_signet_brand_anchor(
 
     /* Set EXTENDED Flag in Data Class */
     uint64_t dclass = hn4_le64_to_cpu(temp_anchor.data_class);
-    dclass |= (1ULL << 63); /* High bit designates Extended Anchor */
+    dclass |= HN4_FLAG_EXTENDED; 
     temp_anchor.data_class = hn4_cpu_to_le64(dclass);
 
     /* Final Checksum Recalculation */

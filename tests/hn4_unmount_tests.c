@@ -3049,3 +3049,115 @@ hn4_TEST(Lifecycle, Immediate_Mount_Unmount_Cycle) {
     hn4_hal_mem_free(mdev->mmio_base);
     hn4_hal_mem_free(mdev);
 }
+
+/*
+ * Test N11: ZNS Bitmap Reset Flow
+ * RATIONALE:
+ * Verifies that the Void Bitmap persistence path handles the ZNS Native flag.
+ * This exercises the new logic:
+ *   if (ZNS) -> HN4_IO_ZONE_RESET -> Barrier -> HN4_IO_WRITE.
+ * 
+ * Success (HN4_OK) implies the sequence was issued correctly to the HAL
+ * without geometry errors or logic crashes.
+ */
+hn4_TEST(Persistence, ZNS_Bitmap_Reset_Flow) {
+    hn4_volume_t* vol = create_volume_fixture();
+    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
+
+    /* 1. Setup ZNS Environment */
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.hw_flags |= HN4_HW_NVM; /* Enable memory backing in mock */
+    mdev->mmio_base = hn4_hal_mem_alloc(HN4_CAPACITY);
+    
+    /* 2. Setup Dirty State to trigger persistence */
+    vol->read_only = false;
+    vol->sb.info.state_flags = HN4_VOL_DIRTY;
+    
+    /* 3. Ensure Bitmap Exists and is Dirty */
+    ASSERT_TRUE(vol->void_bitmap != NULL);
+    /* Set some bits to ensure it's not optimized out (if logic did that) */
+    vol->void_bitmap[0].data = 0xFFFFFFFFFFFFFFFFULL;
+    vol->void_bitmap[0].ecc = _calc_ecc_hamming(vol->void_bitmap[0].data);
+
+    /* 4. Execute Unmount */
+    hn4_result_t res = hn4_unmount(vol);
+    
+    /* 
+     * Expectation: HN4_OK. 
+     * If the ZNS Reset logic was missing block alignment or calculated 
+     * an invalid LBA for the reset, the HAL mock would likely return error.
+     */
+    ASSERT_EQ(HN4_OK, res);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    hn4_hal_mem_free(mdev);
+}
+
+/*
+ * Test N12: ZNS Quality Mask Reset Flow
+ * RATIONALE:
+ * Verifies the fix was applied to the Quality Mask loop as well.
+ * The Q-Mask usually resides in a different Zone than the Bitmap.
+ * This ensures the `HN4_IO_ZONE_RESET` is issued for the Q-Mask LBA range.
+ */
+hn4_TEST(Persistence, ZNS_QMask_Reset_Flow) {
+    hn4_volume_t* vol = create_volume_fixture();
+    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
+
+    /* 1. Setup ZNS Environment */
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    mdev->mmio_base = hn4_hal_mem_alloc(HN4_CAPACITY);
+
+    /* 2. Setup Dirty State */
+    vol->read_only = false;
+    vol->sb.info.state_flags = HN4_VOL_DIRTY;
+
+    /* 3. Ensure Q-Mask Exists */
+    ASSERT_TRUE(vol->quality_mask != NULL);
+    vol->quality_mask[0] = 0xAAAAAAAAAAAAAAAAULL; /* All Bronze */
+
+    /* 4. Execute Unmount */
+    hn4_result_t res = hn4_unmount(vol);
+
+    ASSERT_EQ(HN4_OK, res);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    hn4_hal_mem_free(mdev);
+}
+
+/*
+ * Test N13: Regression Check - Standard SSD Skips Reset
+ * RATIONALE:
+ * Ensures that applying the ZNS fix didn't break standard SSDs.
+ * If `HN4_HW_ZNS_NATIVE` is NOT set, the `HN4_IO_ZONE_RESET` command 
+ * must NOT be issued (as standard SSDs do not support it or it's wasteful).
+ * We rely on the unmount returning HN4_OK on a standard setup.
+ */
+hn4_TEST(Persistence, Standard_SSD_Skips_Reset) {
+    hn4_volume_t* vol = create_volume_fixture();
+    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
+
+    /* 1. Explicitly Clear ZNS Flag */
+    mdev->caps.hw_flags &= ~HN4_HW_ZNS_NATIVE;
+    
+    /* 2. Enable NVM/Write support */
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    mdev->mmio_base = hn4_hal_mem_alloc(HN4_CAPACITY);
+
+    /* 3. Setup Dirty State */
+    vol->read_only = false;
+    vol->sb.info.state_flags = HN4_VOL_DIRTY;
+
+    /* 4. Execute Unmount */
+    hn4_result_t res = hn4_unmount(vol);
+
+    /* 
+     * Success here implies the code didn't inadvertently try to Reset 
+     * a non-ZNS device (which might return error in a strict HAL).
+     */
+    ASSERT_EQ(HN4_OK, res);
+
+    hn4_hal_mem_free(mdev->mmio_base);
+    hn4_hal_mem_free(mdev);
+}

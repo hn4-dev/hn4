@@ -333,11 +333,27 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                         }
                         
                         /* Swap Scratch (Destructive allowed here) */
-                       hn4_bulk_cpu_to_le64(raw, items);
-                        
+                       /* Swap Scratch (Destructive allowed here) */
+                        hn4_bulk_cpu_to_le64(raw, items);
+
                         uint32_t sectors = (items * 8 + ss - 1) / ss;
                         hn4_addr_t lba = hn4_lba_from_sectors(start_lba_val); 
-                        
+
+                        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+                            /* 
+                            * Since Format ensures block_size == zone_size for ZNS,
+                            * and flush_buf_sz is clamped to at least block_size,
+                            * every write here corresponds to a full Zone Reset + Write.
+                            */
+                            if (hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, 0) != HN4_OK) {
+                                persistence_ok = false;
+                                final_res = HN4_ERR_HW_IO;
+                                break;
+                            }
+                            /* Mandatory Barrier after Reset before Write */
+                            hn4_hal_barrier(dev);
+                        }
+
                         if (HN4_UNLIKELY(hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, meta_buf, sectors) != HN4_OK)) {
                             persistence_ok = false;
                             final_res = HN4_ERR_HW_IO;
@@ -370,7 +386,16 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
                         
                         uint32_t sectors = (copy_len + ss - 1) / ss;
                         hn4_addr_t lba = hn4_lba_from_sectors(start_lba_val);
-                        
+
+                        if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+                            if (hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba, NULL, 0) != HN4_OK) {
+                                persistence_ok = false;
+                                final_res = HN4_ERR_HW_IO;
+                                break;
+                            }
+                            hn4_hal_barrier(dev);
+                        }
+
                         if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba, meta_buf, sectors) != HN4_OK) {
                             persistence_ok = false;
                             final_res = HN4_ERR_HW_IO;

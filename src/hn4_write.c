@@ -69,6 +69,41 @@ static const hn4_write_policy_t _write_policy_lut[16] = {
     /* [15] HYPER_CLOUD */{ 10000, 5 }
 };
 
+/* 
+ * WRITE VALIDATION LOOKUP TABLE (4-bit Index)
+ * Bits: [3:Immutable] [2:Tombstone] [1:Panic] [0:ReadOnly]
+ * 
+ * Logic Precedence matches original code:
+ * 1. ReadOnly (Bit 0) -> HN4_ERR_ACCESS_DENIED
+ * 2. Panic    (Bit 1) -> HN4_ERR_VOLUME_LOCKED
+ * 3. Tomb     (Bit 2) -> HN4_ERR_TOMBSTONE
+ * 4. Imm      (Bit 3) -> HN4_ERR_IMMUTABLE
+ */
+static const hn4_result_t _write_check_lut[16] = {
+    /* 0000 */ HN4_OK,                  /* All Good */
+    /* 0001 */ HN4_ERR_ACCESS_DENIED,   /* RO */
+    /* 0010 */ HN4_ERR_VOLUME_LOCKED,   /* Panic */
+    /* 0011 */ HN4_ERR_ACCESS_DENIED,   /* Panic + RO (RO wins) */
+    /* 0100 */ HN4_ERR_TOMBSTONE,       /* Tomb */
+    /* 0101 */ HN4_ERR_ACCESS_DENIED,   /* Tomb + RO */
+    /* 0110 */ HN4_ERR_VOLUME_LOCKED,   /* Tomb + Panic */
+    /* 0111 */ HN4_ERR_ACCESS_DENIED,   /* Tomb + Panic + RO */
+    /* 1000 */ HN4_ERR_IMMUTABLE,       /* Imm */
+    /* 1001 */ HN4_ERR_ACCESS_DENIED,   /* Imm + RO */
+    /* 1010 */ HN4_ERR_VOLUME_LOCKED,   /* Imm + Panic */
+    /* 1011 */ HN4_ERR_ACCESS_DENIED,   /* Imm + Panic + RO */
+    /* 1100 */ HN4_ERR_TOMBSTONE,       /* Imm + Tomb (Tomb wins per original logic order?)  */
+    /* 1101 */ HN4_ERR_ACCESS_DENIED,   /* All + RO */
+    /* 1110 */ HN4_ERR_VOLUME_LOCKED,   /* All + Panic */
+    /* 1111 */ HN4_ERR_ACCESS_DENIED    /* All */
+};
+
+/* CORRECTION: Use _Static_assert for C11 compliance matching project style */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    _Static_assert(sizeof(_write_check_lut) / sizeof(_write_check_lut[0]) == 16,
+                  "HN4: Write check LUT size mismatch");
+#endif
+
 /*
  * POLICY LOOKUP TABLES
  * Centralized logic for allocation strategies based on Device Type and Profile.
@@ -350,43 +385,54 @@ _Check_return_ hn4_result_t hn4_write_block_atomic(
 {
     HN4_LOG_CRIT("WRITE_ATOMIC: Enter. Vol=%p Block=%llu Len=%u", vol, (unsigned long long)block_idx, len);
 
-    /* 1. Pre-flight Validation */
+   /* 1. Pointer & Geometry Checks (Must be explicit) */
+    /* We assume block_idx and vol are checked here because computing the index relies on valid pointers */
     if (HN4_UNLIKELY(!vol || !anchor || !data)) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Invalid Args (NULL ptr)");
         return HN4_ERR_INVALID_ARGUMENT;
     }
-retry_transaction:;
-    if (HN4_UNLIKELY(vol->read_only)) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Volume is RO");
-        return HN4_ERR_ACCESS_DENIED;
-    }
-    if (HN4_UNLIKELY(vol->sb.info.state_flags & HN4_VOL_PANIC)) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Volume Panic. Writes disabled.");
-        return HN4_ERR_VOLUME_LOCKED;
+
+    /* Optimization: Hoist the capacity calculation to avoid div if possible, 
+       or assume vol->vol_capacity_blocks is cached. If not, calc is necessary. */
+    if (HN4_UNLIKELY(block_idx > (UINT64_MAX / vol->vol_block_size))) {
+         return HN4_ERR_INVALID_ARGUMENT;
     }
 
+retry_transaction:;
+
+    /* 2. Setup Transaction Copy (moved up to allow flag extraction) */
     hn4_anchor_t txn_anchor;
     memcpy(&txn_anchor, anchor, sizeof(hn4_anchor_t));
 
-    /* Use txn_anchor for logic checks */
-    uint64_t dclass_check = hn4_le64_to_cpu(txn_anchor.data_class);
-
-    /*
-     * Tombstone Check:
-     * We must not write to a file marked for deletion (Tombstone).
-     * Doing so would create "Zombie Allocations" that the Reaper might miss.
+    /* 
+     * 3. BITWISE STATE FUSION
+     * Extract all 4 conditions into a 4-bit integer.
+     * We use !!(cond) to normalize to 0 or 1, then shift.
+     * This allows the CPU to use pipeline-friendly ALU ops instead of branches.
      */
-    if (dclass_check & HN4_FLAG_TOMBSTONE) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: Attempted write to Tombstone (Deleted File).");
-        return HN4_ERR_TOMBSTONE;
-    }
+    
+    uint64_t dclass = hn4_le64_to_cpu(txn_anchor.data_class);
+    uint32_t perms  = hn4_le32_to_cpu(anchor->permissions);
+    
+    uint32_t idx = 0;
+    
+    /* Bit 0: RO */
+    idx |= (vol->read_only ? 1 : 0);
+    
+    /* Bit 1: Panic */
+    idx |= ((vol->sb.info.state_flags & HN4_VOL_PANIC) ? 2 : 0);
+    
+    /* Bit 2: Tombstone */
+    idx |= ((dclass & HN4_FLAG_TOMBSTONE) ? 4 : 0);
+    
+    /* Bit 3: Immutable */
+    idx |= ((perms & HN4_PERM_IMMUTABLE) ? 8 : 0);
 
-    uint32_t perms = hn4_le32_to_cpu(anchor->permissions);
-
-    /* Immutable Check (Spec 9.4) */
-    if (perms & HN4_PERM_IMMUTABLE) {
-        HN4_LOG_CRIT("WRITE_ATOMIC: File is Immutable");
-        return HN4_ERR_IMMUTABLE;
+    /* 4. Single Branch Resolution */
+    hn4_result_t res = _write_check_lut[idx];
+    
+    if (HN4_UNLIKELY(res != HN4_OK)) {
+        HN4_LOG_CRIT("WRITE_ATOMIC: Rejected by State Check (Code %d)", res);
+        return res;
     }
 
     /* Calculate Effective Permissions */
@@ -494,6 +540,16 @@ retry_transaction:;
             return HN4_ERR_HEADER_ROT;
         }
 
+        uint32_t old_dcrc = hn4_le32_to_cpu(old_hdr->data_crc);
+        uint32_t cal_dcrc = hn4_crc32(HN4_CRC_SEED_DATA, old_hdr->payload, payload_cap);
+
+        if (old_dcrc != cal_dcrc) {
+            HN4_LOG_CRIT("WRITE_ATOMIC: Thaw source has Payload Rot (Bit Rot). Aborting.");
+            hn4_hal_mem_free(thaw_buf);
+            hn4_hal_mem_free(io_buf);
+            return HN4_ERR_PAYLOAD_ROT;
+        }
+
         uint32_t meta = hn4_le32_to_cpu(old_hdr->comp_meta);
         uint8_t algo  = meta & HN4_COMP_ALGO_MASK;
         uint32_t csz  = meta >> HN4_COMP_SIZE_SHIFT;
@@ -525,7 +581,7 @@ retry_transaction:;
      * - HYPER_CLOUD: Never speculate. Only compress if HINT_COMPRESSED is explicitly set.
      *   (Server workloads are often already compressed/encrypted; avoiding the CPU hit boosts IOPS).
      */
-     bool try_compress = (dclass_check & HN4_HINT_COMPRESSED);
+     bool try_compress = (dclass & HN4_HINT_COMPRESSED);
     
     if (vol->sb.info.format_profile == HN4_PROFILE_ARCHIVE) {
         try_compress = true;
@@ -537,7 +593,7 @@ retry_transaction:;
      * Furthermore, the Read Path (_validate_block) explicitly rejects blocks 
      * marked as both Encrypted and Compressed to prevent compression-oracle attacks.
      */
-    if (dclass_check & HN4_HINT_ENCRYPTED) {
+    if (dclass & HN4_HINT_ENCRYPTED) {
         try_compress = false;
     }
 
@@ -837,7 +893,25 @@ retry_transaction:;
 
         if (io_res == HN4_OK) {
             /* 3. REVERSE ENGINEER GRAVITY */
-            uint64_t actual_lba_idx = hn4_addr_to_u64(phys_sector) / sectors;
+            uint64_t actual_lba_idx;
+
+            #ifdef HN4_USE_128BIT
+                /* FIX: 128-bit aware calculation for Quettabyte ZNS */
+                hn4_u128_t blk_128 = hn4_u128_div_u64(phys_sector, sectors);
+                /* If high part set, we can't map back to u64 block index anyway */
+                if (blk_128.hi > 0) actual_lba_idx = HN4_LBA_INVALID; 
+                else actual_lba_idx = blk_128.lo;
+            #else
+                actual_lba_idx = phys_sector / sectors;
+            #endif
+
+            uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
+
+            if (actual_lba_idx >= max_vol_blocks) {
+                HN4_LOG_CRIT("ZNS Error: Drive returned OOB LBA %llu", (unsigned long long)actual_lba_idx);
+                hn4_hal_mem_free(io_buf);
+                return HN4_ERR_GEOMETRY;
+            }
 
             if (actual_lba_idx != target_lba) {
                 

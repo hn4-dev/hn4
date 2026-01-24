@@ -685,9 +685,24 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     }
 
      hn4_result_t res = _check_profile_compatibility(pid, caps, capacity_bytes);
-    if (res != HN4_OK) return res;
+     if (res != HN4_OK) return res;
 
-    /* --- CAPACITY BOUNDS CHECK --- */
+    #ifdef HN4_USE_128BIT
+    hn4_u128_t min_cap_128 = hn4_u128_from_u64(spec->min_cap);
+    if (hn4_u128_cmp(capacity_bytes, min_cap_128) < 0) {
+        /* Cannot log struct directly, log error string */
+        HN4_LOG_CRIT("Capacity too small for profile");
+        return HN4_ERR_GEOMETRY;
+    }
+
+    if (spec->max_cap != HN4_CAP_UNLIMITED) {
+        hn4_u128_t max_cap_128 = hn4_u128_from_u64(spec->max_cap);
+        if (hn4_u128_cmp(capacity_bytes, max_cap_128) > 0) {
+            HN4_LOG_CRIT("Capacity out of bounds for profile");
+            return HN4_ERR_GEOMETRY;
+        }
+    }
+    #else
     if (capacity_bytes < spec->min_cap) {
         HN4_LOG_VAL("Capacity too small for profile", capacity_bytes);
         return HN4_ERR_GEOMETRY;
@@ -697,6 +712,7 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
         HN4_LOG_VAL("Capacity out of bounds for profile", capacity_bytes);
         return HN4_ERR_GEOMETRY;
     }
+    #endif
 
     /* Resolve Block Size */
     uint32_t bs = spec->default_block_size;
@@ -710,11 +726,12 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
 
     /* 
      * FIX [Spec 13.2]: ZNS Macro-Blocking.
-     * Only enforce Zone Size locking if the hardware is ZNS *AND* the profile 
-     * resolved to ZNS mode (i.e., HYPER_CLOUD). 
-     * If resolved_type is SSD, we treat it as a conventional namespace.
+     * If Hardware is ZNS, we MUST lock Block Size to Zone Size.
+     * Allowing small blocks (Generic Profile) on ZNS causes the Superblock and 
+     * Epoch Ring to share Zone 0. The unmount process resets Zone 0 to update 
+     * the SB, which would catastrophically wipe the Epoch Ring.
      */
-    if ((caps->hw_flags & HN4_HW_ZNS_NATIVE) && (resolved_type == HN4_DEV_ZNS)) {
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
         if (caps->zone_size_bytes == 0) {
             HN4_LOG_CRIT("ZNS Format Error: Device reported 0-byte Zone Size.");
             return HN4_ERR_GEOMETRY;
@@ -910,12 +927,26 @@ static hn4_result_t _calc_geometry(const hn4_format_params_t* params,
     uint64_t horizon_pct = (pid == HN4_PROFILE_ARCHIVE) ? 2 : 10;
     uint64_t horizon_sz;
 
-    /* Overflow Guard */
+    #ifdef HN4_USE_128BIT
+    {
+        /* Logic: (Cap / 100) * Pct */
+        hn4_u128_t one_pct = hn4_u128_div_u64(capacity_bytes, 100);
+        hn4_u128_t h_bytes = hn4_u128_mul_u64(one_pct, horizon_pct);
+        
+        /* Clamp to u64 max for allocation safety */
+        if (h_bytes.hi > 0) horizon_sz = UINT64_MAX;
+        else horizon_sz = h_bytes.lo;
+    }
+    #else
+
     if (capacity_bytes > (UINT64_MAX / horizon_pct)) {
         horizon_sz = (capacity_bytes / 100) * horizon_pct;
     } else {
         horizon_sz = (capacity_bytes * horizon_pct) / 100;
     }
+
+    #endif
+
     horizon_sz = HN4_ALIGN_UP(horizon_sz, bs);
     if (horizon_sz < min_horizon) horizon_sz = min_horizon;
 

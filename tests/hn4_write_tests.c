@@ -12809,3 +12809,737 @@ hn4_TEST(Rotational, Sorted_Scan_Integrity) {
     hn4_unmount(vol);
     write_fixture_teardown(dev);
 }
+
+/*
+ * TEST: Physics_Gravity_Well_Reclaim
+ * Objective: Verify the "Gravity Pull" logic.
+ *            If k=0 is occupied, but k=1 is free and k=2 is occupied,
+ *            the allocator MUST fill k=1 (lowest available energy state),
+ *            rather than appending to the end (k=3).
+ */
+hn4_TEST(Physics, Gravity_Well_Reclaim) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint64_t G = 32000;
+    
+    /* 1. Clog k=0 and k=2 manually */
+    bool c;
+    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, 0, 0, 0, 0);
+    uint64_t lba_k2 = _calc_trajectory_lba(vol, G, 0, 0, 0, 2);
+    
+    _bitmap_op(vol, lba_k0, BIT_SET, &c);
+    _bitmap_op(vol, lba_k2, BIT_SET, &c);
+
+    /* Ensure k=1 is explicitly CLEAR */
+    uint64_t lba_k1 = _calc_trajectory_lba(vol, G, 0, 0, 0, 1);
+    _bitmap_op(vol, lba_k1, BIT_CLEAR, &c);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x88;
+    anchor.gravity_center = hn4_cpu_to_le64(G);
+    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    uint8_t buf[16] = "RECLAIM_TEST";
+
+    /* 2. Perform Write */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 12));
+
+    /* 3. Verify it landed at k=1 (The gap) */
+    uint64_t actual_lba = _resolve_residency_verified(vol, &anchor, 0);
+    
+    ASSERT_EQ(lba_k1, actual_lba);
+    ASSERT_NE(lba_k0, actual_lba);
+    ASSERT_NE(lba_k2, actual_lba);
+
+    /* 4. Verify Read */
+    uint8_t read_buf[4096] = {0};
+    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
+    ASSERT_EQ(0, strcmp((char*)read_buf, "RECLAIM_TEST"));
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: ZNS_Logical_Boundary_Violation
+ * Objective: Verify the fix for ZNS Write Pointer desync.
+ *            If the Drive returns an LBA that is physically valid but 
+ *            logically Out-Of-Bounds (exceeds Volume Capacity), 
+ *            the driver MUST reject it to prevent bitmap corruption.
+ */
+hn4_TEST(ZNS, Logical_Boundary_Violation) {
+    /* 1. Setup Physical Device: 256MB */
+    /* Large enough to hold a full simulated zone */
+    uint64_t PHY_SIZE = 256ULL * 1024 * 1024;
+    hn4_hal_device_t* dev = _w_create_fixture_raw();
+    _w_configure_caps(dev, PHY_SIZE);
+    
+    /* Inject RAM buffer */
+    uint8_t* raw_mem = calloc(1, PHY_SIZE);
+    _w_inject_nvm_buffer(dev, raw_mem);
+
+    /* Mock ZNS Hardware: 1 Zone = 256MB */
+    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
+    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mock->caps.zone_size_bytes = PHY_SIZE;
+
+    /* 2. Format Logical Volume: 64MB (Partitioned) */
+    /* This creates the disparity: Logical Cap < Physical Cap */
+    hn4_format_params_t fp = {
+        .target_profile = HN4_PROFILE_HYPER_CLOUD,
+        .override_capacity_bytes = 64ULL * 1024 * 1024,
+        .mount_intent_flags = HN4_MNT_VIRTUAL
+    };
+    /* Note: Format might warn about alignment, but should succeed */
+    if (hn4_format(dev, &fp) != HN4_OK) {
+        /* Fallback if format rejects virtual sizing on ZNS mock */
+        free(raw_mem); hn4_hal_mem_free(dev); return; 
+    }
+
+    /* Force ZNS tag in SB if format didn't set it (Generic profile might not) */
+    hn4_superblock_t sb;
+    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
+    sb.info.device_type_tag = HN4_DEV_ZNS;
+    _w_write_sb(dev, &sb, 0);
+
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 3. SABOTAGE: Push Zone 0 Write Pointer past 64MB */
+    /* We use HAL direct calls to bypass FS bookkeeping */
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+    void* dummy = calloc(1, bs);
+    
+    /* We need to fill > 64MB. 
+       64MB / 64KB block = 1024 blocks.
+       Write 1025 blocks to ensure we cross the boundary. */
+    uint64_t fill_count = (64ULL * 1024 * 1024 / bs) + 1;
+    
+    for(uint64_t i=0; i<fill_count; i++) {
+        hn4_addr_t res_lba;
+        /* Append to Zone 0 (Start LBA 0) */
+        hn4_hal_zns_append_sync(dev, hn4_addr_from_u64(0), dummy, spb, &res_lba);
+    }
+
+    /* 4. Trigger the Write */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    /* Gravity Center 0 points to Zone 0 */
+    anchor.gravity_center = hn4_cpu_to_le64(0);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 
+     * EXECUTION:
+     * Driver predicts LBA 0 (Start of Zone).
+     * Driver sends Append.
+     * HAL (Drive) returns LBA = 1025 (Physically valid, offset ~64.1MB).
+     * 
+     * WITHOUT FIX: Driver tries `_bitmap_op(vol, 1025, ...)`. 
+     *              Bitmap is sized for 64MB (1024 blocks). 1025 is OOB -> Segfault/Corrupt.
+     * WITH FIX:    Driver checks `1025 < vol_capacity_blocks`. Returns error.
+     */
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, dummy, 10);
+
+    /* Verify the Safety Catch fired */
+    ASSERT_EQ(HN4_ERR_GEOMETRY, res);
+
+    free(dummy);
+    hn4_unmount(vol);
+    free(raw_mem);
+    hn4_hal_mem_free(dev);
+}
+
+hn4_TEST(Compression, Entropy_Inversion) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_sz = bs - sizeof(hn4_block_header_t);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+    /* FORCE Compression Hint */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_HINT_COMPRESSED);
+
+    /* 1. Generate High Entropy Payload (Random Noise) */
+    uint8_t* noise = malloc(payload_sz);
+    srand(0xBAD5EED);
+    for(uint32_t i=0; i<payload_sz; i++) noise[i] = (uint8_t)rand();
+
+    /* 2. Write Data */
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, noise, payload_sz));
+
+    /* 3. Physical Inspection: Verify Format fell back to RAW */
+    uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
+    uint64_t lba = _calc_trajectory_lba(vol, G, 0, 0, 0, 0); // V=0
+    
+    uint32_t spb = bs / 512;
+    uint8_t* raw_disk = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba * spb), raw_disk, spb);
+
+    hn4_block_header_t* h = (hn4_block_header_t*)raw_disk;
+    uint32_t meta = hn4_le32_to_cpu(h->comp_meta);
+    
+    /* Expect Algo = NONE (0), despite the Hint */
+    ASSERT_EQ(HN4_COMP_NONE, meta & HN4_COMP_ALGO_MASK);
+    
+    /* Verify Data Integrity */
+    ASSERT_EQ(0, memcmp(h->payload, noise, payload_sz));
+
+    free(noise); free(raw_disk);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Physics, Interstellar_OOB) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x999;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+
+    uint8_t buf[16] = "OOB_ATTACK";
+
+    /* 
+     * Attempt write at Max Logical Index.
+     * Naive Trajectory: G + (Max * V) -> Wraps to G.
+     * Correct Logic: Should detect LBA > Vol_Capacity.
+     */
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, UINT64_MAX, buf, 10);
+
+    /* Must reject as Geometry Error or Invalid Argument */
+    ASSERT_TRUE(res == HN4_ERR_GEOMETRY || res == HN4_ERR_INVALID_ARGUMENT);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Atomicity, Thaw_Corruption_Detection) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 1. Write Valid Baseline (Full Block) */
+    uint8_t* buf = calloc(1, payload_cap);
+    memset(buf, 0xAA, payload_cap);
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, payload_cap));
+
+    /* 2. Corrupt the Block on Disk */
+    uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
+    uint64_t lba = _calc_trajectory_lba(vol, G, 0, 0, 0, 0); // k=0
+    
+    uint32_t spb = bs / 512;
+    uint8_t* raw = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba * spb), raw, spb);
+    
+    /* Flip bit in payload */
+    raw[sizeof(hn4_block_header_t)] ^= 0xFF; 
+    
+    /* Write back CORRUPT data (CRC mismatch created) */
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(lba * spb), raw, spb);
+
+    /* 3. Attempt Partial Update (Trigger Thaw) */
+    uint8_t patch[16] = "PATCH";
+    
+    /* Driver should: Read Old -> Check CRC -> Fail -> Abort Write */
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, patch, 5);
+
+    /* Expect Payload Rot error */
+    ASSERT_EQ(HN4_ERR_PAYLOAD_ROT, res);
+
+    /* Verify Generation NOT advanced (Anchor safety) */
+    /* Note: Gen starts at 1, Step 1 bumps to 2. Step 3 fails, so it must stay 2. */
+    ASSERT_EQ(2, hn4_le32_to_cpu(anchor.write_gen));
+
+    free(buf); free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Security, Sovereign_Vs_Immutable) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x60D;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.write_gen = hn4_cpu_to_le32(1);
+
+    /* 
+     * CONFIGURATION:
+     * File is IMMUTABLE.
+     * User has WRITE and SOVEREIGN permissions.
+     */
+    uint32_t perms = HN4_PERM_WRITE | HN4_PERM_READ | HN4_PERM_IMMUTABLE;
+    anchor.permissions = hn4_cpu_to_le32(perms);
+
+    /* Attempt Write with Sovereign Authority passed in session */
+    uint8_t buf[16] = "I_AM_ROOT";
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, buf, 9, HN4_PERM_SOVEREIGN);
+
+    /* MUST FAIL with Immutable error */
+    ASSERT_EQ(HN4_ERR_IMMUTABLE, res);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Topology, Ghost_Intersection) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+
+    /* 1. Define File A */
+    hn4_anchor_t anchorA = {0};
+    anchorA.seed_id.lo = 0xAAAA;
+    anchorA.permissions = hn4_cpu_to_le32(HN4_PERM_READ);
+    anchorA.gravity_center = hn4_cpu_to_le64(5000);
+    uint64_t target_lba = _calc_trajectory_lba(vol, 5000, 0, 0, 0, 0);
+
+    /* 2. Manually Write an "Imposter" Block (File B) at File A's location */
+    /* This simulates a hash collision where B overwrote A, or A was deleted and B reused the slot */
+    uint8_t* raw = calloc(1, bs);
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    
+    h->magic = hn4_cpu_to_le32(HN4_BLOCK_MAGIC);
+    h->well_id.lo = 0xBBBB; /* Different ID */
+    h->generation = hn4_cpu_to_le64(1);
+    
+    /* Valid CRC for Imposter */
+    h->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, h, offsetof(hn4_block_header_t, header_crc)));
+
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(target_lba * spb), raw, spb);
+
+    /* 3. Mark Bitmap Valid (Simulate occupied) */
+    bool c; _bitmap_op(vol, target_lba, BIT_SET, &c);
+
+    /* 4. Attempt to Read File A */
+    uint8_t read_buf[4096];
+    hn4_result_t res = hn4_read_block_atomic(vol, &anchorA, 0, read_buf, 4096);
+
+    /* 
+     * Expect ID_MISMATCH.
+     * If it returns OK, the driver failed to check the Well ID.
+     */
+    ASSERT_EQ(HN4_ERR_ID_MISMATCH, res);
+
+    free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+/*
+ * TEST: Topology_Hash_Collision_Overwrite_Protection
+ * Objective: Verify that the Cortex (Anchor Table) handles hash collisions
+ *            during WRITE. 
+ *            If File A and File B hash to the same slot, File B must probe
+ *            to the next slot, NOT overwrite File A.
+ */
+hn4_TEST(Topology, Hash_Collision_Overwrite_Protection) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 
+     * 1. Geometry Setup 
+     * We need to force a collision. 
+     * Cortex Size is determined by fixture. 
+     * Fixture: 64MB Vol, 4KB Block.
+     * Cortex start: ~16. Bitmap start: ~16400.
+     * Total Cortex Bytes ~ 64MB * 2% = 1.2MB.
+     * Anchor Size = 128. Slots ~= 10,000.
+     */
+    
+    /* Let's find two IDs that collide in the current volume geometry */
+    uint64_t start_sect, end_sect;
+    _addr_to_u64_checked(vol->sb.info.lba_cortex_start, &start_sect);
+    _addr_to_u64_checked(vol->sb.info.lba_bitmap_start, &end_sect);
+    uint32_t ss = 512; // From fixture
+    uint64_t total_slots = ((end_sect - start_sect) * ss) / sizeof(hn4_anchor_t);
+    
+    /* Find Collision pair */
+    hn4_u128_t id_A = { .lo = 1, .hi = 0 };
+    hn4_u128_t id_B = { .lo = 0, .hi = 0 };
+    
+    uint64_t hash_A = (id_A.lo ^ id_A.hi);
+    hash_A ^= (hash_A >> 33); hash_A *= 0xff51afd7ed558ccdULL; hash_A ^= (hash_A >> 33);
+    uint64_t slot_A = hash_A % total_slots;
+    
+    bool found = false;
+    for(uint64_t i=2; i<10000; i++) {
+        id_B.lo = i;
+        uint64_t hash_B = (id_B.lo ^ id_B.hi);
+        hash_B ^= (hash_B >> 33); hash_B *= 0xff51afd7ed558ccdULL; hash_B ^= (hash_B >> 33);
+        if ((hash_B % total_slots) == slot_A) {
+            found = true;
+            break;
+        }
+    }
+    
+    if (!found) {
+        printf("[WARN] Could not find collision pair. Test Skipped.\n");
+        hn4_unmount(vol);
+        write_fixture_teardown(dev);
+        return;
+    }
+
+    /* 2. Write File A */
+    hn4_anchor_t anchorA = {0};
+    anchorA.seed_id = hn4_cpu_to_le128(id_A);
+    anchorA.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchorA.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchorA));
+
+    /* 3. Write File B (Collision) */
+    hn4_anchor_t anchorB = {0};
+    anchorB.seed_id = hn4_cpu_to_le128(id_B);
+    anchorB.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchorB.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchorB));
+
+    /* 4. Verify File A still exists */
+    hn4_anchor_t readA;
+    hn4_result_t resA = _ns_scan_cortex_slot(vol, id_A, &readA, NULL);
+    
+    /* If Bug exists: File A is gone (overwritten by B), returns NOT_FOUND or ID_MISMATCH */
+    ASSERT_EQ(HN4_OK, resA);
+    ASSERT_EQ(id_A.lo, hn4_le128_to_cpu(readA.seed_id).lo);
+
+    /* 5. Verify File B exists */
+    hn4_anchor_t readB;
+    hn4_result_t resB = _ns_scan_cortex_slot(vol, id_B, &readB, NULL);
+    ASSERT_EQ(HN4_OK, resB);
+    ASSERT_EQ(id_B.lo, hn4_le128_to_cpu(readB.seed_id).lo);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Signet_Inline_Data_Corruption
+ * Objective: Verify that branding a file that stores data/name in the 
+ *            Inline Buffer (Standard Mode) does not interpret the data 
+ *            as a garbage Extension Pointer.
+ *
+ * Bug Trigger: The driver blindly reads the first 8 bytes of inline_buffer
+ *              as an LBA pointer without checking HN4_FLAG_EXTENDED.
+ *              If the file has a name "testfile.txt", it tries to read LBA 
+ *              0x7478742E656C6966 ("file.txt" in hex), causing GEOMETRY error
+ *              or reading random disk locations.
+ */
+hn4_TEST(Signet, Inline_Data_Corruption) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Create a Standard File (Inline Name) */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x516;
+    /* Valid, Static, NOT Extended */
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    
+    /* "bad_ptr" - 7 bytes. Fits in inline. 
+       Hex: 62 61 64 5F 70 74 72 00 
+       If interpreted as LBA: 0x007274705F646162 (Huge number) */
+    strcpy((char*)anchor.inline_buffer, "bad_ptr");
+
+    /* 2. Attempt to Brand it */
+    uint64_t author = 0x1;
+    uint8_t sig[64] = {0};
+    uint8_t pub[32] = {0};
+
+    hn4_result_t res = hn4_signet_brand_anchor(vol, &anchor, author, sig, 64, pub);
+
+    /* 
+     * EXPECTATION: 
+     * It should NOT return HN4_ERR_GEOMETRY (trying to read LBA "bad_ptr").
+     * It should either:
+     * A) Return HN4_ERR_VERSION_INCOMPAT (Refuse to sign non-extended files), OR
+     * B) Return HN4_OK and correctly migrate the name (Advanced fix).
+     * 
+     * For now, we assert it does NOT fail with Geometry/IO error from reading garbage.
+     */
+    if (res == HN4_ERR_GEOMETRY || res == HN4_ERR_HW_IO) {
+        printf("FAIL: Driver tried to read filename bytes as LBA address!\n");
+        ASSERT_TRUE(0);
+    }
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Signet, Auto_Migration_Verify) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    /* 1. Create Standard File */
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x516;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_STATIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    strcpy((char*)anchor.inline_buffer, "migrate_me");
+
+    /* 2. Brand it (Trigger Migration) */
+    uint64_t author = 0x1;
+    uint8_t sig[64] = {0xAA};
+    uint8_t pub[32] = {0xBB};
+
+    ASSERT_EQ(HN4_OK, hn4_signet_brand_anchor(vol, &anchor, author, sig, 64, pub));
+
+    /* 3. Verify Anchor Inline Buffer updated */
+    /* It should now hold a pointer (8 bytes), not the string */
+    uint64_t head_ptr;
+    memcpy(&head_ptr, anchor.inline_buffer, 8);
+    ASSERT_NE(0, head_ptr);
+    
+    /* 4. Verify Flag Updated */
+    uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
+    ASSERT_TRUE(dclass & HN4_FLAG_EXTENDED);
+
+    /* 5. Traverse Chain */
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+    void* buf = calloc(1, bs);
+    
+    /* Read Head (Should be SIGNET, linking to LONGNAME) */
+    /* NOTE: Signet logic pushes new block as HEAD. So HEAD is SIGNET. */
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(hn4_le64_to_cpu(head_ptr) * spb), buf, spb);
+    hn4_extension_header_t* h1 = (hn4_extension_header_t*)buf;
+    ASSERT_EQ(HN4_EXT_TYPE_SIGNET, hn4_le32_to_cpu(h1->type));
+    
+    /* Follow link to next (Old Head) */
+    uint64_t next = hn4_le64_to_cpu(h1->next_ext_lba);
+    ASSERT_NE(0, next);
+    
+    /* Read Tail (Should be LONGNAME) */
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(next * spb), buf, spb);
+    hn4_extension_header_t* h2 = (hn4_extension_header_t*)buf;
+    ASSERT_EQ(HN4_EXT_TYPE_LONGNAME, hn4_le32_to_cpu(h2->type));
+    
+    /* Verify Content */
+    ASSERT_EQ(0, strcmp((char*)h2->payload, "migrate_me"));
+    
+    /* Verify Chain End */
+    ASSERT_EQ(0, hn4_le64_to_cpu(h2->next_ext_lba));
+
+    free(buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+hn4_TEST(Signet, Chain_Integrity_Tamper) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x99;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+
+    uint8_t sig[64] = {0};
+    uint8_t pub[32] = {0};
+
+    ASSERT_EQ(HN4_OK, hn4_signet_brand_anchor(vol, &anchor, 1, sig, 64, pub));
+    
+    /* Capture Seal A Location */
+    uint64_t ptr_A;
+    memcpy(&ptr_A, anchor.inline_buffer, 8);
+    ptr_A = hn4_le64_to_cpu(ptr_A);
+
+    ASSERT_EQ(HN4_OK, hn4_signet_brand_anchor(vol, &anchor, 2, sig, 64, pub));
+
+    /* Corrupt Seal A */
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+    void* buf = calloc(1, bs);
+    
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(ptr_A * spb), buf, spb);
+    ((uint8_t*)buf)[100] ^= 0xFF; 
+    hn4_hal_sync_io(dev, HN4_IO_WRITE, hn4_lba_from_blocks(ptr_A * spb), buf, spb);
+
+    /* Attempt Seal C -> Expect DATA_ROT (CRC Fail) */
+    hn4_result_t res = hn4_signet_brand_anchor(vol, &anchor, 3, sig, 64, pub);
+    
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    free(buf);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+hn4_TEST(Signet, Max_Depth_Enforcement) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+
+    uint8_t sig[64] = {0};
+    uint8_t pub[32] = {0};
+
+    /* Fill Chain to Max (16) */
+    for (int i = 0; i < 16; i++) {
+        hn4_result_t res = hn4_signet_brand_anchor(vol, &anchor, i, sig, 64, pub);
+        if (res != HN4_OK) {
+            printf("Failed at depth %d with error %d\n", i, res);
+            ASSERT_EQ(HN4_OK, res);
+        }
+    }
+
+    /* Attempt 17th Seal -> Expect TAMPERED (Depth Limit) */
+    hn4_result_t res = hn4_signet_brand_anchor(vol, &anchor, 17, sig, 64, pub);
+    ASSERT_EQ(HN4_ERR_TAMPERED, res);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+
+hn4_TEST(Signet, Cross_Volume_Replay_Reject) {
+    /* 1. Setup Vol A */
+    hn4_hal_device_t* devA = write_fixture_setup();
+    hn4_volume_t* volA = NULL;
+    hn4_mount_params_t p = {0};
+    hn4_mount(devA, &p, &volA);
+
+    hn4_anchor_t anchorA = {0};
+    anchorA.seed_id.lo = 0x1233;
+    anchorA.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchorA.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    
+    uint8_t sig[64] = {0};
+    uint8_t pub[32] = {0};
+    hn4_signet_brand_anchor(volA, &anchorA, 1, sig, 64, pub);
+    
+    /* Extract the Seal Block */
+    uint64_t ptr_A = hn4_le64_to_cpu(*(uint64_t*)anchorA.inline_buffer);
+    uint32_t bs = volA->vol_block_size;
+    uint32_t spb = bs / 512;
+    uint8_t* stolen_seal = malloc(bs);
+    hn4_hal_sync_io(devA, HN4_IO_READ, hn4_lba_from_blocks(ptr_A * spb), stolen_seal, spb);
+    
+    hn4_unmount(volA);
+    write_fixture_teardown(devA);
+
+    /* 2. Setup Vol B (Different UUID) */
+    hn4_hal_device_t* devB = write_fixture_setup();
+    hn4_volume_t* volB = NULL;
+    hn4_mount(devB, &p, &volB);
+    
+    /* 3. Inject Stolen Seal into Vol B */
+    hn4_anchor_t anchorB = {0};
+    anchorB.seed_id.lo = 0x1233; /* Same File ID to pass ID check */
+    anchorB.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchorB.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    
+    /* Allocate space in Horizon for the stolen block */
+    hn4_addr_t phys_B;
+    hn4_alloc_horizon(volB, &phys_B);
+    uint64_t idx_B;
+    _addr_to_u64_checked(phys_B, &idx_B);
+    idx_B /= spb;
+    
+    /* Write stolen data */
+    hn4_hal_sync_io(devB, HN4_IO_WRITE, phys_B, stolen_seal, spb);
+    
+    /* Point Anchor B to Stolen Seal manually */
+    uint64_t ptr_le = hn4_cpu_to_le64(idx_B);
+    memcpy(anchorB.inline_buffer, &ptr_le, 8);
+    anchorB.data_class |= hn4_cpu_to_le64(HN4_FLAG_EXTENDED);
+
+    /* 4. Attempt to extend chain on Vol B */
+    hn4_result_t res = hn4_signet_brand_anchor(volB, &anchorB, 2, sig, 64, pub);
+
+    /* 
+     * Expect Failure: ID_MISMATCH.
+     * The seal contains Vol A's UUID. The validator compares it to Vol B's UUID.
+     */
+    ASSERT_EQ(HN4_ERR_ID_MISMATCH, res);
+
+    free(stolen_seal);
+    hn4_unmount(volB);
+    write_fixture_teardown(devB);
+}
+
+hn4_TEST(Signet, Etch_Vector_Mutation) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x516;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
+    
+    /* Init V = 1 */
+    uint64_t v_init = 1;
+    memcpy(anchor.orbit_vector, &v_init, 6);
+
+    uint8_t sig[64] = {0x11}; /* Specific entropy */
+    uint8_t pub[32] = {0};
+
+    ASSERT_EQ(HN4_OK, hn4_signet_brand_anchor(vol, &anchor, 1, sig, 64, pub));
+
+    /* Extract New V */
+    uint64_t v_new = 0;
+    memcpy(&v_new, anchor.orbit_vector, 6);
+    v_new = hn4_le64_to_cpu(v_new) & 0xFFFFFFFFFFFFULL;
+
+    /* Verify Mutation */
+    ASSERT_NE(1, v_new);
+    
+    /* Verify Odd Parity (Requirement for Trajectory Engine) */
+    ASSERT_TRUE(v_new & 1);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}

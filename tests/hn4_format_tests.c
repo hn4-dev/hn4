@@ -3878,3 +3878,43 @@ hn4_TEST(WaterfallLogic, Pico_Tiny_Clamp) {
     destroy_device_fixture(dev);
 }
 
+/* 
+ * TEST: ZNS Virtual Capacity Alignment
+ * RATIONALE: Verifies the fix for 128-bit/ZNS virtual capacity math.
+ *            Virtual capacities on ZNS must be exact multiples of the Zone Size.
+ *            Partial zones at the end of a virtual volume are illegal.
+ */
+hn4_TEST(ZNS_Fix, Virtual_Alignment_Boundary) {
+    uint64_t cap = 10ULL * HN4_SZ_GB;
+    uint32_t zone_sz = 64 * 1024 * 1024; /* 64MB Zones */
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.zone_size_bytes = zone_sz;
+    mdev->mmio_base = NULL; 
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC; /* Min Cap: 128MB */
+    params.mount_intent_flags = HN4_MNT_VIRTUAL;
+    
+    /* 
+     * Request: 256MB + 4KB.
+     * 1. > 128MB (Satisfies Generic Profile)
+     * 2. Not divisible by 64MB Zone Size (Violates ZNS Alignment)
+     */
+#ifdef HN4_USE_128BIT
+    params.override_capacity_bytes.lo = (uint64_t)(4 * zone_sz) + 4096;
+    params.override_capacity_bytes.hi = 0;
+#else
+    params.override_capacity_bytes = (uint64_t)(4 * zone_sz) + 4096;
+#endif
+
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect failure due to strict zone alignment enforcement */
+    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
+    
+    destroy_device_fixture(dev);
+}

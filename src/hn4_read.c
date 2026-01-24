@@ -59,6 +59,80 @@ static const uint16_t _hdd_prefetch_lut[32] = {
 };
 
 /* =========================================================================
+* READ POLICY CONFIGURATION
+* ========================================================================= */
+
+/* Flags for Read Policy */
+#define RP_NO_HEAL      (1 << 0)
+#define RP_CHECK_MASS   (1 << 1) /* Gaming: Depth=1 if size < 64KB */
+#define RP_IS_HDD       (1 << 2) /* Sets is_hdd flag */
+
+typedef struct {
+    uint16_t sleep_us;
+    uint8_t  depth;
+    uint8_t  flags;
+} hn4_read_policy_t;
+
+/* 
+ * READ POLICY LUT [32 Entries]
+ * Index = (Profile << 2) | HW_Type
+ * HW_Type Mapping: 0=SSD, 1=HDD, 2=TAPE, 3=RSVD
+ */
+static const hn4_read_policy_t _read_policy_lut[32] = {
+    /* --- [0] GENERIC --- */
+    {1000, 12, 0},          /* SSD */
+    {1000,  2, RP_IS_HDD},  /* HDD */
+    {1000,  0, RP_IS_HDD},  /* TAPE */
+    {1000, 12, 0},          /* RSVD */
+
+    /* --- [1] GAMING (Note: Ignores HDD depth limits, prefers custom logic) --- */
+    {  10, 12, RP_CHECK_MASS},             /* SSD */
+    {  10, 12, RP_CHECK_MASS | RP_IS_HDD}, /* HDD */
+    {  10, 12, RP_CHECK_MASS | RP_IS_HDD}, /* TAPE */
+    {  10, 12, RP_CHECK_MASS},             /* RSVD */
+
+    /* --- [2] AI --- */
+    {1000, 12, 0},          /* SSD */
+    {1000,  2, RP_IS_HDD},  /* HDD */
+    {1000,  0, RP_IS_HDD},  /* TAPE */
+    {1000, 12, 0},          /* RSVD */
+
+    /* --- [3] ARCHIVE (Forces HDD Logic) --- */
+    {1000, 12, RP_IS_HDD},  /* SSD (Treated as HDD logic) */
+    {1000,  2, RP_IS_HDD},  /* HDD */
+    {1000,  0, RP_IS_HDD},  /* TAPE */
+    {1000, 12, RP_IS_HDD},  /* RSVD */
+
+    /* --- [4] PICO --- */
+    {1000,  1, RP_NO_HEAL}, /* SSD */
+    {1000,  1, RP_NO_HEAL}, /* HDD (Override HDD depth 2 -> 1) */
+    {1000,  1, RP_NO_HEAL}, /* TAPE */
+    {1000,  1, RP_NO_HEAL}, /* RSVD */
+
+    /* --- [5] SYSTEM --- */
+    {1000, 12, 0},          /* SSD */
+    {1000,  2, RP_IS_HDD},  /* HDD */
+    {1000,  0, RP_IS_HDD},  /* TAPE */
+    {1000, 12, 0},          /* RSVD */
+
+    /* --- [6] USB --- */
+    {5000,  3, 0},          /* SSD */
+    {5000,  3, RP_IS_HDD},  /* HDD (Override HDD depth 2 -> 3) */
+    {5000,  3, RP_IS_HDD},  /* TAPE */
+    {5000,  3, 0},          /* RSVD */
+
+    /* --- [7] HYPER_CLOUD --- */
+    {1000, 12, 0},          /* SSD */
+    {1000,  2, RP_IS_HDD},  /* HDD */
+    {1000,  0, RP_IS_HDD},  /* TAPE */
+    {1000, 12, 0},          /* RSVD */
+};
+
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    _Static_assert(sizeof(hn4_read_policy_t) == 4, "Read Policy Struct size mismatch");
+#endif
+
+/* =========================================================================
  * CONSTANTS & MACROS
  * ========================================================================= */
 
@@ -283,11 +357,10 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     uint32_t payload_cap = HN4_BLOCK_PayloadSize(vol->vol_block_size);
 
-    if (buffer_len < payload_cap) {
+    if (HN4_UNLIKELY(buffer_len < payload_cap)) {
         HN4_LOG_ERR("Read Error: Buffer %u < Payload %u", buffer_len, payload_cap);
         return HN4_ERR_INVALID_ARGUMENT;
     }
-
     /* 1. Permissions Gate */
     uint32_t perms  = hn4_le32_to_cpu(anchor.permissions);
     uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
@@ -323,39 +396,35 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     uint32_t sectors = bs / ss;
 
     /* 3. Hardware Profile Tuning */
-    uint8_t  depth_limit   = HN4_SHOTGUN_DEPTH;
-    bool     allow_healing = !vol->read_only;
-    uint32_t retry_sleep   = 1000;
-    uint32_t profile       = vol->sb.info.format_profile;
-    uint32_t dev_type      = vol->sb.info.device_type_tag;
+    uint32_t profile  = vol->sb.info.format_profile & 7;
+    uint32_t dev_type = vol->sb.info.device_type_tag;
+    uint64_t hw_caps  = vol->sb.info.hw_caps_flags;
 
-   bool is_hdd = (dev_type == HN4_DEV_HDD) || 
-                  (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL) ||
-                  (profile == HN4_PROFILE_ARCHIVE);
+    /* 
+     * Calculate Hardware Index (0..3) 
+     * 0=SSD, 1=HDD, 2=TAPE
+     */
+    uint32_t hw_idx = 0;
+    if (dev_type == HN4_DEV_TAPE) {
+        hw_idx = 2;
+    } else if (dev_type == HN4_DEV_HDD || (hw_caps & HN4_HW_ROTATIONAL)) {
+        hw_idx = 1;
+    }
 
-    switch (profile) {
-        case HN4_PROFILE_PICO:
-            depth_limit   = 1;
-            allow_healing = false;
-            break;
-        case HN4_PROFILE_USB:
-            depth_limit = 3;
-            retry_sleep = 5000;
-            break;
-        case HN4_PROFILE_GAMING:
-            if (hn4_le64_to_cpu(anchor.mass) < 65536) {
-                depth_limit = 1;
-            }
-            retry_sleep = 10;
-            break;
-        default:
-            /* Device-specific overrides */
-            if (dev_type == HN4_DEV_HDD || (vol->sb.info.hw_caps_flags & HN4_HW_ROTATIONAL)) {
-                depth_limit = 2;
-            } else if (dev_type == HN4_DEV_TAPE) {
-                depth_limit = 0;
-            }
-            break;
+    /* O(1) Fetch */
+    hn4_read_policy_t pol = _read_policy_lut[(profile << 2) | hw_idx];
+
+    /* Unpack */
+    uint32_t retry_sleep   = pol.sleep_us;
+    uint8_t  depth_limit   = pol.depth;
+    bool     allow_healing = !vol->read_only && !(pol.flags & RP_NO_HEAL);
+    bool     is_hdd        = (pol.flags & RP_IS_HDD);
+
+    /* Dynamic Logic: Gaming Mass Check */
+    if (HN4_UNLIKELY(pol.flags & RP_CHECK_MASS)) {
+        if (hn4_le64_to_cpu(anchor.mass) < 65536) {
+            depth_limit = 1;
+        }
     }
 
     /* 4. Candidate Generation */

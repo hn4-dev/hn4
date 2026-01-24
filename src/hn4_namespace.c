@@ -76,18 +76,6 @@ static inline int _ns_popcount(uint64_t x)
 #define HN4_NS_MAX_PROBES 1024   /* Spec 3.3: Bounded distance for Linear Probe */
 #define HN4_NS_MAX_EXT_DEPTH 16  /* Spec 6.2: Max extension chain depth */
 
-/* Spec 3.1: Hardware-optimized Hash Constant */
-#define HN4_NS_HASH_CONST 0xff51afd7ed558ccdULL
-
-/* Extension Types */
-#ifndef HN4_EXT_TYPE_TAG
-#define HN4_EXT_TYPE_TAG 0x01
-#endif
-
-#ifndef HN4_EXT_TYPE_LONGNAME
-#define HN4_EXT_TYPE_LONGNAME 0x02
-#endif
-
 /* =========================================================================
  * 1. INTERNAL HELPERS: HASHING & VALIDATION
  * ========================================================================= */
