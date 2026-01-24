@@ -3918,3 +3918,183 @@ hn4_TEST(ZNS_Fix, Virtual_Alignment_Boundary) {
     
     destroy_device_fixture(dev);
 }
+
+/* =========================================================================
+ * TEST 4.11: 4Kn Drive with 512B Profile Request (Misaligned)
+ * RATIONALE:
+ * If user requests a profile that defaults to 512B (like PICO), but 
+ * hardware is 4Kn (4096B sector), the format must fail because we cannot 
+ * physically address 512B chunks.
+ * ========================================================================= */
+hn4_TEST(EdgeCase, Profile_512_on_4Kn_HW) {
+    uint64_t cap = 2 * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_PICO; /* Wants 512B */
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    ASSERT_EQ(HN4_ERR_PROFILE_MISMATCH, res);
+    
+    destroy_device_fixture(dev);
+}
+
+/* =========================================================================
+ * TEST 4.12: Large Sector (8KB) Support
+ * RATIONALE:
+ * Future hardware might use 8KB sectors. Generic profile (4KB BS) must scale up.
+ * If HW Sector > Profile Block Size, format logic should auto-adjust BS.
+ * ========================================================================= */
+hn4_TEST(EdgeCase, Sector_8K_Upscale) {
+    uint64_t cap = 1 * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 8192); /* 8KB Sector */
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC; /* Defaults to 4KB */
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    /* Verify BS was forced to 8KB to match sector */
+    ASSERT_EQ(8192, sb->info.block_size);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/* =========================================================================
+ * TEST 4.13: Empty Label vs Null Label
+ * RATIONALE:
+ * Passing an empty string "" should result in an empty label on disk.
+ * Passing NULL results in "HN4_UNNAMED".
+ * ========================================================================= */
+hn4_TEST(EdgeCase, Empty_String_Label) {
+    uint64_t cap = 128 * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    params.label = ""; /* Empty */
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    /* Should be empty, not "HN4_UNNAMED" */
+    ASSERT_EQ(0, sb->info.volume_label[0]);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/* =========================================================================
+ * TEST 4.14: ZNS with Non-Po2 Zone Size (Validation)
+ * RATIONALE:
+ * While unlikely in real HW, if a ZNS drive reports 3MB zones, 
+ * the format logic (which aligns to Po2) might fail alignment checks if strict.
+ * 3MB = 3 * 1024 * 1024. Not power of 2.
+ * Block Engine might reject non-Po2 BS.
+ * ========================================================================= */
+hn4_TEST(EdgeCase, ZNS_NonPo2_Zone) {
+    uint64_t cap = 1 * HN4_SZ_GB;
+    uint32_t zone_sz = 3 * 1024 * 1024; /* 3MB - Not Power of 2 */
+    
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    mdev->caps.zone_size_bytes = zone_sz;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    hn4_result_t res = hn4_format(dev, &params);
+    
+    /* Expect failure due to binary alignment constraints */
+    ASSERT_EQ(HN4_ERR_ALIGNMENT_FAIL, res);
+    
+    destroy_device_fixture(dev);
+}
+
+
+/* =========================================================================
+ * TEST 4.15: System Profile - Boot Map Pointer Init
+ * RATIONALE:
+ * The System Profile is designed for bootable volumes. 
+ * The `boot_map_ptr` field exists in the SB. 
+ * Ensure it is initialized to 0 (clean state) and not garbage.
+ * ========================================================================= */
+hn4_TEST(EdgeCase, BootMap_Clean_Init) {
+    uint64_t cap = 1 * HN4_SZ_GB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_SYSTEM;
+    
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    
+#ifdef HN4_USE_128BIT
+    ASSERT_EQ(0, sb->info.boot_map_ptr.lo);
+#else
+    ASSERT_EQ(0, sb->info.boot_map_ptr);
+#endif
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}
+
+/* 
+ * TEST: NVM Zero Opcode Optimization
+ * Objective: Verify that formatting an NVM device triggers the optimized 
+ *            HN4_IO_ZERO path instead of standard HN4_IO_WRITE for metadata zeroing.
+ */
+hn4_TEST(Optimization, NVM_Zero_Opcode_Usage) {
+    uint64_t cap = 128 * HN4_SZ_MB;
+    hn4_hal_device_t* dev = create_device_fixture(cap, 4096);
+    mock_hal_device_t* mdev = (mock_hal_device_t*)dev;
+    
+    mdev->caps.hw_flags |= HN4_HW_NVM;
+    mdev->mmio_base = hn4_hal_mem_alloc(cap);
+    
+    /* Pre-poison memory to verify zeroing actually happens */
+    memset(mdev->mmio_base, 0xCC, cap);
+    
+    hn4_format_params_t params = {0};
+    params.target_profile = HN4_PROFILE_GENERIC;
+    
+    /* 
+     * If logic is correct:
+     * 1. hn4_format detects NVM.
+     * 2. Calls hn4_hal_sync_io_large with HN4_IO_ZERO.
+     * 3. HAL executes _hal_nvm_zero_fill.
+     * 4. Returns OK.
+     * 
+     * If HAL didn't support ZERO, it would return error, failing this check.
+     */
+    ASSERT_EQ(HN4_OK, hn4_format(dev, &params));
+    
+    /* Verify Cortex Region (D0) is Zeroed (except for Root Anchor at start) */
+    hn4_superblock_t* sb = (hn4_superblock_t*)mdev->mmio_base;
+    uint64_t ctx_start = hn4_addr_to_u64(sb->info.lba_cortex_start) * 4096;
+    
+    /* Offset 4096 (Second block of Cortex) must be 0x00 */
+    uint8_t* check_ptr = mdev->mmio_base + ctx_start + 4096;
+    
+    /* Check a sample of bytes to ensure poison 0xCC is gone */
+    ASSERT_EQ(0x00, check_ptr[0]);
+    ASSERT_EQ(0x00, check_ptr[1023]);
+    ASSERT_EQ(0x00, check_ptr[4095]);
+    
+    hn4_hal_mem_free(mdev->mmio_base);
+    destroy_device_fixture(dev);
+}

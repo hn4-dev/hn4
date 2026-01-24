@@ -453,6 +453,11 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
     if (start_lba >= phys_limit_lba) return HN4_OK;
 #endif
 
+    if (caps->hw_flags & HN4_HW_NVM) {
+        /* Pass NULL buffer. HAL handles generation via HN4_IO_ZERO. */
+        return hn4_hal_sync_io_large(dev, HN4_IO_ZERO, start_lba, NULL, byte_len, block_size);
+    }
+
     /* Try 32MB, fall back to 2MB, then 64KB */
     uint32_t buf_sz = 32 * 1024 * 1024;
     void* buffer = hn4_hal_mem_alloc(buf_sz);

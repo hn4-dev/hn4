@@ -32,10 +32,6 @@
 #include "hn4_constants.h"
 #include <string.h>
 
-/* Internal Constants */
-#define HN4_ORBIT_LIMIT           12
-#define HN4_ZNS_TIMEOUT_NS        (30ULL * 1000000000ULL)
-
 typedef struct {
     uint32_t retry_sleep_us;
     int      max_retries;
@@ -307,20 +303,22 @@ uint64_t _resolve_residency_verified(
             
                 if ((UINT64_MAX - G) >= offset_sectors) {
                 
-                    uint64_t linear_lba = G + offset_sectors;
+                uint64_t linear_lba_sectors = G + offset_sectors;
+                uint64_t linear_blk_idx = linear_lba_sectors / spb;
                 
-                    bool in_bounds = false;
+                bool in_bounds = false;
         #ifdef HN4_USE_128BIT
-                hn4_u128_t limit_chk = hn4_u128_mul_u64(hn4_u128_from_u64(linear_lba), vol->vol_block_size);
+                hn4_u128_t limit_chk = hn4_u128_mul_u64(hn4_u128_from_u64(linear_blk_idx), vol->vol_block_size);
                 if (hn4_u128_cmp(limit_chk, vol->vol_capacity_bytes) < 0) in_bounds = true;
         #else
                 uint64_t max_vol_blocks = vol->vol_capacity_bytes / vol->vol_block_size;
-                if (linear_lba < max_vol_blocks) in_bounds = true;
+                if (linear_blk_idx < max_vol_blocks) in_bounds = true;
         #endif
 
                 if (in_bounds) {
-                    if (_verify_block_at_lba(vol, linear_lba, check_buf, my_well_id, block_idx, current_gen)) {
-                        found_lba = linear_lba;
+                    /* Pass Block Index to verification and output */
+                    if (_verify_block_at_lba(vol, linear_blk_idx, check_buf, my_well_id, block_idx, current_gen)) {
+                        found_lba = linear_blk_idx;
                         goto Cleanup;
                     }
                 }
@@ -328,6 +326,7 @@ uint64_t _resolve_residency_verified(
                 HN4_LOG_WARN("Horizon LBA Wrap detected. File logical offset exceeds 64-bit physical space.");
             }
         }
+         goto Cleanup;
     }
 
     /* =====================================================================
@@ -482,6 +481,16 @@ retry_transaction:;
      * Locate the previous block (if any) so we can eclipse it later.
      */
     uint64_t old_lba = _resolve_residency_verified(vol, anchor, block_idx);
+    
+    uint64_t mass = hn4_le64_to_cpu(anchor->mass);
+    uint64_t logical_end = block_idx * payload_cap + len;
+    
+    if (old_lba == HN4_LBA_INVALID && len < payload_cap && logical_end < mass) {
+        HN4_LOG_CRIT("WRITE_ATOMIC: Partial write on missing block (Rot/Lost). Aborting.");
+        /* No buffers allocated yet, safe to return */
+        return HN4_ERR_DATA_ROT;
+    }
+
     HN4_LOG_CRIT("WRITE_ATOMIC: Old Residency LBA = %llu", (unsigned long long)old_lba);
 
     /* 3. Allocate IO Buffer */
@@ -716,6 +725,7 @@ retry_transaction:;
     /* Allocation Loop */
     uint8_t k_limit = (policy_mask & HN4_POL_SEQ) ? 0 : HN4_ORBIT_LIMIT;
 
+    
     if (vol->sb.info.state_flags & HN4_VOL_RUNTIME_SATURATED) {
         /*
          * Adjusted Saturation Decay:
@@ -799,6 +809,12 @@ retry_transaction:;
     /* Fallback to Horizon (D1.5) if Flux (D1) is saturated */
     if (alloc_res != HN4_OK) {
         if (alloc_res == HN4_ERR_GRAVITY_COLLAPSE) {
+
+            if (block_idx > 0) {
+                HN4_LOG_CRIT("WRITE_ATOMIC: Cannot switch to Horizon mid-stream. File is fragmented.");
+                return HN4_ERR_ENOSPC;
+            }
+
             HN4_LOG_CRIT("WRITE_ATOMIC: D1 Full. Trying Horizon...");
 
             hn4_addr_t horizon_phys_addr = hn4_addr_from_u64(0);

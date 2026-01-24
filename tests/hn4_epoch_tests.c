@@ -1739,3 +1739,280 @@ hn4_TEST(EpochState, TornWriteDetection) {
     
     cleanup_epoch_fixture(vol);
 }
+
+/* =========================================================================
+ * TEST 51: Epoch Check - Perfectly Synced
+ * RATIONALE:
+ * The most common case: Memory ID matches Disk ID.
+ * Should return HN4_OK.
+ * ========================================================================= */
+hn4_TEST(EpochCheck, Synced) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* mdev = (advanced_mock_hal_device_t*)vol->target_device;
+
+    vol->sb.info.current_epoch_id = 42;
+
+    /* Write matching epoch to disk */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = 42;
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+
+    uint64_t ptr_lba = vol->sb.info.epoch_ring_block_idx * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    memcpy(mdev->mmio_base + (ptr_lba * TEST_SECTOR_SIZE), &ep, sizeof(ep));
+
+    hn4_result_t res = hn4_epoch_check_ring(vol->target_device, &vol->sb, TEST_CAPACITY);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 52: Epoch Check - Minor Future Dilation
+ * RATIONALE:
+ * Disk is ahead of Memory, but within safety limits (e.g., +100).
+ * Should return HN4_ERR_TIME_DILATION (Warning), not TOXIC.
+ * ========================================================================= */
+hn4_TEST(EpochCheck, FutureDilationWarning) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* mdev = (advanced_mock_hal_device_t*)vol->target_device;
+
+    vol->sb.info.current_epoch_id = 100;
+
+    /* Disk = 200 (+100). Limit is 5000. */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = 200;
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+
+    uint64_t ptr_lba = vol->sb.info.epoch_ring_block_idx * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    memcpy(mdev->mmio_base + (ptr_lba * TEST_SECTOR_SIZE), &ep, sizeof(ep));
+
+    hn4_result_t res = hn4_epoch_check_ring(vol->target_device, &vol->sb, TEST_CAPACITY);
+    
+    ASSERT_EQ(HN4_ERR_TIME_DILATION, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 53: Epoch Check - Minor Past Skew
+ * RATIONALE:
+ * Memory is ahead of Disk (Journal Lag), but within limits (e.g. -10).
+ * Should return HN4_ERR_GENERATION_SKEW (Warning), not TOXIC.
+ * ========================================================================= */
+hn4_TEST(EpochCheck, PastSkewWarning) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* mdev = (advanced_mock_hal_device_t*)vol->target_device;
+
+    vol->sb.info.current_epoch_id = 100;
+
+    /* Disk = 90 (-10). Limit is 100. */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = 90;
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+
+    uint64_t ptr_lba = vol->sb.info.epoch_ring_block_idx * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    memcpy(mdev->mmio_base + (ptr_lba * TEST_SECTOR_SIZE), &ep, sizeof(ep));
+
+    hn4_result_t res = hn4_epoch_check_ring(vol->target_device, &vol->sb, TEST_CAPACITY);
+    
+    ASSERT_EQ(HN4_ERR_GENERATION_SKEW, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 54: Epoch Advance - Dirty Volume State
+ * RATIONALE:
+ * Epoch advancement should function correctly even if the volume is marked 
+ * HN4_VOL_DIRTY (standard operating state).
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, DirtyState) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    vol->sb.info.state_flags |= HN4_VOL_DIRTY;
+    vol->sb.info.current_epoch_id = 50;
+
+    uint64_t out_id;
+    hn4_result_t res = hn4_epoch_advance(vol->target_device, &vol->sb, false, &out_id, NULL);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(51, out_id);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 55: Epoch Genesis - Large Block Size
+ * RATIONALE:
+ * Verify Genesis works with 64KB blocks (common in AI profiles).
+ * Requires buffer allocation check inside genesis.
+ * ========================================================================= */
+hn4_TEST(EpochGenesis, LargeBlock) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    vol->sb.info.block_size = 65536; /* 64KB */
+    
+    /* Ensure alignment of LBA start (must be multiple of 128 sectors) */
+    vol->sb.info.lba_epoch_start = 12800; /* Aligned */
+
+    hn4_result_t res = hn4_epoch_write_genesis(vol->target_device, &vol->sb);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 56: Epoch Advance - ID Zero
+ * RATIONALE:
+ * If current ID is 0, next ID must be 1.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, ZeroToOne) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    vol->sb.info.current_epoch_id = 0;
+
+    uint64_t out_id;
+    hn4_result_t res = hn4_epoch_advance(vol->target_device, &vol->sb, false, &out_id, NULL);
+
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(1, out_id);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 57: Epoch Check - Capacity Boundary
+ * RATIONALE:
+ * Ring occupies the exact last MB of the disk.
+ * Start = Capacity - RingSize.
+ * End = Capacity.
+ * Verify valid bounds checking.
+ * ========================================================================= */
+hn4_TEST(EpochCheck, CapacityEdge) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    mock_hal_device_t* mdev = (mock_hal_device_t*)vol->target_device;
+
+    /* Cap = 100MB */
+    uint64_t cap_bytes = 100ULL * 1024 * 1024;
+    mdev->caps.total_capacity_bytes = cap_bytes;
+    
+    /* Ring Size = 1MB. Start at 99MB. */
+    uint64_t start_bytes = 99ULL * 1024 * 1024;
+    vol->sb.info.lba_epoch_start = start_bytes / TEST_SECTOR_SIZE;
+    
+    /* Pointer at last block of ring/disk */
+    uint64_t end_bytes = cap_bytes - TEST_BLOCK_SIZE;
+    vol->sb.info.epoch_ring_block_idx = end_bytes / TEST_BLOCK_SIZE;
+
+    /* Write valid epoch */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = 10;
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+    
+    /* Need advanced mock to write to memory */
+    cleanup_epoch_fixture(vol);
+    vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* adev = (advanced_mock_hal_device_t*)vol->target_device;
+    
+    vol->sb.info.lba_epoch_start = start_bytes / TEST_SECTOR_SIZE;
+    vol->sb.info.epoch_ring_block_idx = end_bytes / TEST_BLOCK_SIZE;
+    
+    uint64_t ptr_lba = vol->sb.info.epoch_ring_block_idx * (TEST_BLOCK_SIZE / TEST_SECTOR_SIZE);
+    memcpy(adev->mmio_base + (ptr_lba * TEST_SECTOR_SIZE), &ep, sizeof(ep));
+
+    hn4_result_t res = hn4_epoch_check_ring(vol->target_device, &vol->sb, cap_bytes);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 58: Epoch Advance - Custom Wrap
+ * RATIONALE:
+ * Verify wrap logic with non-standard ring alignment/size.
+ * Start = 100. Ring Size = 1MB (256 blocks). End = 356.
+ * Current = 355. Next should be 100.
+ * ========================================================================= */
+hn4_TEST(EpochAdvance, CustomWrap) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    
+    uint64_t start = 100;
+    vol->sb.info.lba_epoch_start = start * 8; /* Sector LBA */
+    
+    /* Ring len is hardcoded 1MB -> 256 blocks */
+    uint64_t end = start + 256; 
+    
+    /* Set ptr to last block */
+    vol->sb.info.epoch_ring_block_idx = end - 1;
+
+    hn4_addr_t out_ptr;
+    hn4_result_t res = hn4_epoch_advance(vol->target_device, &vol->sb, false, NULL, &out_ptr);
+
+    ASSERT_EQ(HN4_OK, res);
+#ifdef HN4_USE_128BIT
+    ASSERT_EQ(start, out_ptr.lo);
+#else
+    ASSERT_EQ(start, out_ptr);
+#endif
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 59: Epoch Geometry - 4Kn Sector Support
+ * RATIONALE:
+ * Simulate 4Kn drive (4096 byte sectors).
+ * Block Size must be >= 4096.
+ * ========================================================================= */
+hn4_TEST(EpochGeometry, Native4K) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* mdev = (advanced_mock_hal_device_t*)vol->target_device;
+    
+    mdev->caps.logical_block_size = 4096;
+    vol->sb.info.block_size = 4096;
+    
+    /* Aligned start (Sector 10 = 40KB) */
+    vol->sb.info.lba_epoch_start = 10;
+    vol->sb.info.epoch_ring_block_idx = 10;
+
+    /* Write valid epoch */
+    hn4_epoch_header_t ep = {0};
+    ep.epoch_id = 10;
+    ep.epoch_crc = hn4_epoch_calc_crc(&ep);
+    
+    /* Memory offset: 10 * 4096 */
+    memcpy(mdev->mmio_base + (10 * 4096), &ep, sizeof(ep));
+
+    hn4_result_t res = hn4_epoch_check_ring(vol->target_device, &vol->sb, TEST_CAPACITY);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_epoch_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 60: Epoch ZNS - Reset Logic Trigger
+ * RATIONALE:
+ * Simulate ZNS device. Force a ring wrap (which triggers Zone Reset).
+ * Verify call succeeds (logic flow check).
+ * ========================================================================= */
+hn4_TEST(EpochZNS, ResetOnWrap) {
+    hn4_volume_t* vol = create_epoch_fixture();
+    advanced_mock_hal_device_t* mdev = (advanced_mock_hal_device_t*)vol->target_device;
+    
+    mdev->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
+    
+    /* Force wrap condition */
+    uint64_t start = 256;
+    uint64_t len = 256;
+    vol->sb.info.epoch_ring_block_idx = start + len - 1;
+
+    hn4_result_t res = hn4_epoch_advance(vol->target_device, &vol->sb, false, NULL, NULL);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_epoch_fixture(vol);
+}

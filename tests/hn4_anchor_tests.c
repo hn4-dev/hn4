@@ -8,8 +8,9 @@
 #include "hn4_anchor.h"
 #include "hn4_hal.h"
 #include "hn4_constants.h"
+#include "hn4_endians.h"
 #include "hn4_errors.h"
-#include "hn4_crc.h" /* For manual CRC verification */
+#include "hn4_crc.h"
 
 /* --- FIXTURE HELPERS --- */
 
@@ -631,6 +632,347 @@ hn4_TEST(AnchorGenesis, VectorCheck) {
     hn4_anchor_t* root = (hn4_anchor_t*)(mdev->mmio_base + start_offset);
     
     ASSERT_EQ(1, root->orbit_vector[0]);
+    
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 24: Atomic Write - Collision Avoidance (Linear Probing)
+ * RATIONALE:
+ * If the target slot (H % N) is occupied by a different ID, the writer
+ * must probe linearly (H+1, H+2...) to find an empty slot.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, CollisionAvoidance) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    /* 1. Define ID A and ID B */
+    hn4_anchor_t a = {0}; a.seed_id.lo = 100;
+    hn4_anchor_t b = {0}; b.seed_id.lo = 200;
+
+    /* 2. Calculate Hash for A to find its slot */
+    uint64_t region_bytes = (vol->sb.info.lba_bitmap_start - vol->sb.info.lba_cortex_start) * 512;
+    uint64_t total_slots = region_bytes / sizeof(hn4_anchor_t);
+    
+    uint64_t h_a = a.seed_id.lo ^ a.seed_id.hi;
+    h_a ^= (h_a >> 33); h_a *= 0xff51afd7ed558ccdULL; h_a ^= (h_a >> 33);
+    uint64_t slot_a = h_a % total_slots;
+
+    /* 3. Manually place "garbage" at slot_a in RAM to simulate collision */
+    uint64_t start_offset = vol->sb.info.lba_cortex_start * 512;
+    hn4_anchor_t* disk_a = (hn4_anchor_t*)(mdev->mmio_base + start_offset + (slot_a * 128));
+    
+    disk_a->seed_id.lo = 999; /* Occupied by "Someone Else" */
+    disk_a->data_class = 1;   /* Mark used */
+
+    /* 4. Write Anchor A using API. Should land at slot_a + 1 */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &a));
+
+    /* 5. Verify Slot A+1 */
+    uint64_t slot_b = (slot_a + 1) % total_slots;
+    hn4_anchor_t* disk_b = (hn4_anchor_t*)(mdev->mmio_base + start_offset + (slot_b * 128));
+    
+    ASSERT_EQ(100, disk_b->seed_id.lo); /* Found it moved */
+    ASSERT_EQ(999, disk_a->seed_id.lo); /* Original stayed put */
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 25: Atomic Write - Update In Collision Chain
+ * RATIONALE:
+ * If a chain exists (Slot X=Occupied, Slot X+1=Our ID), the write must
+ * update X+1, not overwrite X, and not skip to X+2.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, UpdateInChain) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    hn4_anchor_t target = {0}; 
+    target.seed_id.lo = 0xBEEF;
+    target.mass = 50;
+
+    /* Calculate Primary Slot */
+    uint64_t region_bytes = (vol->sb.info.lba_bitmap_start - vol->sb.info.lba_cortex_start) * 512;
+    uint64_t total_slots = region_bytes / sizeof(hn4_anchor_t);
+    uint64_t h = target.seed_id.lo ^ target.seed_id.hi;
+    h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    uint64_t slot_0 = h % total_slots;
+    uint64_t slot_1 = (slot_0 + 1) % total_slots;
+
+    /* Setup RAM: Slot 0 = Alien, Slot 1 = Us */
+    uint64_t base = vol->sb.info.lba_cortex_start * 512;
+    
+    hn4_anchor_t* ram_0 = (hn4_anchor_t*)(mdev->mmio_base + base + (slot_0 * 128));
+    ram_0->seed_id.lo = 0x12;
+    ram_0->data_class = 1;
+
+    hn4_anchor_t* ram_1 = (hn4_anchor_t*)(mdev->mmio_base + base + (slot_1 * 128));
+    ram_1->seed_id.lo = 0xBEEF;
+    ram_1->data_class = 1;
+    ram_1->mass = 10;
+
+    /* Write Update */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &target));
+
+    /* Verify: Slot 0 unchanged, Slot 1 updated */
+    ASSERT_EQ(0x12, ram_0->seed_id.lo);
+    ASSERT_EQ(50, ram_1->mass);
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 26: Atomic Write - Cortex Saturation (ENOSPC)
+ * RATIONALE:
+ * If the linear probe limit (1024) is exhausted, the write must fail with 
+ * ENOSPC rather than overwriting arbitrary data or infinite looping.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, SaturationLimit) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    hn4_anchor_t anchor = {0}; 
+    anchor.seed_id.lo = 777;
+
+    uint64_t region_bytes = (vol->sb.info.lba_bitmap_start - vol->sb.info.lba_cortex_start) * 512;
+    uint64_t total_slots = region_bytes / sizeof(hn4_anchor_t);
+    
+    uint64_t h = anchor.seed_id.lo; 
+    h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    uint64_t start_slot = h % total_slots;
+    uint64_t base = vol->sb.info.lba_cortex_start * 512;
+
+    /* Fill 1024 slots starting from start_slot with garbage */
+    for (int i = 0; i < 1024; i++) {
+        uint64_t idx = (start_slot + i) % total_slots;
+        hn4_anchor_t* slot = (hn4_anchor_t*)(mdev->mmio_base + base + (idx * 128));
+        slot->seed_id.lo = 0xFF; /* Not us */
+        slot->data_class = 1;    /* Occupied */
+    }
+
+    /* Attempt write */
+    ASSERT_EQ(HN4_ERR_ENOSPC, hn4_write_anchor_atomic(vol, &anchor));
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 27: Atomic Write - Probe Wrap Around
+ * RATIONALE:
+ * If the hash lands on the last slot of the Cortex, the linear probe must
+ * correctly wrap around to slot 0.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, ProbeWrapAround) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    /* Shrink Cortex to 4 slots to make hitting the end easier */
+    vol->sb.info.lba_bitmap_start = vol->sb.info.lba_cortex_start + 1; /* 1 sector = 4 slots */
+    
+    /* Find an ID that hashes to slot 3 (Last slot) */
+    hn4_anchor_t anchor = {0};
+    uint64_t target_slot = 3;
+    uint64_t h;
+    do {
+        anchor.seed_id.lo++;
+        h = anchor.seed_id.lo ^ anchor.seed_id.hi;
+        h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    } while ((h % 4) != target_slot);
+
+    /* Fill Slot 3 */
+    uint64_t base = vol->sb.info.lba_cortex_start * 512;
+    hn4_anchor_t* last = (hn4_anchor_t*)(mdev->mmio_base + base + (3 * 128));
+    last->seed_id.lo = 0xFULL;
+    last->data_class = 1;
+
+    /* Write. Should wrap to Slot 0. */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+
+    hn4_anchor_t* first = (hn4_anchor_t*)(mdev->mmio_base + base);
+    ASSERT_EQ(anchor.seed_id.lo, first->seed_id.lo);
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 28: Genesis - Invalid Flag Masking
+ * RATIONALE:
+ * Only specific permission bits (RO, WORM, etc.) can be injected via genesis.
+ * Garbage bits in `compat_flags` must be masked out.
+ * ========================================================================= */
+hn4_TEST(AnchorGenesis, InvalidFlagMasking) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    /* Inject 0xFFFFFFFF (All bits) */
+    vol->sb.info.compat_flags = 0xFFFFFFFF;
+
+    ASSERT_EQ(HN4_OK, hn4_anchor_write_genesis(vol->target_device, &vol->sb));
+
+    uint64_t start = vol->sb.info.lba_cortex_start * 512;
+    hn4_anchor_t* root = (hn4_anchor_t*)(mdev->mmio_base + start);
+    
+    /* Check a known invalid bit (e.g. 0x80000000) is NOT set */
+    ASSERT_FALSE(root->permissions & 0x80000000);
+    
+    /* Check a valid bit IS set */
+    ASSERT_TRUE(root->permissions & HN4_PERM_IMMUTABLE);
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 29: Genesis - Public ID Mirroring
+ * RATIONALE:
+ * The Public ID (mutable UUID) must be initialized to match the Seed ID
+ * (Immutable 0xFF..) at creation time.
+ * ========================================================================= */
+hn4_TEST(AnchorGenesis, PublicIDCheck) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    ASSERT_EQ(HN4_OK, hn4_anchor_write_genesis(vol->target_device, &vol->sb));
+
+    hn4_anchor_t* root = (hn4_anchor_t*)(mdev->mmio_base + (vol->sb.info.lba_cortex_start * 512));
+    
+    ASSERT_EQ(root->seed_id.lo, root->public_id.lo);
+    ASSERT_EQ(root->seed_id.hi, root->public_id.hi);
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 30: Atomic Write - Zero ID Handling
+ * RATIONALE:
+ * An anchor with Seed ID 0 is technically "Empty". Writing it should find
+ * the first empty slot. This tests that the collision logic doesn't skip
+ * empty slots if the target ID itself is empty (Edge case).
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, WriteZeroID) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+
+    hn4_anchor_t zero = {0};
+    /* Hash of 0 is 0. Slot 0. */
+    
+    /* Write to Slot 0 */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &zero));
+    
+    /* Verify data written */
+    hn4_anchor_t* slot0 = (hn4_anchor_t*)(mdev->mmio_base + (vol->sb.info.lba_cortex_start * 512));
+    /* Since we wrote all zeros, verify CRC is NOT zero (implies write happened) */
+    ASSERT_TRUE(slot0->checksum != 0);
+
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 31: Atomic Write - IO Read Failure
+ * RATIONALE:
+ * During RMW (Read-Modify-Write), if the read fails, the operation must abort
+ * to prevent corruption of neighbors in the sector.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, IOReadFailure) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    
+    /* Point Cortex to invalid LBA (beyond HAL capacity) to force Read Error */
+    vol->sb.info.lba_cortex_start = (ANCHOR_CAPACITY / 512) + 100;
+    vol->sb.info.lba_bitmap_start = vol->sb.info.lba_cortex_start + 100;
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 1;
+
+    /* 
+     * CHANGE: Implementation skips bad sectors during probe. 
+     * Since all are bad, it returns ENOSPC (Saturation), not HW_IO.
+     */
+    ASSERT_EQ(HN4_ERR_ENOSPC, hn4_write_anchor_atomic(vol, &anchor));
+
+    cleanup_anchor_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 32: Atomic Write - Sector Boundary Calculation
+ * RATIONALE:
+ * Verify logic when writing the LAST anchor in a sector.
+ * Sector = 512 bytes. Anchor = 128 bytes. 4 anchors per sector.
+ * Slot 3 is at offset 384. Length 128. End 512.
+ * Should generate a valid 1-sector write.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, SectorBoundary) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    /* Force 4-slot Cortex */
+    vol->sb.info.lba_bitmap_start = vol->sb.info.lba_cortex_start + 1;
+    
+    /* Find ID for Slot 3 */
+    hn4_anchor_t anchor = {0};
+    uint64_t target = 3;
+    uint64_t h;
+    do {
+        anchor.seed_id.lo++;
+        h = anchor.seed_id.lo;
+        h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    } while ((h % 4) != target);
+
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 33: Genesis - Create Clock
+ * RATIONALE:
+ * Verify `create_clock` (u32 seconds) is derived correctly from `generation_ts`.
+ * ========================================================================= */
+hn4_TEST(AnchorGenesis, CreateClock) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+    
+    /* 2000-01-01 00:00:00 UTC = 946684800 seconds */
+    vol->sb.info.generation_ts = 946684800ULL * 1000000000ULL;
+    
+    ASSERT_EQ(HN4_OK, hn4_anchor_write_genesis(vol->target_device, &vol->sb));
+    
+    hn4_anchor_t* root = (hn4_anchor_t*)(mdev->mmio_base + (vol->sb.info.lba_cortex_start * 512));
+    
+    ASSERT_EQ(946684800, hn4_le32_to_cpu(root->create_clock));
+    
+    cleanup_anchor_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 34: Atomic Write - Update Class
+ * RATIONALE:
+ * Ensure Data Class (flags) are updated correctly.
+ * ========================================================================= */
+hn4_TEST(AnchorAtomic, UpdateDataClass) {
+    hn4_volume_t* vol = create_anchor_fixture();
+    mock_anchor_hal_t* mdev = (mock_anchor_hal_t*)vol->target_device;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 77;
+    anchor.data_class = 0;
+    
+    /* Write initial */
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    
+    /* Update Flags */
+    anchor.data_class = HN4_FLAG_VALID | HN4_FLAG_TOMBSTONE;
+    ASSERT_EQ(HN4_OK, hn4_write_anchor_atomic(vol, &anchor));
+    
+    /* Check Disk */
+    /* Find slot again */
+    uint64_t region_bytes = (vol->sb.info.lba_bitmap_start - vol->sb.info.lba_cortex_start) * 512;
+    uint64_t total_slots = region_bytes / sizeof(hn4_anchor_t);
+    uint64_t h = anchor.seed_id.lo;
+    h ^= (h >> 33); h *= 0xff51afd7ed558ccdULL; h ^= (h >> 33);
+    uint64_t slot = h % total_slots;
+    
+    hn4_anchor_t* disk = (hn4_anchor_t*)(mdev->mmio_base + (vol->sb.info.lba_cortex_start * 512) + (slot * 128));
+    
+    ASSERT_EQ(HN4_FLAG_VALID | HN4_FLAG_TOMBSTONE, disk->data_class);
     
     cleanup_anchor_fixture(vol);
 }

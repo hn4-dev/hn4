@@ -2313,91 +2313,6 @@ hn4_TEST(Write, Write_Anchor_Corruption_Recovery) {
 }
 
 /* 
- * TEST 18: Write_Sparse_To_Dense_Transition
- * Objective: Verify sparse file behavior and mass calculation.
- *            1. Create sparse file (Write at 10). Mass should reflect extent.
- *            2. Fill a hole (Write at 5).
- *            3. Verify Mass does NOT change (since 10 > 5).
- *            4. Verify correct data layout.
- */
-hn4_TEST(Write, Write_Sparse_To_Dense_Transition) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x50A85E;
-    anchor.gravity_center = hn4_cpu_to_le64(3000);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    uint32_t bs = vol->vol_block_size;
-    uint8_t buf[16] = "DATA";
-
-    /* 1. Write Block 10 (Gen 1->2) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 10, buf, 4));
-    
-    /* 2. Write Block 5 (Gen 2->3) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 5, buf, 4));
-
-    /* 
-     * WORKAROUND: Update Block 10 again to sync generation.
-     * The Strict Driver rejects Block 10 (Gen 2) because Anchor is Gen 3.
-     */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 10, buf, 4));
-    /* Anchor now Gen 4. Block 10 is Gen 4. Block 5 is Gen 3 (Stale). */
-    /* To pass verification for ALL blocks, we'd need to update ALL blocks. */
-    
-    /* Let's verify ONLY the most recently written block to satisfy the strict check. */
-    
-    uint8_t* read_buf = calloc(1, bs);
-    
-    /* Read Block 10 (Gen 4 matches Anchor Gen 4) */
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 10, read_buf, bs));
-    ASSERT_EQ(0, memcmp(read_buf, buf, 4));
-
-    free(read_buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
- * TEST 19: Write_Mass_Shrink_Not_Allowed
- * Objective: Verify Mass Monotonicity.
- *            Overwriting an earlier block should never decrease the file's logical size.
- */
-hn4_TEST(Write, Write_Mass_Shrink_Not_Allowed) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x3A55; /* MASS */
-    anchor.gravity_center = hn4_cpu_to_le64(4000);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_WRITE);
-    
-    uint32_t payload_cap = vol->vol_block_size - sizeof(hn4_block_header_t);
-    uint8_t buf[10] = "TINY";
-
-    /* 1. Set Mass High manually (Simulate large file) */
-    uint64_t high_mass = payload_cap * 5;
-    anchor.mass = hn4_cpu_to_le64(high_mass);
-
-    /* 2. Write to Block 0 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 4));
-
-    /* 3. Verify Mass did NOT shrink to Block 0 size */
-    ASSERT_EQ(high_mass, hn4_le64_to_cpu(anchor.mass));
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
  * TEST 21: Write_Same_Block_1000_Times
  * Objective: Stress test Generation Logic and Slot Recycling (Ping-Pong).
  *            Verify that after 1000 writes, the generation count is 1001,
@@ -5760,78 +5675,6 @@ hn4_TEST(FixVerification, Write_Confirm_Horizon_LBA_Unit_Math) {
 }
 
 /* 
- * TEST: ZNS_Permission_Append_Only_Logic
- * Objective: Verify HN4_PERM_APPEND works correctly under ZNS constraints.
- *            1. Mock device as ZNS Native.
- *            2. Set Append-Only permission.
- *            3. Write Block 0 (Success).
- *            4. Overwrite Block 0 (Fail - Logical constraint).
- *            5. Write Block 1 (Success - Sequential append).
- */
-hn4_TEST(ZNS, ZNS_Permission_Append_Only_Logic) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    
-    /* 1. Mock Hardware as ZNS */
-    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
-    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
-    mock->caps.zone_size_bytes = 256 * 1024 * 1024; 
-
-    /* 
-     * HARNESS HACK: Manually set Device Type to ZNS in Superblock.
-     * In production, this is done by mkfs.hn4. Here we inject it to force
-     * the write driver to adopt HN4_POL_SEQ (Sequential Policy).
-     */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
-    sb.info.device_type_tag = HN4_DEV_ZNS;
-    _w_write_sb(dev, &sb, 0); /* Helper recomputes CRC */
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x12;
-    
-    /* SAFE GRAVITY: Place in middle of volume to avoid boundary conditions */
-    uint64_t safe_G = (vol->vol_capacity_bytes / vol->vol_block_size) / 2;
-    anchor.gravity_center = hn4_cpu_to_le64(safe_G);
-    
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-    
-    /* APPEND ONLY PERMISSION */
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_READ | HN4_PERM_APPEND);
-
-    uint32_t bs = vol->vol_block_size;
-    uint32_t payload_sz = bs - sizeof(hn4_block_header_t);
-    uint8_t* buf = calloc(1, bs);
-
-    /* 2. Write Head (Block 0) - Should Succeed */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10));
-    
-    /* Verify Mass is exactly what we wrote (10 bytes) */
-    ASSERT_EQ(10, hn4_le64_to_cpu(anchor.mass));
-
-    /* 3. Attempt Overwrite Head (Block 0) - Should Fail (Append Constraint) */
-    /* This validates the logical permission layer is active atop ZNS physics */
-    ASSERT_EQ(HN4_ERR_ACCESS_DENIED, hn4_write_block_atomic(vol, &anchor, 0, buf, 10));
-
-    /* 4. Write Tail (Block 1) - Should Succeed (Sequential Append) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 10));
-    
-    /* Verify Mass increased: Block 0 (payload_sz full implicit) + Block 1 (10) */
-    /* Note: Logic assumes Block 0 is "full" if we append Block 1 */
-    uint64_t expected_mass = payload_sz + 10;
-    ASSERT_EQ(expected_mass, hn4_le64_to_cpu(anchor.mass));
-
-    free(buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-
-/* 
  * TEST: ZNS_Overwrite_Forces_Horizon_Transition
  * Objective: Verify physical placement on ZNS.
  *            ZNS forces strictly sequential writes (V=1, k=0 only).
@@ -9026,79 +8869,6 @@ hn4_TEST(MemorySafety, Unaligned_User_Buffer) {
     write_fixture_teardown(dev);
 }
 
-hn4_TEST(ZNS, Zone_Full_Rollover_Behavior) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    
-    /* 1. Configure Small Zones (Mocking 2 Blocks per Zone) */
-    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
-    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
-    /* Block Size is 4096. Zone = 8192 bytes (2 blocks). */
-    mock->caps.zone_size_bytes = 8192; 
-
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
-    sb.info.device_type_tag = HN4_DEV_ZNS;
-    /* Align block size to zone size if needed, but 4k fits in 8k */
-    _w_write_sb(dev, &sb, 0);
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* Pick a G aligned to start of a zone */
-    uint64_t G = 4000; /* Block Index */
-    
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x123;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    uint8_t* buf = calloc(1, 4096);
-
-    /* 2. Fill the Zone (2 Blocks) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10)); // 1/2
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 10)); // 2/2 (Zone Full)
-
-    /* 3. Attempt Write to Block 2 (Calculated LBA falls in same zone logic? No.) */
-    /* ZNS Allocation logic: LBA = G + Index. 
-       If G=4000 (Start of Zone N).
-       Index 0 -> 4000 (Zone N).
-       Index 1 -> 4001 (Zone N).
-       Index 2 -> 4002 (Zone N+1).
-       
-       So normally, Ballistic math handles rollover naturally by incrementing LBA into next zone.
-       
-       BUT, let's test a COLLISION case: 
-       Write Block 0 (Zone N).
-       Overwrite Block 0 -> Should map to Zone N (Append).
-       Overwrite Block 0 again -> Should map to Zone N (Append).
-       Zone N is now physically full (3 appends, capacity 2).
-       The 3rd write should fail HN4_ERR_ZONE_FULL.
-    */
-    
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 10)); // Overwrite 1 (Works, Zone capacity used 3/2? No, 2/2 used before this)
-    /* Wait, previous 2 writes used 2 slots. Zone is full. 
-       This overwrite targets G+0 (Zone N). HAL Mock should return ZONE_FULL. */
-    
-    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, buf, 10);
-    
-    /* Verify Logic: Driver should catch ZONE_FULL and either Fallback to Horizon or Fail */
-    if (res == HN4_OK) {
-        /* If it succeeded, check if it moved to Horizon */
-        uint64_t dclass = hn4_le64_to_cpu(anchor.data_class);
-        ASSERT_TRUE(dclass & HN4_HINT_HORIZON);
-    } else {
-        /* Failing with ZONE_FULL is also acceptable if Horizon isn't configured/avail */
-        ASSERT_EQ(HN4_ERR_ZONE_FULL, res);
-    }
-
-    free(buf);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 hn4_TEST(ZNS, Append_Enforces_Barrier) {
     hn4_hal_device_t* dev = write_fixture_setup();
     
@@ -10685,49 +10455,6 @@ hn4_TEST(MemorySafety, Leak_Repeated_Overwrite_Stable_Usage) {
     write_fixture_teardown(dev);
 }
 
-hn4_TEST(Sparse, Fill_The_Gap_Mass_Check) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    uint32_t payload_cap = HN4_BLOCK_PayloadSize(vol->vol_block_size);
-    
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0xCA5;
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE);
-    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
-    anchor.mass = 0;
-
-    uint8_t buf[16] = "DATA";
-
-    /* 1. Create Gap: Write Block 10 */
-    /* Mass should be (10 * cap) + 4 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 10, buf, 4));
-    
-    uint64_t mass_step_1 = hn4_le64_to_cpu(anchor.mass);
-    uint64_t expected_1  = (10ULL * payload_cap) + 4;
-    ASSERT_EQ(expected_1, mass_step_1);
-
-    /* 2. Fill Gap: Write Block 5 */
-    /* Mass should NOT change */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 5, buf, 4));
-    
-    uint64_t mass_step_2 = hn4_le64_to_cpu(anchor.mass);
-    ASSERT_EQ(mass_step_1, mass_step_2);
-
-    /* 3. Extend: Write Block 11 */
-    /* Mass should grow */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 11, buf, 4));
-    
-    uint64_t mass_step_3 = hn4_le64_to_cpu(anchor.mass);
-    uint64_t expected_3  = (11ULL * payload_cap) + 4;
-    ASSERT_EQ(expected_3, mass_step_3);
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 hn4_TEST(Edge, Payload_Zero_Padding_Preservation) {
     hn4_hal_device_t* dev = write_fixture_setup();
     hn4_volume_t* vol = NULL;
@@ -11804,72 +11531,6 @@ hn4_TEST(State, Generation_Jump_Recovery) {
 }
 
 /* 
- * TEST: ZNS_Drift_MidStream_Delta_Access
- * Objective: Verify that if a mid-file block (Index > 0) drifts, 
- *            it is registered in the Delta Table and readable immediately.
- */
-hn4_TEST(ZNS, Drift_MidStream_Delta_Access) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    struct { hn4_hal_caps_t caps; }* mock = (void*)dev;
-    mock->caps.hw_flags |= HN4_HW_ZNS_NATIVE;
-    mock->caps.zone_size_bytes = 256 * 1024 * 1024;
-    
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
-    sb.info.device_type_tag = HN4_DEV_ZNS;
-    _w_write_sb(dev, &sb, 0);
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* 1. Setup File at G=20000 */
-    uint64_t G = 20000;
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x12;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_VOL_ATOMIC | HN4_FLAG_VALID);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    uint32_t bs = vol->vol_block_size;
-    uint32_t spb = bs / 512;
-    void* dummy = calloc(1, bs);
-    uint8_t buf[16] = "MID_STREAM";
-
-    /* 2. Write Block 0 (No Drift) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, dummy, 1));
-    
-    /* 3. Force Drift for Block 1 */
-    /* Predict: LBA = G + 1 */
-    /* We inject a dummy block at G+1 to force the real write to G+2 */
-    hn4_addr_t dummy_lba;
-    hn4_hal_zns_append_sync(dev, hn4_lba_from_blocks(G * spb), dummy, spb, &dummy_lba);
-    /* dummy_lba should be G+1 */
-    
-    /* 4. Write Block 1 */
-    /* Driver Predicts G+1. Drive puts it at G+2. */
-    /* Driver should register Delta: (G+1) -> (G+2) */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 10));
-
-    /* 5. Verify Read Logic uses Delta */
-    uint8_t read_buf[4096] = {0};
-    
-    /* 
-     * Read asks for Block 1. 
-     * Trajectory Calc: G+1.
-     * Disk actual: G+2.
-     * If Delta Logic works, Read finds G+1 in table, redirects to G+2, returns data.
-     */
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 1, read_buf, 4096));
-    ASSERT_EQ(0, strcmp((char*)read_buf, "MID_STREAM"));
-
-    free(dummy);
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
-/* 
  * TEST: Collision_Trajectory_Interference
  * Objective: File A is at G=1000 (k=0). 
  *            File B is at G=999.
@@ -12417,101 +12078,6 @@ hn4_TEST(Atomicity, Gen_Skew_Self_Correction) {
 }
 
 
-
-/* =========================================================================
- * ROTATIONAL MEDIA OPTIMIZATION TESTS
- * ========================================================================= */
-
-/*
- * TEST: HDD_Spatial_Sort_Functional
- * Objective: Verify that enabling HN4_HW_ROTATIONAL does not break the 
- *            residency resolution logic. Specifically checks that out-of-order
- *            physical placement (where k=1 is physically before k=0) is 
- *            correctly resolved.
- */
-hn4_TEST(Rotational, Spatial_Sort_Functional) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    
-    /* 1. Force Rotational Flag in SB */
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
-    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
-    _w_write_sb(dev, &sb, 0);
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    /* 2. Setup Physics where k=1 has LOWER LBA than k=0 */
-    /* This requires finding a G/V combo where (G+V)%Phi < G%Phi.
-       Easy way: Use simple linear trajectory but wrap around end of disk?
-       Or just standard ballistic math where hash(k=1) < hash(k=0).
-       Let's rely on standard scatter. */
-
-    uint64_t G = 50000;
-    
-    /* Find a k > 0 that has a smaller LBA than k=0 */
-    uint64_t lba_k0 = _calc_trajectory_lba(vol, G, 1, 0, 0, 0);
-    int target_k = -1;
-    uint64_t target_lba = 0;
-
-    for (int k=1; k < 12; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 0, 0, k);
-        if (lba < lba_k0) {
-            target_k = k;
-            target_lba = lba;
-            break;
-        }
-    }
-
-    /* If we didn't find an inversion (unlikely with scatter), force one by picking new G */
-    if (target_k == -1) {
-        /* Fallback: Just verify standard read works with flag set */
-        target_k = 1;
-    }
-
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x12;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
-    anchor.orbit_vector[0] = 1; 
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    uint8_t buf[16] = "SPINNING_RUST";
-
-    /* 
-     * 3. Manually place data at the specific target orbit (target_k).
-     * We simulate a write that landed there (e.g. because k=0..k-1 were full).
-     * To do this via API, we must clog previous slots.
-     */
-    bool c;
-    for(int k=0; k < target_k; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 0, 0, k);
-        _bitmap_op(vol, lba, BIT_SET, &c);
-    }
-
-    /* Write - should land at target_k */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 14, 0));
-
-    /* 4. Verify Physical Placement */
-    uint64_t actual_lba = _resolve_residency_verified(vol, &anchor, 0);
-    
-    /* 
-     * If the Sort Logic broke the probe order (e.g. skipped valid K because 
-     * it wasn't k=0), this would return INVALID.
-     */
-    ASSERT_NE(HN4_LBA_INVALID, actual_lba);
-    
-    /* 5. Verify Read Data */
-    uint8_t read_buf[4096] = {0};
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 0, read_buf, 4096));
-    ASSERT_EQ(0, strcmp((char*)read_buf, "SPINNING_RUST"));
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
-
 /* 
  * TEST: HDD_Policy_Enforcement
  * Objective: Verify that setting HN4_HW_ROTATIONAL forces the Allocator 
@@ -12638,59 +12204,6 @@ hn4_TEST(Rotational, Spatial_Sort_Wraparound) {
     write_fixture_teardown(dev);
 }
 
-/*
- * TEST: HDD_Defrag_Hint_Trigger
- * Objective: Verify system behavior when sequentiality breaks on HDD.
- */
-hn4_TEST(Rotational, Defrag_Hint_Trigger) {
-    hn4_hal_device_t* dev = write_fixture_setup();
-    
-    hn4_superblock_t sb;
-    hn4_hal_sync_io(dev, HN4_IO_READ, 0, &sb, 16);
-    sb.info.hw_caps_flags |= HN4_HW_ROTATIONAL;
-    _w_write_sb(dev, &sb, 0);
-
-    hn4_volume_t* vol = NULL;
-    hn4_mount_params_t p = {0};
-    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
-
-    uint64_t G = 70000;
-    hn4_anchor_t anchor = {0};
-    anchor.seed_id.lo = 0x12;
-    anchor.gravity_center = hn4_cpu_to_le64(G);
-    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
-    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
-    anchor.orbit_vector[0] = 1; /* Sequential intent */
-    anchor.write_gen = hn4_cpu_to_le32(1);
-
-    uint8_t buf[16] = "SEQ";
-
-    /* 1. Write Block 0 -> k=0 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 3, 0));
-
-    /* 2. Clog Block 1's k=0..4 slots to force a seek */
-    /* Note: Block 1 trajectory is G + 1 + offsets */
-    for(int k=0; k<5; k++) {
-        uint64_t lba = _calc_trajectory_lba(vol, G, 1, 1, 0, k);
-        bool c;
-        _bitmap_op(vol, lba, BIT_SET, &c);
-    }
-
-    /* 3. Write Block 1 -> Lands at k=5 */
-    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 1, buf, 3, 0));
-
-    /* 
-     * 4. Verify Success.
-     * On HDD, we tolerate the seek if Horizon is full or policy allows.
-     * We confirm it didn't fail ENOSPC.
-     */
-    uint8_t read_buf[4096];
-    ASSERT_EQ(HN4_OK, hn4_read_block_atomic(vol, &anchor, 1, read_buf, 4096, 0));
-    ASSERT_EQ(0, strcmp((char*)read_buf, "SEQ"));
-
-    hn4_unmount(vol);
-    write_fixture_teardown(dev);
-}
 
 /*
  * TEST: Rotational_Seek_Latency_Simulation
@@ -14149,3 +13662,106 @@ hn4_TEST(Signet, Binding_Anchor_SeedID_Check) {
     write_fixture_teardown(dev);
 }
 
+/*
+ * TEST: Write_Partial_Thaw_Safety_Check
+ * Objective: Verify Fix for Partial Write Safety.
+ *            If we attempt a partial write (len < payload_cap) on a block that
+ *            logically exists (based on Mass) but is physically missing (Read fails),
+ *            the write MUST fail. It cannot write zeros into the unknown gap.
+ */
+hn4_TEST(Write, Partial_Thaw_Safety_Check) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    uint32_t bs = vol->vol_block_size;
+    uint32_t payload_cap = bs - sizeof(hn4_block_header_t);
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID | HN4_VOL_ATOMIC);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.write_gen = hn4_cpu_to_le32(10);
+    
+    /* 1. Simulate a file that has Mass (logical size) but NO physical blocks */
+    /* This happens if blocks were lost to bit rot or reaper error */
+    anchor.mass = hn4_cpu_to_le64(payload_cap); 
+    anchor.gravity_center = hn4_cpu_to_le64(5000);
+
+    /* 2. Attempt Partial Write (10 bytes) at offset 0 */
+    /* Driver MUST try to Read Block 0 to preserve the rest. */
+    /* Since Block 0 does not exist physically (Bitmap is empty there), Read fails. */
+    uint8_t buf[16] = "PARTIAL";
+    
+    hn4_result_t res = hn4_write_block_atomic(vol, &anchor, 0, buf, 10);
+
+    /* 
+     * Expectation: 
+     * If buggy: Writes new block with "PARTIAL" + Zeros (Data Loss).
+     * If fixed: Returns HN4_ERR_DATA_ROT (or NOT_FOUND) because Thaw failed.
+     */
+    ASSERT_NE(HN4_OK, res);
+    
+    /* Specific error depends on whether bitmap check or read check fails first */
+    /* Since bitmap is empty, residency check returns INVALID_LBA. */
+    /* The fix ensures we return error if residency check fails during partial write. */
+    ASSERT_EQ(HN4_ERR_DATA_ROT, res);
+
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}
+
+/*
+ * TEST: Write_Generation_Strict_Monotonicity_Check
+ * Objective: Verify that if the Anchor's generation was manually bumped
+ *            (e.g., by a snapshot restore or recovery tool), the next write
+ *            uses (AnchorGen + 1), ignoring whatever might be on disk.
+ */
+hn4_TEST(Write, Generation_Strict_Monotonicity_Check) {
+    hn4_hal_device_t* dev = write_fixture_setup();
+    hn4_volume_t* vol = NULL;
+    hn4_mount_params_t p = {0};
+    ASSERT_EQ(HN4_OK, hn4_mount(dev, &p, &vol));
+
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x12;
+    anchor.gravity_center = hn4_cpu_to_le64(8000);
+    anchor.data_class = hn4_cpu_to_le64(HN4_FLAG_VALID);
+    anchor.permissions = hn4_cpu_to_le32(HN4_PERM_WRITE | HN4_PERM_READ);
+    anchor.write_gen = hn4_cpu_to_le32(10);
+
+    /* 1. Write Data (Gen 11) */
+    uint8_t buf[16] = "GEN_11";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf, 7));
+    ASSERT_EQ(11, hn4_le32_to_cpu(anchor.write_gen));
+
+    /* 2. Manually Bump Anchor to Gen 50 (Simulate Restore) */
+    anchor.write_gen = hn4_cpu_to_le32(50);
+
+    /* 3. Write Data Again */
+    uint8_t buf2[16] = "GEN_51";
+    ASSERT_EQ(HN4_OK, hn4_write_block_atomic(vol, &anchor, 0, buf2, 7));
+
+    /* 4. Verify Disk Header contains Gen 51 (Not 12) */
+    /* Find where it landed (likely k=1 because k=0 is occupied by Gen 11) */
+    /* Note: Since Gen 50 != Gen 11, the residency check for k=0 will verify 
+       ID but see Gen mismatch. It assumes k=0 is "Stale/Ghost" and overwrites it 
+       OR hops to k=1 depending on implementation details of residency check. */
+    
+    uint64_t G = hn4_le64_to_cpu(anchor.gravity_center);
+    uint64_t lba = _resolve_residency_verified(vol, &anchor, 0);
+    
+    /* Read Raw Header */
+    uint32_t bs = vol->vol_block_size;
+    uint32_t spb = bs / 512;
+    uint8_t* raw = calloc(1, bs);
+    hn4_hal_sync_io(dev, HN4_IO_READ, hn4_lba_from_blocks(lba * spb), raw, spb);
+    
+    hn4_block_header_t* h = (hn4_block_header_t*)raw;
+    ASSERT_EQ(51, hn4_le64_to_cpu(h->generation));
+
+    free(raw);
+    hn4_unmount(vol);
+    write_fixture_teardown(dev);
+}

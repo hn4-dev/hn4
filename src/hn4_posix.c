@@ -460,6 +460,16 @@ int hn4_posix_open(hn4_volume_t* vol, const char* path, int flags, hn4_mode_t mo
         new_anc.orbit_vector[0] = 1;
 
         if (HN4_UNLIKELY(hn4_write_anchor_atomic(vol, &new_anc) != HN4_OK)) {
+
+        uint64_t failed_dc = hn4_le64_to_cpu(new_anc.data_class);
+        if (failed_dc & HN4_FLAG_EXTENDED) {
+            uint64_t ext_ptr;
+            _imp_memcpy(&ext_ptr, new_anc.inline_buffer, sizeof(uint64_t));
+            ext_ptr = hn4_le64_to_cpu(ext_ptr);
+            hn4_free_block(vol, ext_ptr);
+        }
+
+            /* Rollback RAM Slot */
             hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
             ram_base[target_slot].data_class = 0; 
             hn4_hal_spinlock_release(&vol->locking.l2_lock);

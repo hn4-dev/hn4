@@ -104,6 +104,7 @@ void hn4_hal_spinlock_release(hn4_spinlock_t* lock);
 #define HN4_IO_DISCARD          3
 #define HN4_IO_ZONE_APPEND      4
 #define HN4_IO_ZONE_RESET       5
+#define HN4_IO_ZERO             6
 
 typedef struct {
     uint8_t     op_code;
@@ -171,8 +172,24 @@ static inline void hn4_hal_nvm_persist(volatile void* ptr, size_t size) {
          * Note: In a real deployment, check _hn4_cpu_features
          * to decide between CLFLUSH, CLFLUSHOPT, or CLWB.
          */
-        __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
+        bool use_clwb = (_hn4_cpu_features & HN4_CPU_X86_CLWB);
+    bool use_opt  = (_hn4_cpu_features & HN4_CPU_X86_CLFLUSHOPT);
+
+    while (addr < end) {
+        if (use_clwb) {
+            /* CLWB [RAX]: 66 0F AE /6 (ModRM 0x30 = [RAX]) */
+            __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x30" :: "a"(addr) : "memory");
+        } 
+        else if (use_opt) {
+            /* CLFLUSHOPT [RAX]: 66 0F AE /7 (ModRM 0x38 = [RAX]) */
+            __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x38" :: "a"(addr) : "memory");
+        } 
+        else {
+            /* Legacy CLFLUSH: Let compiler pick addressing mode */
+            __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
+        }
         addr += HN4_CACHE_LINE_SIZE;
+    }
     }
     
     /* SFENCE ensures the flush instructions complete */
@@ -191,9 +208,22 @@ static inline void hn4_hal_nvm_persist(volatile void* ptr, size_t size) {
     /* Ensure all previous stores are observed before the clean */
     __asm__ volatile("dsb ish" ::: "memory");
 
+     bool use_clwb = (_hn4_cpu_features & HN4_CPU_X86_CLWB);
+    bool use_opt  = (_hn4_cpu_features & HN4_CPU_X86_CLFLUSHOPT);
+
     while (addr < end) {
-        /* DC CVAP: Data Cache Clean by VA to Point of Persistence */
-        __asm__ volatile("dc cvap, %0" : : "r" (addr) : "memory");
+        if (use_clwb) {
+            /* CLWB [RAX]: Write back modified line, do NOT invalidate. Keeps cache warm. */
+            __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x30" :: "a"(addr) : "memory");
+        } 
+        else if (use_opt) {
+            /* CLFLUSHOPT [RAX]: Ordered flush, higher throughput than CLFLUSH. */
+            __asm__ volatile(".byte 0x66, 0x0f, 0xae, 0x38" :: "a"(addr) : "memory");
+        } 
+        else {
+            /* CLFLUSH: Legacy serialized flush. */
+            __asm__ volatile("clflush (%0)" :: "r"(addr) : "memory");
+        }
         addr += HN4_CACHE_LINE_SIZE;
     }
 

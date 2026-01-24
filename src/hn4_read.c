@@ -257,12 +257,16 @@ static hn4_result_t _validate_block(
             const uint64_t* scan = (const uint64_t*)buffer;
             bool is_poison = true;
             
-            /* Check 64 bytes (8 x 64-bit words) */
-            for (int i = 0; i < 8; i++) {
-                if (scan[i] != 0xCCCCCCCCCCCCCCCCULL) {
-                    is_poison = false;
-                    break;
+            if (len >= 64) {
+                /* Check 64 bytes (8 x 64-bit words) */
+                for (int i = 0; i < 8; i++) {
+                    if (scan[i] != 0xCCCCCCCCCCCCCCCCULL) {
+                        is_poison = false;
+                        break;
+                    }
                 }
+            } else {
+                is_poison = false; /* Buffer too small to confirm global poison */
             }
 
             if (is_poison) {
@@ -286,7 +290,7 @@ static hn4_result_t _validate_block(
         return HN4_ERR_ID_MISMATCH;
     }
 
-    if (hn4_le64_to_cpu(hdr->seq_index) != logical_seq) return false;
+    if (hn4_le64_to_cpu(hdr->seq_index) != logical_seq) return HN4_ERR_PHANTOM_BLOCK;
 
      /* 
      * 4. Freshness Check (STRICT ATOMICITY)
@@ -350,9 +354,23 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
 
     hn4_anchor_t anchor;
     
-    hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
-    memcpy(&anchor, anchor_ptr, sizeof(hn4_anchor_t));
-    hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    /* Optimization: Only lock if reading from shared Nano-Cortex RAM */
+    bool need_lock = false;
+    if (vol->nano_cortex) {
+        uintptr_t ptr = (uintptr_t)anchor_ptr;
+        uintptr_t start = (uintptr_t)vol->nano_cortex;
+        uintptr_t end = start + vol->cortex_size;
+        if (ptr >= start && ptr < end) need_lock = true;
+    }
+
+    if (need_lock) {
+        hn4_hal_spinlock_acquire(&vol->locking.l2_lock);
+        volatile hn4_anchor_t* v_ptr = (volatile hn4_anchor_t*)anchor_ptr;
+        memcpy(&anchor, (void*)v_ptr, sizeof(hn4_anchor_t));
+        hn4_hal_spinlock_release(&vol->locking.l2_lock);
+    } else {
+        memcpy(&anchor, anchor_ptr, sizeof(hn4_anchor_t));
+    }
 
     uint32_t payload_cap = HN4_BLOCK_PayloadSize(vol->vol_block_size);
 
@@ -436,25 +454,34 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     for (int i = 0; i < HN4_ORBIT_LIMIT; i++) candidate_errors[i] = HN4_ERR_NOT_FOUND;
 
     if (dclass & HN4_HINT_HORIZON) {
-        uint16_t safe_M = (M > 63) ? 63 : M;
+
+        uint16_t safe_M = (M > 32) ? 32 : M;
         uint64_t stride = (1ULL << safe_M);
 
         if (block_idx < (UINT64_MAX / stride)) {
-            uint64_t linear_lba = G + (block_idx * stride);
-            if (linear_lba < max_blocks) {
-                bool allocated;
-                hn4_result_t op_res = _bitmap_op(vol, linear_lba, BIT_TEST, &allocated);
 
-                if (op_res != HN4_OK) {
-                    probe_error = _merge_error(probe_error, op_res);
-                } else if (allocated) {
-                    candidates[0]    = linear_lba;
-                    valid_candidates = 1;
-                }
+            uint64_t offset = block_idx * stride;
+
+            /* Check Physical Limit BEFORE addition to G */
+            if (offset < max_blocks && (UINT64_MAX - G) >= offset) {
+                uint64_t linear_lba = G + offset;
+                
+                /* Double check final LBA against capacity */
+                if (linear_lba < max_blocks) {
+                    bool allocated;
+                    hn4_result_t op_res = _bitmap_op(vol, linear_lba, BIT_TEST, &allocated);
+
+                    if (op_res != HN4_OK) {
+                        probe_error = _merge_error(probe_error, op_res);
+                    } else if (allocated) {
+                        candidates[0]    = linear_lba;
+                        valid_candidates = 1;
+                    }
+                
+               }
             }
         }
     } else {
-        if (HN4_UNLIKELY(dev_type == HN4_DEV_TAPE)) return HN4_ERR_GEOMETRY;
 
         /* Determine target Orbit (k) from Anchor Hint (2 bits per cluster) */
         uint8_t target_k = 0;
@@ -529,7 +556,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
     
      if (is_hdd && valid_candidates > 1) {
-        _sort_orbits_spatial(candidates, valid_candidates);
+        _sort_candidates_mechanical(candidates, valid_candidates);
     }
 
 
@@ -545,7 +572,7 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
         uint64_t target_lba = candidates[i];
 
         if (target_lba > (UINT64_MAX / sectors)) {
-            failed_mask |= (1U << i);
+            failed_mask |= (1ULL << i);
             candidate_errors[i] = HN4_ERR_GEOMETRY;
             deep_error          = _merge_error(deep_error, HN4_ERR_GEOMETRY);
             continue;
@@ -617,7 +644,9 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
             }
 
             if (++tries < max_retries && io_res != HN4_OK) {
-                hn4_hal_micro_sleep(current_retry_delay);
+                uint32_t safe_sleep = (current_retry_delay > 10000) ? 10000 : current_retry_delay;
+                hn4_hal_poll(vol->target_device);
+                hn4_hal_micro_sleep(safe_sleep);
             }
         } while (HN4_UNLIKELY(io_res != HN4_OK && tries < max_retries));
 
@@ -718,11 +747,13 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
                          #ifdef HN4_USE_128BIT
                              hn4_u128_t blk_128 = hn4_u128_from_u64(next_lba);
                              hn4_addr_t pf_phys = hn4_u128_mul_u64(blk_128, sectors);
+                             hn4_hal_prefetch(vol->target_device, pf_phys, pf_len_sectors);
                          #else
-                             hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
+                             if (next_lba <= (UINT64_MAX / sectors)) {
+                                 hn4_addr_t pf_phys = hn4_lba_from_blocks(next_lba * sectors);
+                                 hn4_hal_prefetch(vol->target_device, pf_phys, pf_len_sectors);
+                             }
                          #endif
-                         
-                         hn4_hal_prefetch(vol->target_device, pf_phys, pf_len_sectors);
                     }
                 }
             
@@ -744,51 +775,45 @@ _Check_return_ HN4_NO_INLINE hn4_result_t hn4_read_block_atomic(
     }
 
     /* 6. Auto-Medic */
-      if (HN4_UNLIKELY(HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0)) {
-        hn4_block_header_t* w_hdr = (hn4_block_header_t*)io_buf;
+       if (HN4_UNLIKELY(HN4_IS_OK(deep_error) && failed_mask != 0 && allow_healing && winner_idx >= 0)) {
+        
         if (vol->read_only) {
             HN4_LOG_WARN("READ_ATOMIC: Skipping Auto-Medic (RO).");
         } else {
-            for (int i = 0; i < valid_candidates; i++) {
-                if (i == winner_idx) continue;
 
-                if (failed_mask & (1U << i)) {
-                    hn4_result_t err = candidate_errors[i];
-                    if (err == HN4_ERR_GENERATION_SKEW || err == HN4_ERR_ID_MISMATCH) continue;
+            void* repair_copy = hn4_hal_mem_alloc(bs);
+            
+            if (repair_copy) {
+                /* Snapshot the valid data */
+                memcpy(repair_copy, io_buf, bs);
 
-                    uint64_t   bad_lba_idx = candidates[i];
-                    hn4_addr_t bad_phys    = hn4_lba_from_blocks(bad_lba_idx * sectors);
+                for (int i = 0; i < valid_candidates; i++) {
+                    if (i == winner_idx) continue;
 
-                    /* 
-                     * Re-verify CRC before writing back to disk.
-                     * We calculate based on the RAW payload in the buffer (compressed or not).
-                     */
-                    size_t h_bound = offsetof(hn4_block_header_t, header_crc);
+                    if (failed_mask & (1U << i)) {
+                        hn4_result_t err = candidate_errors[i];
+                        /* Don't overwrite Skewed/Mismatch blocks - they might be valid history */
+                        if (err == HN4_ERR_GENERATION_SKEW || err == HN4_ERR_ID_MISMATCH) continue;
 
-                    uint32_t saved_crc = w_hdr->header_crc;
-                    uint32_t d_len = HN4_BLOCK_PayloadSize(vol->vol_block_size);
+                        uint64_t   bad_lba_idx = candidates[i];
+                        hn4_addr_t bad_phys    = hn4_lba_from_blocks(bad_lba_idx * sectors);
 
-                    w_hdr->data_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_DATA, w_hdr->payload, d_len));
-                    w_hdr->header_crc = 0;
-                    w_hdr->header_crc = hn4_cpu_to_le32(hn4_crc32(HN4_CRC_SEED_HEADER, w_hdr, h_bound));
-
-                    if (hn4_repair_block(vol, bad_phys, io_buf, bs) != HN4_OK) {
-                        HN4_LOG_WARN("READ_ATOMIC: Auto-Medic failed for candidate %d", i);
+                        if (hn4_repair_block(vol, bad_phys, repair_copy, bs) != HN4_OK) {
+                            HN4_LOG_WARN("READ_ATOMIC: Auto-Medic failed for candidate %d", i);
+                        }
                     }
-
-                    w_hdr->header_crc = saved_crc;
                 }
+                hn4_hal_mem_free(repair_copy);
+            } else {
+                HN4_LOG_WARN("READ_ATOMIC: OOM during Auto-Medic. Repair skipped.");
             }
         }
     }
 
     hn4_hal_mem_free(io_buf);
 
-    if (winner_idx == -1) {
-        /* Do not wipe output buffer on error */
-        return deep_error;
-    }
-
+    if (winner_idx == -1)  return deep_error;
+    
     if (deep_error == HN4_OK && probe_error == HN4_INFO_HEALED) {
         return HN4_INFO_HEALED;
     }

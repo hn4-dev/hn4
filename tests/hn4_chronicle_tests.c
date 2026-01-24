@@ -977,3 +977,346 @@ hn4_TEST(Verify, NullDevice) {
     
     cleanup_chronicle_fixture(vol);
 }
+
+/* =========================================================================
+ * TEST 38: Verify - Future Protocol Version
+ * RATIONALE:
+ * If an entry claims a version higher than HN4_CHRONICLE_VERSION, it should
+ * be flagged. However, forward compatibility might allow it if structure 
+ * matches. Current implementation assumes strict version match or ignores?
+ * Let's check impl: It doesn't explicitly check version in `_is_sector_valid`.
+ * But `append` writes `HN4_CHRONICLE_VERSION`.
+ * If we inject a higher version, `verify` should accept it if CRC holds, 
+ * as long as the header layout hasn't changed.
+ * Wait, actually `_is_sector_valid` calculates CRC over `offsetof(entry_header_crc)`.
+ * If version is part of that range (it is), changing version changes CRC.
+ * We calculate CRC *with* the future version.
+ * Result: Should be OK (Forward compat) or ignored.
+ * ========================================================================= */
+hn4_TEST(Verify, FutureVersion) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    uint8_t buf[512] = {0};
+    hn4_chronicle_header_t* h = (hn4_chronicle_header_t*)buf;
+    
+    h->magic = hn4_cpu_to_le64(HN4_CHRONICLE_MAGIC);
+    h->version = hn4_cpu_to_le16(0xFFFF); /* Version 65535 */
+    h->sequence = hn4_cpu_to_le64(1);
+    h->self_lba = hn4_addr_to_le(100);
+    
+    /* Calc CRC with the future version */
+    uint32_t hcrc = hn4_crc32(0, h, offsetof(hn4_chronicle_header_t, entry_header_crc));
+    h->entry_header_crc = hn4_cpu_to_le32(hcrc);
+    *(uint64_t*)(buf + 504) = hn4_cpu_to_le64((uint64_t)hcrc ^ HN4_CHRONICLE_TAIL_KEY);
+    
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, 100, buf, 1);
+    vol->sb.info.journal_ptr = 101;
+    
+    /* 
+     * Current implementation does NOT strictly enforce version <= current 
+     * in the verify loop to allow reading logs from newer drivers.
+     */
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 39: Verify - Broken Link Hash (Tampering)
+ * RATIONALE:
+ * Block N points to N-1. N-1 is valid.
+ * But N's `prev_sector_crc` does not match `CRC(N-1)`.
+ * This indicates the chain was altered or N was forged.
+ * Expect: HN4_ERR_TAMPERED.
+ * ========================================================================= */
+hn4_TEST(Verify, BrokenLinkHash) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* 1. Write Block 100 (Seq 1) */
+    inject_log_entry(vol, 100, 1, 0);
+    
+    /* 2. Write Block 101 (Seq 2), but with WRONG prev_hash */
+    /* Correct hash of 100 */
+    uint8_t buf[512];
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 100, buf, 1);
+    uint32_t correct_prev = hn4_crc32(0, buf, 512);
+    
+    /* Inject with corrupted link */
+    inject_log_entry(vol, 101, 2, correct_prev ^ 0xFFFFFFFF);
+    
+    vol->sb.info.journal_ptr = 102;
+    
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    ASSERT_EQ(HN4_ERR_TAMPERED, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 40: Verify - History Truncation (Bad Magic)
+ * RATIONALE:
+ * Block N points to N-1. N-1 has bad Magic.
+ * This implies N-1 is not a log entry (end of history).
+ * Verify should stop and return OK, not error.
+ * ========================================================================= */
+hn4_TEST(Verify, HistoryTruncation) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* 1. Write Block 100 (Seq 1) */
+    inject_log_entry(vol, 100, 1, 0);
+    
+    /* 2. Write Block 101 (Seq 2) linking to 100 */
+    uint8_t buf[512];
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 100, buf, 1);
+    uint32_t prev = hn4_crc32(0, buf, 512);
+    inject_log_entry(vol, 101, 2, prev);
+    
+    /* 3. Corrupt Block 100 (Magic) AFTER calculating link */
+    /* This simulates N-1 being overwritten by something else */
+    memset(buf, 0xAA, 512);
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, 100, buf, 1);
+    
+    vol->sb.info.journal_ptr = 102;
+    
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    /* Should accept 101 as valid, stop at 100 */
+    ASSERT_EQ(HN4_OK, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 41: Verify - Heal Wrap-Around
+ * RATIONALE:
+ * Phantom Head detection should work across the ring boundary.
+ * SB Ptr = 199 (End).
+ * Disk has valid entry at 100 (Start) linked to 199.
+ * Verify should detect this and update SB to 101.
+ * ========================================================================= */
+hn4_TEST(Verify, HealWrapAround) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    uint8_t buf[512];
+    
+    /* 1. Inject Base Entry at 198 (Seq 1) */
+    inject_log_entry(vol, 198, 1, 0);
+    
+    /* Calculate CRC of 198 */
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 198, buf, 1);
+    uint32_t crc_198 = hn4_crc32(0, buf, 512);
+    
+    /* 2. Inject Phantom 1 at 199 (Seq 2) */
+    inject_log_entry(vol, 199, 2, crc_198);
+    
+    /* Calculate CRC of 199 */
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 199, buf, 1);
+    uint32_t crc_199 = hn4_crc32(0, buf, 512);
+    
+    /* 3. Inject Phantom 2 at 100 (Seq 3) - Wrapped */
+    inject_log_entry(vol, 100, 3, crc_199);
+    
+    /* 4. Set Stale SB Pointer to 199 */
+    /* This implies the last known valid write was 198. */
+    vol->sb.info.journal_ptr = 199;
+    
+    /* Run Verify */
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    
+    ASSERT_EQ(HN4_OK, res);
+    
+    /* 
+     * Expectation:
+     * 1st pass heals 199 (Next=100).
+     * 2nd pass heals 100 (Next=101).
+     * Final Head = 101.
+     * Heal Count should be at least 1 (implementation dependent if it counts passes or ops).
+     */
+    ASSERT_EQ(101, hn4_addr_to_u64(vol->sb.info.journal_ptr));
+    ASSERT_TRUE(vol->health.heal_count >= 1);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+
+/* =========================================================================
+ * TEST 42: Append - Misaligned Journal Start
+ * RATIONALE:
+ * `hn4_chronicle_append` validates geometry. If `journal_start` is 
+ * not sector aligned (should be enforced by type, but LBA logic applies),
+ * or if it's logically invalid (e.g. > Capacity), it fails.
+ * ========================================================================= */
+hn4_TEST(ChronicleAppend, MisalignedStart) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* Set Start > End */
+    vol->sb.info.journal_start = 300; 
+    /* End is ~200 based on capacity calculation in fixture */
+    
+    hn4_result_t res = hn4_chronicle_append(vol->target_device, vol, 0, 0, 0, 0);
+    
+    ASSERT_EQ(HN4_ERR_BAD_SUPERBLOCK, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 43: Verify - Zero Timestamp
+ * RATIONALE:
+ * Timestamp = 0 is a valid value (Epoch 1970). Verify should accept it.
+ * ========================================================================= */
+hn4_TEST(Verify, ZeroTimestamp) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    uint8_t buf[512] = {0};
+    hn4_chronicle_header_t* h = (hn4_chronicle_header_t*)buf;
+    
+    h->magic = hn4_cpu_to_le64(HN4_CHRONICLE_MAGIC);
+    h->sequence = hn4_cpu_to_le64(1);
+    h->timestamp = 0; /* Zero */
+    h->self_lba = hn4_addr_to_le(100);
+    
+    uint32_t hcrc = hn4_crc32(0, h, offsetof(hn4_chronicle_header_t, entry_header_crc));
+    h->entry_header_crc = hn4_cpu_to_le32(hcrc);
+    *(uint64_t*)(buf + 504) = hn4_cpu_to_le64((uint64_t)hcrc ^ HN4_CHRONICLE_TAIL_KEY);
+    
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, 100, buf, 1);
+    
+    vol->sb.info.journal_ptr = 101;
+    
+    ASSERT_EQ(HN4_OK, hn4_chronicle_verify_integrity(vol->target_device, vol));
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 44: Verify - Self LBA Mismatch (Cloned Sector)
+ * RATIONALE:
+ * If a valid block is copied from LBA 100 to LBA 101, the `self_lba` field 
+ * inside the block will still say 100. Verification at 101 should reject it.
+ * This prevents replay of valid blocks to wrong locations.
+ * ========================================================================= */
+hn4_TEST(Verify, SelfLBAMismatch) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* Create entry valid for LBA 100 */
+    uint8_t buf[512] = {0};
+    hn4_chronicle_header_t* h = (hn4_chronicle_header_t*)buf;
+    h->magic = hn4_cpu_to_le64(HN4_CHRONICLE_MAGIC);
+    h->sequence = hn4_cpu_to_le64(1);
+    h->self_lba = hn4_addr_to_le(100);
+    
+    uint32_t hcrc = hn4_crc32(0, h, offsetof(hn4_chronicle_header_t, entry_header_crc));
+    h->entry_header_crc = hn4_cpu_to_le32(hcrc);
+    *(uint64_t*)(buf + 504) = hn4_cpu_to_le64((uint64_t)hcrc ^ HN4_CHRONICLE_TAIL_KEY);
+    
+    /* Write it to LBA 101 (Mismatch) */
+    hn4_hal_sync_io(vol->target_device, HN4_IO_WRITE, 101, buf, 1);
+    
+    /* Point SB to 102, so it checks 101 as the head */
+    vol->sb.info.journal_ptr = 102;
+    
+    /* Should treat 101 as invalid (garbage) and stop there or fail if it's the head */
+    /* Since 101 is the head, if it's invalid, it's TAMPERED */
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    ASSERT_EQ(HN4_ERR_TAMPERED, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 45: Append - Principal Hash Truncation
+ * RATIONALE:
+ * The API takes `uint64_t principal_hash`, but the on-disk struct stores
+ * `uint32_t principal_hash32`. Verify the lower 32 bits are persisted.
+ * ========================================================================= */
+hn4_TEST(ChronicleAppend, PrincipalTruncation) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* 0x12345678_ABCDEF00 */
+    uint64_t big_hash = 0x12345678ABCDEF00ULL;
+    
+    ASSERT_EQ(HN4_OK, hn4_chronicle_append(vol->target_device, vol, 0, 0, 0, big_hash));
+    
+    uint8_t buf[512];
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 100, buf, 1);
+    hn4_chronicle_header_t* h = (hn4_chronicle_header_t*)buf;
+    
+    /* Should match lower 32 bits: 0xABCDEF00 */
+    ASSERT_EQ(0xABCDEF00, hn4_le32_to_cpu(h->principal_hash32));
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 46: Verify - Short Capacity
+ * RATIONALE:
+ * If the SB defines a journal region that exceeds physical capacity (due to 
+ * resize or corruption), verify should catch this geometry error.
+ * ========================================================================= */
+hn4_TEST(Verify, ShortCapacity) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* Set SB Total Capacity > Physical RAM disk */
+    /* RAM is 10MB. Set SB to 100MB. */
+    #ifdef HN4_USE_128BIT
+    vol->sb.info.total_capacity.lo = 100ULL * 1024 * 1024;
+    #else
+    vol->sb.info.total_capacity = 100ULL * 1024 * 1024;
+    #endif
+    
+    /* 
+     * Verify checks `end` which is derived from capacity.
+     * `check_ring` logic (which calls verify) or `verify` itself checks bounds.
+     * `verify` uses `sb.total_capacity`. If that's larger than physical, 
+     * HAL reads will fail with HW_IO or verify logic might calculate wrong end.
+     * Here we rely on HAL failing the read if we try to read non-existent RAM.
+     * Set Head to valid LBA, but implies End is far away.
+     */
+    
+    /* Actually, verify derives `end` from `sb.total_capacity`. */
+    /* If we set `head` to something within SB cap but outside physical cap... */
+    uint64_t oob_lba = (15ULL * 1024 * 1024) / 512; /* 15MB > 10MB */
+    vol->sb.info.journal_ptr = oob_lba;
+    
+    hn4_result_t res = hn4_chronicle_verify_integrity(vol->target_device, vol);
+    
+    /* Should be BAD_SUPERBLOCK (bounds check) or HW_IO (read fail) */
+    /* The code has a bounds check: `if (head >= end) bounds_bad = true` */
+    /* Here head (15MB) < end (100MB). So bounds check passes. */
+    /* HAL Read will fail. */
+    ASSERT_EQ(HN4_ERR_HW_IO, res);
+    
+    cleanup_chronicle_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 47: Verify - Stability After Heal
+ * RATIONALE:
+ * Simulate a successful heal (Phantom Head recovery), then immediately 
+ * verify again. The second verify should be clean (HN4_OK) without healing.
+ * ========================================================================= */
+hn4_TEST(Verify, RecoverFromHeal) {
+    hn4_volume_t* vol = create_chronicle_fixture();
+    
+    /* 1. Valid 100 */
+    inject_log_entry(vol, 100, 1, 0);
+    uint8_t buf[512];
+    hn4_hal_sync_io(vol->target_device, HN4_IO_READ, 100, buf, 1);
+    uint32_t crc1 = hn4_crc32(0, buf, 512);
+    
+    /* 2. Phantom 101 */
+    inject_log_entry(vol, 101, 2, crc1);
+    
+    /* 3. SB at 101 (Stale) */
+    vol->sb.info.journal_ptr = 101;
+    
+    /* First Verify: Heals to 102 */
+    ASSERT_EQ(HN4_OK, hn4_chronicle_verify_integrity(vol->target_device, vol));
+    ASSERT_EQ(102, hn4_addr_to_u64(vol->sb.info.journal_ptr));
+    
+    /* Second Verify: Should be stable */
+    ASSERT_EQ(HN4_OK, hn4_chronicle_verify_integrity(vol->target_device, vol));
+    ASSERT_EQ(102, hn4_addr_to_u64(vol->sb.info.journal_ptr));
+    
+    cleanup_chronicle_fixture(vol);
+}

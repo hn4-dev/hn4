@@ -500,11 +500,12 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
                 if (shift >= 64) {
                     blocks_128.lo = (cap_128.hi >> (shift - 64));
                     blocks_128.hi = 0;
-                } else if (shift > 0) { /* FIX: Ensure shift is non-zero before subtracting from 64 */
+                } else if (shift > 0) {
+                    /* FIX: Only perform split shift if shift > 0 */
                     blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
                     blocks_128.hi = (cap_128.hi >> shift);
                 } else {
-                    /* Fallback for shift == 0 (should be covered by block_size==1 check, but safe) */
+                    /* Fallback for BlockSize=1 (shift=0): Identity mapping */
                     blocks_128 = cap_128;
                 }
             }
@@ -1482,12 +1483,11 @@ hn4_alloc_genesis(
         uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
         uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
 
-        /*
-         * Align the Flux Start to the S boundary.
-         * The trajectory equation relies on modulo arithmetic; misaligned bases
-         * cause wrap-around corruption at the end of the disk.
-         */
-        uint64_t flux_aligned_blk = (flux_start_blk + (S - 1)) & ~(S - 1);
+       if (flux_start_blk > (UINT64_MAX - (S - 1))) {
+          return HN4_ERR_GEOMETRY;
+       }
+       
+       uint64_t flux_aligned_blk = (flux_start_blk + (S - 1)) & ~(S - 1);
 
         if (flux_aligned_blk < total_blocks) {
 

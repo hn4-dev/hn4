@@ -420,3 +420,206 @@ hn4_TEST(NanoStorage, Read_Uninit_Anchor) {
     
     cleanup_nano_fixture(vol);
 }
+
+/* =========================================================================
+ * TEST 15: PAYLOAD ALIGNMENT
+ * ========================================================================= */
+hn4_TEST(NanoStorage, Payload_Offset_Check) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    struct hn4_hal_device_impl* impl = (struct hn4_hal_device_impl*)vol->target_device;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x777;
+    char payload[] = "Aligned?";
+    
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, payload, sizeof(payload)));
+    
+    /* Find where it landed */
+    uint32_t orbit_k = (uint32_t)hn4_le64_to_cpu(anchor.gravity_center);
+    hn4_addr_t target_lba;
+    /* We need to re-calc trajectory to find physical location */
+    /* Since `_calc_nano_trajectory` is static, we rely on implementation details or repeat logic. */
+    /* Instead, we scan the Cortex for the Magic Number. */
+    
+    uint64_t cortex_start = hn4_addr_to_u64(vol->sb.info.lba_cortex_start) * 512;
+    uint64_t cortex_len = (hn4_addr_to_u64(vol->sb.info.lba_bitmap_start) - 
+                           hn4_addr_to_u64(vol->sb.info.lba_cortex_start)) * 512;
+    
+    bool found = false;
+    for(uint64_t i = 0; i < cortex_len; i += 512) {
+        hn4_nano_quantum_t* q = (hn4_nano_quantum_t*)(impl->mmio_base + cortex_start + i);
+        if (hn4_le32_to_cpu(q->magic) == HN4_MAGIC_NANO && 
+            q->owner_id.lo == anchor.seed_id.lo) {
+            
+            /* Verify payload offset is 40 bytes from start of sector */
+            /* struct: magic(4)+id(16)+len(4)+crc(4)+res(4)+seq(8) = 40 bytes */
+            ASSERT_EQ(0, offsetof(hn4_nano_quantum_t, payload) % 8);
+            ASSERT_EQ(40, offsetof(hn4_nano_quantum_t, payload));
+            
+            /* Verify content */
+            ASSERT_EQ(0, memcmp(q->payload, payload, sizeof(payload)));
+            found = true;
+            break;
+        }
+    }
+    ASSERT_TRUE(found);
+    
+    cleanup_nano_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 17: PARTIAL READ
+ * ========================================================================= */
+hn4_TEST(NanoStorage, Partial_Read) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xABC;
+    char payload[] = "FullPayloadString";
+    
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, payload, sizeof(payload)));
+    
+    char buf[5]; /* Smaller buffer */
+    hn4_result_t res = hn4_read_nano_ballistic(vol, &anchor, buf, 5);
+    
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, memcmp(buf, "FullP", 5));
+    
+    cleanup_nano_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 18: OVERSIZED READ REQUEST
+ * ========================================================================= */
+hn4_TEST(NanoStorage, Oversized_Read) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0xDEF;
+    char payload[] = "Small";
+    
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, payload, 6)); /* Include null */
+    
+    char buf[20];
+    memset(buf, 0xCC, 20);
+    
+    /* Request 20 bytes, only 6 available */
+    hn4_result_t res = hn4_read_nano_ballistic(vol, &anchor, buf, 20);
+    
+    ASSERT_EQ(HN4_OK, res);
+    ASSERT_EQ(0, strcmp(buf, "Small"));
+    /* Ensure padding is zeroed by read function */
+    ASSERT_EQ(0, buf[6]);
+    ASSERT_EQ(0, buf[19]);
+    
+    cleanup_nano_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 20: RETRY LOGIC (SIMULATED IO ERROR)
+ * ========================================================================= */
+/* 
+ * Note: To test retries, we would need to mock `hn4_hal_sync_io` to fail N times then succeed.
+ * With current simple mock, we can only test permanent failure or success.
+ * Test Permanent Write Failure -> Orbit Exhaustion or IO Error return.
+ */
+hn4_TEST(NanoStorage, Write_IO_Fail) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    
+    /* Point Cortex LBA to invalid range to force HAL IO error */
+    vol->sb.info.lba_cortex_start = hn4_addr_from_u64(TEST_CAP / 512 + 1000); 
+    
+    hn4_anchor_t anchor = {0};
+    char payload[] = "Fail";
+    
+    hn4_result_t res = hn4_write_nano_ballistic(vol, &anchor, payload, 4);
+    
+    /* Should fail with HW_IO or GEOMETRY depending on where check happens */
+    ASSERT_TRUE(res == HN4_ERR_HW_IO || res == HN4_ERR_GEOMETRY);
+    
+    cleanup_nano_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 21: OVERWRITE EXISTING SLOT
+ * ========================================================================= */
+hn4_TEST(NanoStorage, Overwrite_Slot) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x555;
+    
+    /* 1. Write Data A */
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, "DataA", 6));
+    uint64_t k1 = hn4_le64_to_cpu(anchor.gravity_center);
+    
+    /* 2. Write Data B (Overwrite) */
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, "DataB", 6));
+    uint64_t k2 = hn4_le64_to_cpu(anchor.gravity_center);
+    
+    /* Should reuse same slot (k1 == k2) if it was valid owner */
+    /* Actually, trajectory scan checks `is_mine`. If `is_mine` -> Reuse. */
+    ASSERT_EQ(k1, k2);
+    
+    /* Read back to verify B */
+    char buf[10];
+    ASSERT_EQ(HN4_OK, hn4_read_nano_ballistic(vol, &anchor, buf, 6));
+    ASSERT_EQ(0, strcmp(buf, "DataB"));
+    
+    cleanup_nano_fixture(vol);
+}
+
+/* =========================================================================
+ * TEST 22: ORBIT COLLISION RESOLUTION
+ * ========================================================================= */
+hn4_TEST(NanoStorage, Collision_Hop) {
+    hn4_volume_t* vol = create_nano_fixture(HN4_PROFILE_GENERIC, HN4_DEV_SSD);
+    struct hn4_hal_device_impl* impl = (struct hn4_hal_device_impl*)vol->target_device;
+    
+    hn4_anchor_t anchor = {0};
+    anchor.seed_id.lo = 0x123;
+    
+    /* 
+     * 1. Calculate K=0 Slot manually 
+     */
+    hn4_addr_t k0_lba;
+    /* We can't call static _calc_nano_trajectory directly. 
+       Workaround: Write once, check G, then poison that slot. */
+       
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, "Temp", 4));
+    uint64_t k0 = hn4_le64_to_cpu(anchor.gravity_center);
+    ASSERT_EQ(0, k0); /* Should be first orbit */
+    
+    /* Find physical address of K0 */
+    /* We know it succeeded. We can find it by scanning memory for Owner ID. */
+    uint64_t cortex_start = hn4_addr_to_u64(vol->sb.info.lba_cortex_start) * 512;
+    uint64_t cortex_len = (hn4_addr_to_u64(vol->sb.info.lba_bitmap_start) - 
+                           hn4_addr_to_u64(vol->sb.info.lba_cortex_start)) * 512;
+    
+    uint64_t k0_offset = 0;
+    for(uint64_t i=0; i<cortex_len; i+=512) {
+         hn4_nano_quantum_t* q = (hn4_nano_quantum_t*)(impl->mmio_base + cortex_start + i);
+         if (q->owner_id.lo == 0x123) {
+             k0_offset = i;
+             break;
+         }
+    }
+    
+    /* 
+     * 2. Poison K0 Slot with Alien Data 
+     * Make it look valid but owned by someone else.
+     */
+    hn4_nano_quantum_t* q0 = (hn4_nano_quantum_t*)(impl->mmio_base + cortex_start + k0_offset);
+    q0->owner_id.lo = 0x999; /* Alien */
+    q0->magic = hn4_cpu_to_le32(HN4_MAGIC_NANO);
+    
+    /* 
+     * 3. Write again. Should Hop to K=1.
+     */
+    ASSERT_EQ(HN4_OK, hn4_write_nano_ballistic(vol, &anchor, "Hop", 4));
+    
+    uint64_t k_new = hn4_le64_to_cpu(anchor.gravity_center);
+    ASSERT_TRUE(k_new > 0); /* Moved to next orbit */
+    
+    cleanup_nano_fixture(vol);
+}

@@ -137,6 +137,108 @@ void hn4_hal_panic(const char* reason)
     while (1) { HN4_YIELD(); }
 }
 
+
+/* NVM OPTIMIZATION: Non-Temporal Stream Copy */
+static void _hal_nvm_stream_copy(void* dst, const void* src, size_t len) {
+#if defined(HN4_ARCH_X86)
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+
+    /* Align Destination to 16 bytes */
+    while (((uintptr_t)d & 15) && len > 0) {
+        *d++ = *s++; len--;
+    }
+
+    /* Stream 128-bit blocks */
+    while (len >= 16) {
+        __m128i val = _mm_loadu_si128((const __m128i*)s);
+        _mm_stream_si128((__m128i*)d, val); /* Bypass Cache */
+        s += 16; d += 16; len -= 16;
+    }
+    
+    /* SFENCE is required to drain the write-combining buffers */
+    _mm_sfence();
+
+    /* Tail */
+    while (len > 0) {
+        *d++ = *s++; len--;
+    }
+    
+    /* 
+     * Note: _mm_stream guarantees durability to the memory controller.
+     * We only need to manually flush the unaligned Head/Tail bytes.
+     */
+    if ((uintptr_t)dst < (uintptr_t)d) {
+         /* Flush head/tail cache lines just in case */
+         hn4_hal_nvm_persist(dst, 16); 
+         if (len > 0) hn4_hal_nvm_persist(d, len);
+    }
+#else
+    /* Fallback for non-x86 */
+    memcpy(dst, src, len);
+    hn4_hal_nvm_persist(dst, len);
+#endif
+}
+
+/* NVM OPTIMIZATION: Non-Temporal Stream Read */
+static void _hal_nvm_stream_read(void* dst, const void* src, size_t len) {
+#if defined(HN4_ARCH_X86) && defined(__SSE4_1__)
+    uint8_t* d = (uint8_t*)dst;
+    const uint8_t* s = (const uint8_t*)src;
+
+    /* Source must be 16-byte aligned for MOVNTDQA */
+    if ((uintptr_t)s & 15) {
+        memcpy(dst, src, len);
+        return;
+    }
+
+    while (len >= 16) {
+        /* MOVNTDQA: Stream load from USWC memory, bypasses cache pollution */
+        __m128i val = _mm_stream_load_si128((__m128i*)s);
+        _mm_storeu_si128((__m128i*)d, val);
+        s += 16; d += 16; len -= 16;
+    }
+    memcpy(d, s, len);
+#else
+    memcpy(dst, src, len);
+#endif
+}
+
+/* NVM OPTIMIZATION: Non-Temporal Zero Fill */
+static void _hal_nvm_zero_fill(void* dst, size_t len) {
+#if defined(HN4_ARCH_X86)
+    uint8_t* d = (uint8_t*)dst;
+    
+    /* Align to 16 bytes */
+    while (((uintptr_t)d & 15) && len > 0) {
+        *d++ = 0; len--;
+    }
+    
+    __m128i zero = _mm_setzero_si128();
+    while (len >= 16) {
+        /* Stream Zero directly to NVM */
+        _mm_stream_si128((__m128i*)d, zero);
+        d += 16; len -= 16;
+    }
+    
+    _mm_sfence();
+
+    /* Tail */
+    while (len > 0) {
+        *d++ = 0; len--;
+    }
+    
+    /* Flush unaligned head/tail */
+    if ((uintptr_t)dst < (uintptr_t)d) {
+         hn4_hal_nvm_persist(dst, 16); 
+         if (len > 0) hn4_hal_nvm_persist(d, len);
+    }
+#else
+    memset(dst, 0, len);
+    hn4_hal_nvm_persist(dst, len);
+#endif
+}
+
 /* =========================================================================
  * 3. IO SUBMISSION LOGIC
  * ========================================================================= */
@@ -177,17 +279,20 @@ void hn4_hal_submit_io(hn4_hal_device_t* dev, hn4_io_req_t* req, hn4_io_callback
 
         switch (req->op_code) {
             case HN4_IO_READ:
-                memcpy(req->buffer, dev->mmio_base + offset, len_bytes);
+                /* FIX: Use Stream Read for NVM to save Cache bandwidth */
+                _hal_nvm_stream_read(req->buffer, dev->mmio_base + offset, len_bytes);
+                break;
+            
+            case HN4_IO_ZERO:
+                /* Direct NVM zeroing, ignores req->buffer */
+                _hal_nvm_zero_fill(dev->mmio_base + offset, len_bytes);
                 break;
 
             case HN4_IO_WRITE:
                 memcpy(dev->mmio_base + offset, req->buffer, len_bytes);
-                /*
-                 * Flush Semantics
-                 * This ensures data reaches the persistence domain.
-                 * ASSUMPTION: Platform supports ADR/eADR or equivalent.
-                 */
-                hn4_hal_nvm_persist(dev->mmio_base + offset, len_bytes);
+                 /* This bypasses cache, preventing pollution and eliminating the need for 
+                   explicit CLWB on the main body of data. */
+                _hal_nvm_stream_copy(dev->mmio_base + offset, req->buffer, len_bytes);
                 break;
 
             case HN4_IO_FLUSH:

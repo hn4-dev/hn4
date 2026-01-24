@@ -1017,13 +1017,12 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     cap_bytes = sb->info.total_capacity;
     hw_cap = caps->total_capacity_bytes;
     
+    /* FIX: Allow Virtual Capacity if Mount Intent permits it */
+    bool is_virtual = (sb->info.mount_intent & HN4_MNT_VIRTUAL);
+
     /* Check: Partition Cap > HW Cap? */
-    if (hn4_u128_cmp(cap_bytes, hw_cap) > 0) {
+    if (!is_virtual && hn4_u128_cmp(cap_bytes, hw_cap) > 0) {
         HN4_LOG_CRIT("Geometry Mismatch: Superblock expects capacity larger than HW reports");
-        /* 
-         * Explicitly deny mount on shrink. 
-         * HN4 Geometry is immutable without a full migration (fsck).
-         */
         return HN4_ERR_GEOMETRY;
     }
     
@@ -1033,8 +1032,11 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     cap_bytes = sb->info.total_capacity;
     hw_cap = caps->total_capacity_bytes;
     
-        if (cap_bytes > hw_cap) return HN4_ERR_GEOMETRY;
-        if (cap_bytes < (2ULL * 1024 * 1024)) return HN4_ERR_GEOMETRY;
+    /* FIX: Allow Virtual Capacity if Mount Intent permits it */
+    bool is_virtual = (sb->info.mount_intent & HN4_MNT_VIRTUAL);
+
+    if (!is_virtual && cap_bytes > hw_cap) return HN4_ERR_GEOMETRY;
+    if (cap_bytes < (2ULL * 1024 * 1024)) return HN4_ERR_GEOMETRY;
 #endif
 
     uint32_t bs = sb->info.block_size;
