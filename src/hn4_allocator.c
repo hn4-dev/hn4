@@ -498,10 +498,10 @@ static uint64_t _get_random_uniform(uint64_t upper_bound) {
             } else {
                 int shift = _hn4_ctz64(vol->vol_block_size);
                 if (shift >= 64) {
-                    blocks_128.lo = (cap_128.hi >> (shift - 64));
+                     int eff_shift = shift - 64;
+                    blocks_128.lo = (cap_128.hi >> eff_shift);
                     blocks_128.hi = 0;
                 } else if (shift > 0) {
-                    /* FIX: Only perform split shift if shift > 0 */
                     blocks_128.lo = (cap_128.lo >> shift) | (cap_128.hi << (64 - shift));
                     blocks_128.hi = (cap_128.hi >> shift);
                 } else {
@@ -1085,36 +1085,28 @@ _calc_trajectory_lba(
     uint8_t              k
     )
 {
-    /* 
-     * [INERTIAL DAMPING]
-     * Lookup table for Theta Jitter. This scatters writes on SSDs to avoid 
-     * hitting the same flash pages repeatedly, reducing wear concentration.
-     */
+    /* Inertial Damping (Write Scattering) */
     static const uint8_t _theta_lut[16] = {
         0, 1, 3, 6, 10, 15, 21, 28, 
         36, 45, 55, 66, 78, 91, 105, 120
     };
 
-    /* 1. Validate Fractal Scale & Device Context */
-    /* Safety: M >= 63 would cause 1ULL << M to overflow 64 bits. */
+    /* 1. Validation */
     if (HN4_UNLIKELY(M >= 63 || !vol->target_device)) {
         return HN4_LBA_INVALID;
     }
 
-    /* 2. Load Geometry */
     const hn4_hal_caps_t* caps = hn4_hal_get_caps(vol->target_device);
     if (HN4_UNLIKELY(!caps)) return HN4_LBA_INVALID;
 
+    /* 2. Geometry & Stride */
     uint32_t bs          = vol->vol_block_size;
     uint32_t ss          = caps->logical_block_size ? caps->logical_block_size : 512;
     uint32_t sec_per_blk = (bs / ss) ? (bs / ss) : 1;
-    uint64_t S           = 1ULL << M; /* The Fractal Stride Size */
+    uint64_t S           = 1ULL << M; 
 
-    /* 
-     * [CAPACITY NORMALIZATION]
-     * Calculate total usable blocks. Handles the 128-bit Quettabyte build flag.
-     */
-     uint64_t total_blocks;
+    /* 3. Capacity Normalization */
+    uint64_t total_blocks;
 
 #ifdef HN4_USE_128BIT
     hn4_u128_t cap_128 = vol->vol_capacity_bytes;
@@ -1126,99 +1118,59 @@ _calc_trajectory_lba(
     total_blocks = vol->vol_capacity_bytes / bs;
 #endif
 
-    /* 
-     * [FLUX DOMAIN ALIGNMENT]
-     * Determine where the "Flux" (Data) region starts.
-     */
+    /* 4. Flux Domain Alignment */
     uint64_t flux_start_sect = hn4_addr_to_u64(vol->sb.info.lba_flux_start);
     uint64_t flux_start_blk  = flux_start_sect / sec_per_blk;
 
-    /* 
-     * Align Flux Start to Fractal Boundary (S).
-     * The trajectory equation relies on modulo arithmetic; misaligned bases
-     * cause wrap-around corruption at the end of the disk.
-     */
+    /* Align base to fractal boundary to prevent wrap-around corruption */
     uint64_t flux_aligned_blk = (flux_start_blk + (S - 1)) & ~(S - 1);
 
     if (HN4_UNLIKELY(flux_aligned_blk >= total_blocks)) {
         return HN4_LBA_INVALID;
     }
 
+    /* Calculate search window (Phi) */
     uint64_t available_blocks = total_blocks - flux_aligned_blk;
-    
-    /* 
-     * OPTIMIZATION 4: Division Elimination
-     * Replaced: phi = available_blocks / S;
-     * With:     phi = available_blocks >> M;
-     * 
-     * Since S is defined as (1 << M), division by S is equivalent to right-shift by M.
-     * This saves ~40-80 CPU cycles on 64-bit platforms.
-     */
-    uint64_t phi = available_blocks >> M;
+    uint64_t phi = available_blocks >> M; /* equivalent to / S */
     
     if (HN4_UNLIKELY(phi == 0)) return HN4_LBA_INVALID;
 
-    /* 
-     * 3. Apply Gravity Assist (Vector Shift)
-     * If we are deep in collision territory (k >= 4), we engage "Gravity Assist" 
-     * to teleport the vector using the canonical Swizzle Engine. 
-     * This escapes local gravity wells (hash collisions).
-     */
+    /* 5. Vector Physics */
     uint64_t effective_V = V;
     if (k >= HN4_GRAVITY_ASSIST_K) {
         effective_V = hn4_swizzle_gravity_assist(V);
     }
-    effective_V |= 1; /* Force Odd (Anti-Even Degeneracy) */
+    effective_V |= 1; /* Force odd for better ring coverage */
 
-    /*
-     * [DECOMPOSITION]
-     * G is split into the fractal index and the "Entropy Loss" (sub-block offset).
-     * The Entropy Loss is re-injected at the end to preserve byte alignment.
-     */
-    uint64_t g_aligned   = G & ~(S - 1);
-    
     /* 
-     * OPTIMIZATION 4 (Cont.): Division Elimination 
-     * Replaced: g_fractal = g_aligned / S;
-     * With:     g_fractal = g_aligned >> M;
+     * 6. Decomposition
+     * We split the Gravity Center (G) and Logical Index (N) into
+     * Fractal Components (Macro) and Offsets (Micro).
      */
-    uint64_t g_fractal   = g_aligned >> M;
     
+    /* G Decomposition */
+    uint64_t g_aligned    = G & ~(S - 1);
+    uint64_t g_fractal    = g_aligned >> M;
     uint64_t entropy_loss = G & (S - 1);
-    uint64_t cluster_idx = N >> 4;
-    
-    /* UNUSED: uint64_t sub_offset  = N & 0xF; */
+    uint64_t cluster_idx = N >> M;      /* Logical Index / S */
+    uint64_t sub_offset  = N & (S - 1); /* Logical Index % S */
     
     uint64_t term_n = cluster_idx % phi;
     uint64_t term_v = effective_V % phi;
     
-    /* 
-     * [COPRIMALITY ENFORCEMENT]
-     * Ensures the vector V covers the entire ring Phi without short cycles.
-     * Replaces the old slow GCD loop with the O(1) projection function.
-     */
+    /* Project to Coprime Ring to guarantee coverage */
     term_v = _project_coprime_vector(term_v, phi);
     
     uint64_t offset = _mul_mod_safe(term_n, term_v, phi);
     uint64_t theta = 0;
     
-    /* 
-     * [DEVICE PHYSICS]
-     * Check Linear LUT (Mask & 0x3 protects against corrupt tags).
-     * ZNS, HDD, and Tape require sequential writes (Linear).
-     * SSDs allow scattered writes (Ballistic).
-     */
+    /* 7. Device Physics Adjustments */
     bool is_linear = _hn4_is_linear_lut[vol->sb.info.device_type_tag & 0x3];
     bool is_system = (vol->sb.info.format_profile == HN4_PROFILE_SYSTEM);
     
-    /* 
-     * HARDWARE OVERRIDE:
-     * 1. ZNS: Must be sequential to respect Write Pointer.
-     * 2. ROTATIONAL: Must be sequential to avoid seek latency (Fragmentation).
-     */
-    uint64_t linear_mask = HN4_HW_ZNS_NATIVE | HN4_HW_ROTATIONAL;
-
-    if (vol->sb.info.hw_caps_flags & linear_mask) is_linear = true;
+    if (vol->sb.info.hw_caps_flags & (HN4_HW_ZNS_NATIVE | HN4_HW_ROTATIONAL)) {
+        is_linear = true;
+    }
 
     if (!is_linear && !is_system) {
         if (HN4_UNLIKELY(phi < 32)) {
@@ -1229,14 +1181,21 @@ _calc_trajectory_lba(
         }
     }
     
-    /* 7. Final Projection */
+    /* 8. Final Projection */
     uint64_t target_fractal_idx = (g_fractal + offset + theta) % phi;
-    uint64_t rel_block_idx = (target_fractal_idx << M);
     
+    /* 
+     * Reconstruct Physical Block Index:
+     * Base = (Target_Fractal * Stride)
+     * Offset = Sub_Block_Offset (from N)
+     */
+    uint64_t rel_block_idx = (target_fractal_idx * S) + sub_offset;
+    
+    /* Bounds Check 1: Overflow during re-injection of G's entropy */
     if (HN4_UNLIKELY((UINT64_MAX - entropy_loss) < rel_block_idx)) return HN4_LBA_INVALID;
-    
     rel_block_idx += entropy_loss;
 
+    /* Bounds Check 2: Physical Capacity */
     if (HN4_UNLIKELY((UINT64_MAX - flux_aligned_blk) < rel_block_idx)) return HN4_LBA_INVALID;
     
     return flux_aligned_blk + rel_block_idx;

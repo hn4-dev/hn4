@@ -1123,28 +1123,13 @@ retry_transaction:;
     }
 
     /* 8. The Wall (Data Persistence Barrier) */
-    /*
-     * OPTIMIZATION: Skip barrier on NVM only if STRICT_FLUSH is certified.
-     * We do not trust the NVM flag alone; the HAL must opt-in to the
-     * strict durability contract.
-     */
-     bool skip_barrier = false;
+
+    bool skip_barrier = false;
 
     /* NVM Optimization */
-    if ((vol->sb.info.hw_caps_flags & HN4_HW_NVM) &&
-        (vol->sb.info.hw_caps_flags & HN4_HW_STRICT_FLUSH)) {
-        skip_barrier = true;
-    }
+    if (vol->sb.info.hw_caps_flags & HN4_HW_NVM) skip_barrier = true;
 
-    /* 
-     * HYPER_CLOUD OPTIMIZATION:
-     * Server environments typically have battery-backed write caches.
-     * We skip per-block FUA/Flush to maximize IOPS. Durability is 
-     * deferred to the Journal/Epoch flush (Async Consistency).
-     */
-    if (vol->sb.info.format_profile == HN4_PROFILE_HYPER_CLOUD) {
-        skip_barrier = true;
-    }
+    if (vol->sb.info.format_profile == HN4_PROFILE_HYPER_CLOUD) skip_barrier = true;
 
     if (skip_barrier) {
         io_res = HN4_OK;
@@ -1221,12 +1206,6 @@ retry_transaction:;
 
     /* 10. THE ECLIPSE (Atomic Discard of Old LBA) */
     if (old_lba != HN4_LBA_INVALID && old_lba != target_lba) {
-        /*
-         * We removed the synchronous HN4_IO_DISCARD command.
-         * Blocking on TRIM/UNMAP during the write path causes severe latency spikes.
-         * The old data is logically unreachable once the Anchor is updated (Step 9).
-         */
-
         /* Barrier: Ensure the Anchor update (Step 9) is visible before freeing old space */
         atomic_thread_fence(memory_order_release);
 

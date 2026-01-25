@@ -1,7 +1,7 @@
 /*
  * HYDRA-NEXUS 4 (HN4) STORAGE ENGINE
  * MODULE:      Spatial Array Router (Hyper-Cloud Profile)
- * SOURCE:      hn4_helix.c
+ * SOURCE:      hn4_maveric.c
  * STATUS:       RE-ENGINEERED (v2.7)
  * COPYRIGHT:   (c) 2026 The Hydra-Nexus Team.
  *
@@ -22,7 +22,6 @@
 
 #define HN4_STACK_BUF_SIZE 128 
 #define HN4_SMALL_ARRAY_LIMIT 8
-#define HN4_HELIX_STRIPE_SECTORS 128 
 
 
 /* =========================================================================
@@ -72,21 +71,21 @@ HN4_INLINE uint8_t _gf_mul(uint8_t a, uint8_t b) {
 
 /* Reconstruction Strategies */
 typedef enum {
-    HELIX_SOLVE_NONE = 0,
-    HELIX_SOLVE_P_ONLY,     /* Q is dead. Use P (XOR). */
-    HELIX_SOLVE_Q_ONLY,     /* P is dead. Use Q (Galois). */
-    HELIX_SOLVE_PQ_ALGEBRA  /* Both P/Q alive. Use Algebra. */
-} hn4_helix_strategy_t;
+    MAVERIC_SOLVE_NONE = 0,
+    MAVERIC_SOLVE_P_ONLY,     /* Q is dead. Use P (XOR). */
+    MAVERIC_SOLVE_Q_ONLY,     /* P is dead. Use Q (Galois). */
+    MAVERIC_SOLVE_PQ_ALGEBRA  /* Both P/Q alive. Use Algebra. */
+} hn4_maveric_strategy_t;
 
 /* 
  * Dual Failure Resolution Matrix
  * Index Bits: [Bit 1: Q_Dead] [Bit 0: P_Dead]
  */
-static const uint8_t _helix_solve_lut[4] = {
-    [0] = HELIX_SOLVE_PQ_ALGEBRA, /* 00: Both Alive -> Data + Data failed */
-    [1] = HELIX_SOLVE_Q_ONLY,     /* 01: P Dead    -> Data + P failed */
-    [2] = HELIX_SOLVE_P_ONLY,     /* 10: Q Dead    -> Data + Q failed */
-    [3] = HELIX_SOLVE_NONE        /* 11: Both Dead -> Data Safe (Impossible here) */
+static const uint8_t _maveric_solve_lut[4] = {
+    [0] = MAVERIC_SOLVE_PQ_ALGEBRA, /* 00: Both Alive -> Data + Data failed */
+    [1] = MAVERIC_SOLVE_Q_ONLY,     /* 01: P Dead    -> Data + P failed */
+    [2] = MAVERIC_SOLVE_P_ONLY,     /* 10: Q Dead    -> Data + Q failed */
+    [3] = MAVERIC_SOLVE_NONE        /* 11: Both Dead -> Data Safe (Impossible here) */
 };
 
 /* =========================================================================
@@ -108,7 +107,13 @@ static const uint8_t _helix_solve_lut[4] = {
      * Corrected Overlap Check (Standard Interval Logic).
      * Ensures linear behavior even in overlapping cases (memmove semantics).
      */
-    if (!(d + len <= s || s + len <= d)) {
+    uintptr_t d_end = d + len;
+    uintptr_t s_end = s + len;
+
+    /* Check if ranges overlap */
+    bool overlap = (d < s_end) && (s < d_end);
+
+    if (overlap) {
         uint8_t* d8 = (uint8_t*)dst;
         const uint8_t* s8 = (const uint8_t*)src;
         
@@ -256,13 +261,13 @@ HN4_INLINE bool _is_critical_failure(hn4_result_t res) {
 }
 
 /* =========================================================================
- * HELIX-D MATH EXTENSIONS
+ * MAVERIC MATH EXTENSIONS
  * ========================================================================= */
 
 /* Inverse in GF(2^8): x^-1 = exp(255 - log(x)) */
 HN4_INLINE uint8_t _gf_inv(uint8_t x) {
     if (HN4_UNLIKELY(x == 0)) {
-        hn4_hal_panic("HN4 Helix: GF Inversion Singularity (Div by Zero)");
+        hn4_hal_panic("HN4 Maveric: GF Inversion Singularity (Div by Zero)");
         return 0; /* Unreachable */
     }
     if (x == 1) return 1; 
@@ -270,7 +275,7 @@ HN4_INLINE uint8_t _gf_inv(uint8_t x) {
     return _gf_exp[255 - _gf_log[x]];
 }
 /*
- * _hn4_helix_apply_delta
+ * _hn4_maveric_apply_delta
  * Updates P (XOR) and Q (Galois) in one pass for Read-Modify-Write.
  * 
  * Logic:
@@ -279,7 +284,7 @@ HN4_INLINE uint8_t _gf_inv(uint8_t x) {
  * 
  * Uses 4-way unrolling to hide memory latency of GF table lookups.
  */
- void _hn4_helix_apply_delta(
+ void _hn4_maveric_apply_delta(
     uint8_t* dst_p, 
     uint8_t* dst_q, 
     const uint8_t* delta, 
@@ -354,7 +359,7 @@ HN4_INLINE uint32_t _hn4_phys_to_logical(uint32_t phys, uint32_t p_col, uint32_t
 }
 
 /* 
- * _hn4_reconstruct_helix
+ * _hn4_reconstruct_maveric
  * Solves for missing data in the stripe.
  * 
  * Strategy:
@@ -365,7 +370,7 @@ HN4_INLINE uint32_t _hn4_phys_to_logical(uint32_t phys, uint32_t p_col, uint32_t
  *    - If 2 failures (Data+P): Use Q.
  *    - If 2 failures (Data+Data): Use P+Q Algebra.
  */
-static hn4_result_t _hn4_reconstruct_helix(
+static hn4_result_t _hn4_reconstruct_maveric(
     hn4_volume_t* vol,
     hn4_drive_t* snapshot,
     uint32_t count,
@@ -536,8 +541,8 @@ static hn4_result_t _hn4_reconstruct_helix(
 
     hn4_result_t res = HN4_OK;
 
-    switch (_helix_solve_lut[state]) {
-        case HELIX_SOLVE_PQ_ALGEBRA:
+    switch (_maveric_solve_lut[state]) {
+        case MAVERIC_SOLVE_PQ_ALGEBRA:
         {
             uint32_t log_x = _hn4_phys_to_logical(x, p_col, q_col);
             uint32_t log_y = _hn4_phys_to_logical(y, p_col, q_col);
@@ -566,14 +571,14 @@ static hn4_result_t _hn4_reconstruct_helix(
             break;
         }
 
-        case HELIX_SOLVE_P_ONLY: /* Q is dead (or N/A), use P */
+        case MAVERIC_SOLVE_P_ONLY: /* Q is dead (or N/A), use P */
         {
             /* P = X ^ Survivors. P_syn already holds this. */
             memcpy(result_buf, p_syn, byte_len);
             break;
         }
 
-        case HELIX_SOLVE_Q_ONLY: /* P is dead, use Q */
+        case MAVERIC_SOLVE_Q_ONLY: /* P is dead, use Q */
         {
             /* If P is dead, we solve X using Q. */
             /* Determine which variable is the data column (it's not P) */
@@ -1010,7 +1015,7 @@ if (d_ok) {
 
 if (!d_ok) {
     /* DATA DRIVE MISSING: Reconstruct 'd_old' to allow Parity Update */
-    hn4_result_t rc_res = _hn4_reconstruct_helix(
+    hn4_result_t rc_res = _hn4_reconstruct_maveric(
         vol, snapshot, count, stripe_ss,
         p_col, q_col, phys_col,
         target_lba, d_old, chunk
@@ -1041,7 +1046,7 @@ if (!d_ok) {
                      * If p_ok is false, p_old contains garbage -> p_old becomes new garbage.
                      * This is safe because we gate the WRITE (Step 4) on p_ok/q_ok.
                      */
-                    _hn4_helix_apply_delta(p_old, q_old, d_old, io_sz, (uint8_t)col_logical, p_ok, q_ok);
+                    _hn4_maveric_apply_delta(p_old, q_old, d_old, io_sz, (uint8_t)col_logical, p_ok, q_ok);
 
                     /* 3. LOG INTENT (WAL) */
                     uint64_t audit_payload = row;
@@ -1120,13 +1125,11 @@ if (!d_ok) {
                     if (is_offline || !_is_io_success(res)) {
                         
                         if (!is_offline) {
-                            /* Mark Primary Failed */
                             _mark_device_offline(vol, phys_col, snapshot[phys_col].dev_handle);
                             snapshot[phys_col].status = HN4_DEV_STAT_OFFLINE;
                         }
 
-                        /* EXECUTE HELIX-D RECONSTRUCTION */
-                        res = _hn4_reconstruct_helix(
+                        res = _hn4_reconstruct_maveric(
                             vol, snapshot, count, stripe_ss,
                             p_col, q_col, phys_col,
                             target_lba,

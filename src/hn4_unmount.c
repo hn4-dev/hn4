@@ -508,12 +508,20 @@ hn4_result_t hn4_unmount(HN4_INOUT hn4_volume_t* vol)
     if (!retain_debug) {
         bool should_zero = !vol->read_only;
 
-        _safe_release_mem((void**)&vol->void_bitmap, vol->bitmap_size, should_zero);
-        _safe_release_mem((void**)&vol->quality_mask, vol->qmask_size, should_zero);
-        _safe_release_mem((void**)&vol->locking.l2_summary_bitmap, 0, false); 
-        _safe_release_mem((void**)&vol->nano_cortex, vol->cortex_size, should_zero);
+          size_t topo_sz = vol->topo_count * sizeof(*vol->topo_map);
+
+        #define FREE_SAFE(ptr, size, secure) \
+            _safe_release_mem((void**)&(ptr), (size), (secure))
+
+            bool z = !vol->read_only; 
+            FREE_SAFE(vol->void_bitmap,            vol->bitmap_size, z);
+            FREE_SAFE(vol->quality_mask,           vol->qmask_size,  z);
+            FREE_SAFE(vol->locking.l2_summary_bitmap, 0,             false);
+            FREE_SAFE(vol->nano_cortex,            vol->cortex_size, z);
+            FREE_SAFE(vol->topo_map,               topo_sz,          false);
+
+        #undef FREE_SAFE
         
-        size_t topo_sz = vol->topo_count * sizeof(*vol->topo_map);
         _safe_release_mem((void**)&vol->topo_map, topo_sz, false);
 
         int status_code = (int)final_res;

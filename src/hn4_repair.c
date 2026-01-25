@@ -105,13 +105,15 @@ _Check_return_ hn4_result_t hn4_repair_block(
      * 3. THE WALL (Barrier & Verify)
      * Only verify if the write appeared to succeed.
      */
-    if (res == HN4_OK) {
+   if (res == HN4_OK) {
         /*
          * BARRIER ENFORCEMENT:
-         * Force electrons into the floating gates. If we read back immediately
-         * without a barrier, we might just be reading the controller's DRAM cache.
+         * Force electrons into the floating gates.
+         * OPTIMIZATION: Skip if NVM (Byte-addressable persistence).
          */
-        res = hn4_hal_barrier(vol->target_device);
+        if (!(vol->sb.info.hw_caps_flags & HN4_HW_NVM)) {
+            res = hn4_hal_barrier(vol->target_device);
+        }
 
         if (res == HN4_OK) {
             void* verify_buf = hn4_hal_mem_alloc(len);

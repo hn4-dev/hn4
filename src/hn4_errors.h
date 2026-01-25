@@ -245,96 +245,109 @@ typedef int32_t hn4_result_t;
 /* =========================================================================
  * 7. UTILITY FUNCTIONS
  * ========================================================================= */
+/* 
+ * X-MACRO DEFINITION
+ * Centralizes the Error Code <-> String Literal mapping.
+ * To add a new error, add one line here. The switch statement updates automatically.
+ */
+#define HN4_ERRORS(X) \
+    /* --- Singularity --- */ \
+    X(HN4_OK,                          "SUCCESS") \
+    \
+    /* --- Positive Manifold (Info) --- */ \
+    X(HN4_INFO_PENDING,                "PENDING") \
+    X(HN4_INFO_HEALED,                 "HEALED_VIA_HELIX") \
+    X(HN4_INFO_SPARSE,                 "SPARSE_READ") \
+    X(HN4_INFO_HORIZON_FALLBACK,       "HORIZON_FALLBACK") \
+    X(HN4_INFO_THAWED,                 "THAWED") \
+    \
+    /* --- The Void (Allocation) --- */ \
+    X(HN4_ERR_ENOSPC,                  "ERR_ENOSPC") \
+    X(HN4_ERR_EVENT_HORIZON,           "ERR_EVENT_HORIZON") \
+    X(HN4_ERR_GRAVITY_COLLAPSE,        "ERR_GRAVITY_COLLAPSE") \
+    X(HN4_ERR_BITMAP_CORRUPT,          "ERR_BITMAP_CORRUPT") \
+    X(HN4_ERR_ALIGNMENT_FAIL,          "ERR_ALIGNMENT_FAIL") \
+    X(HN4_ERR_ATOMICS_TIMEOUT,         "ERR_ATOMICS_TIMEOUT") \
+    X(HN4_ERR_ZONE_FULL,               "ERR_ZONE_FULL") \
+    X(HN4_ERR_WIPE_PENDING,            "ERR_WIPE_PENDING") \
+    \
+    /* --- The Cortex (Lookup) --- */ \
+    X(HN4_ERR_NOT_FOUND,               "ERR_NOT_FOUND") \
+    X(HN4_ERR_TOMBSTONE,               "ERR_TOMBSTONE") \
+    X(HN4_ERR_ID_MISMATCH,             "ERR_ID_MISMATCH") \
+    X(HN4_ERR_TAG_OVERFLOW,            "ERR_TAG_OVERFLOW") \
+    X(HN4_ERR_NAME_TOO_LONG,           "ERR_NAME_TOO_LONG") \
+    \
+    /* --- The Sovereign (Security) --- */ \
+    X(HN4_ERR_ACCESS_DENIED,           "ERR_ACCESS_DENIED") \
+    X(HN4_ERR_IMMUTABLE,               "ERR_IMMUTABLE") \
+    X(HN4_ERR_SIG_INVALID,             "ERR_SIG_INVALID") \
+    X(HN4_ERR_TETHER_EXPIRED,          "ERR_TETHER_EXPIRED") \
+    X(HN4_ERR_NOT_SOVEREIGN,           "ERR_NOT_SOVEREIGN") \
+    X(HN4_ERR_VOLUME_LOCKED,           "ERR_VOLUME_LOCKED") \
+    X(HN4_ERR_AUDIT_FAILURE,           "ERR_AUDIT_FAILURE") \
+    \
+    /* --- The Helix (Integrity/HW) --- */ \
+    X(HN4_ERR_HW_IO,                   "ERR_HW_IO") \
+    X(HN4_ERR_DATA_ROT,                "ERR_DATA_ROT") \
+    X(HN4_ERR_HEADER_ROT,              "ERR_HEADER_ROT") \
+    X(HN4_ERR_PAYLOAD_ROT,             "ERR_PAYLOAD_ROT") \
+    X(HN4_ERR_ENCRYPTED_ROT,           "ERR_ENCRYPTED_ROT") \
+    X(HN4_ERR_PARITY_BROKEN,           "ERR_PARITY_BROKEN") \
+    X(HN4_ERR_PHANTOM_BLOCK,           "ERR_PHANTOM_BLOCK") \
+    X(HN4_ERR_DECOMPRESS_FAIL,         "ERR_DECOMPRESS_FAIL") \
+    X(HN4_ERR_THERMAL_CRITICAL,        "ERR_THERMAL_CRITICAL") \
+    X(HN4_ERR_CPU_INSANITY,            "ERR_CPU_INSANITY") \
+    X(HN4_ERR_MEDIA_TOXIC,             "ERR_MEDIA_TOXIC") \
+    \
+    /* --- The Chrono-Sphere (Time) --- */ \
+    X(HN4_ERR_GENERATION_SKEW,         "ERR_GENERATION_SKEW") \
+    X(HN4_ERR_EPOCH_LOST,              "ERR_EPOCH_LOST") \
+    X(HN4_ERR_SNAPSHOT_INVALID,        "ERR_SNAPSHOT_INVALID") \
+    X(HN4_ERR_QUANTUM_VIOLATION,       "ERR_QUANTUM_VIOLATION") \
+    X(HN4_ERR_TIME_DILATION,           "ERR_TIME_DILATION") \
+    X(HN4_ERR_TAMPERED,                "ERR_TAMPERED") \
+    X(HN4_ERR_TIME_PARADOX,            "ERR_TIME_PARADOX") \
+    \
+    /* --- The Manifold (System) --- */ \
+    X(HN4_ERR_BAD_SUPERBLOCK,          "ERR_BAD_SUPERBLOCK") \
+    X(HN4_ERR_VERSION_INCOMPAT,        "ERR_VERSION_INCOMPAT") \
+    X(HN4_ERR_NOMEM,                   "ERR_NOMEM") \
+    X(HN4_ERR_DMA_MAPPING,             "ERR_DMA_MAPPING") \
+    X(HN4_ERR_PROFILE_MISMATCH,        "ERR_PROFILE_MISMATCH") \
+    X(HN4_ERR_PICO_LIMIT,              "ERR_PICO_LIMIT") \
+    X(HN4_ERR_ENDIAN_MISMATCH,         "ERR_ENDIAN_MISMATCH") \
+    X(HN4_ERR_INTERNAL_FAULT,          "ERR_INTERNAL_FAULT") \
+    X(HN4_ERR_GEOMETRY,                "ERR_GEOMETRY") \
+    X(HN4_ERR_INVALID_ARGUMENT,        "ERR_INVALID_ARGUMENT") \
+    X(HN4_ERR_UNINITIALIZED,           "ERR_UNINITIALIZED") \
+    X(HN4_ERR_EEXIST,                  "ERR_EEXIST") \
+    X(HN4_ERR_COMPRESSION_INEFFICIENT, "ERR_COMPRESSION_INEFFICIENT") \
+    X(HN4_ERR_ALGO_UNKNOWN,            "ERR_ALGO_UNKNOWN") \
+    X(HN4_ERR_KEY_EXPIRED,             "ERR_KEY_EXPIRED") \
+    X(HN4_ERR_INTERNAL,                "ERR_INTERNAL") \
+    X(HN4_ERR_BUSY,                    "ERR_BUSY")
 
 /**
- * hn4_strerror()
+ * hn4_strerror
  * Returns a static string representation of the error code.
- * Useful for Triage Logs (Spec 21.4).
  * 
+ * DESIGN:
+ * Uses X-Macros to ensure string table stays synchronized with enum definitions.
+ *
  * @param res The error code to stringify.
  * @return A const string pointer (do not free).
  */
 static inline const char* hn4_strerror(hn4_result_t res) {
     switch (res) {
-        /* --- Singularity --- */
-        case HN4_OK:                        return "SUCCESS";
+        /* Expand cases: case CODE: return STR; */
+        #define X(code, str) case code: return str;
+        HN4_ERRORS(X)
+        #undef X
         
-        /* --- Positive Manifold --- */
-        case HN4_INFO_PENDING:              return "PENDING";
-        case HN4_INFO_HEALED:               return "HEALED_VIA_HELIX";
-        case HN4_INFO_SPARSE:               return "SPARSE_READ";
-        case HN4_INFO_HORIZON_FALLBACK:     return "HORIZON_FALLBACK";
-        case HN4_INFO_THAWED:               return "THAWED";
-        
-        /* --- The Void --- */
-        case HN4_ERR_ENOSPC:                return "ERR_ENOSPC";
-        case HN4_ERR_EVENT_HORIZON:         return "ERR_EVENT_HORIZON";
-        case HN4_ERR_GRAVITY_COLLAPSE:      return "ERR_GRAVITY_COLLAPSE";
-        case HN4_ERR_BITMAP_CORRUPT:        return "ERR_BITMAP_CORRUPT";
-        case HN4_ERR_ALIGNMENT_FAIL:        return "ERR_ALIGNMENT_FAIL";
-        case HN4_ERR_ATOMICS_TIMEOUT:       return "ERR_ATOMICS_TIMEOUT";
-        case HN4_ERR_ZONE_FULL:             return "ERR_ZONE_FULL";
-        case HN4_ERR_WIPE_PENDING:          return "ERR_WIPE_PENDING";
-        
-        /* --- The Cortex --- */
-        case HN4_ERR_NOT_FOUND:             return "ERR_NOT_FOUND";
-        case HN4_ERR_TOMBSTONE:             return "ERR_TOMBSTONE";
-        case HN4_ERR_ID_MISMATCH:           return "ERR_ID_MISMATCH";
-        case HN4_ERR_TAG_OVERFLOW:          return "ERR_TAG_OVERFLOW";
-        case HN4_ERR_NAME_TOO_LONG:         return "ERR_NAME_TOO_LONG";
-        
-        /* --- The Sovereign --- */
-        case HN4_ERR_ACCESS_DENIED:         return "ERR_ACCESS_DENIED";
-        case HN4_ERR_IMMUTABLE:             return "ERR_IMMUTABLE";
-        case HN4_ERR_SIG_INVALID:           return "ERR_SIG_INVALID";
-        case HN4_ERR_TETHER_EXPIRED:        return "ERR_TETHER_EXPIRED";
-        case HN4_ERR_NOT_SOVEREIGN:         return "ERR_NOT_SOVEREIGN";
-        case HN4_ERR_VOLUME_LOCKED:         return "ERR_VOLUME_LOCKED";
-        case HN4_ERR_AUDIT_FAILURE:         return "ERR_AUDIT_FAILURE";
-        
-        /* --- The Helix --- */
-        case HN4_ERR_HW_IO:                 return "ERR_HW_IO";
-        case HN4_ERR_DATA_ROT:              return "ERR_DATA_ROT";
-        case HN4_ERR_HEADER_ROT:            return "ERR_HEADER_ROT";
-        case HN4_ERR_PAYLOAD_ROT:           return "ERR_PAYLOAD_ROT";
-        case HN4_ERR_ENCRYPTED_ROT:         return "ERR_ENCRYPTED_ROT";
-        case HN4_ERR_PARITY_BROKEN:         return "ERR_PARITY_BROKEN";
-        case HN4_ERR_PHANTOM_BLOCK:         return "ERR_PHANTOM_BLOCK";
-        case HN4_ERR_DECOMPRESS_FAIL:       return "ERR_DECOMPRESS_FAIL";
-        case HN4_ERR_THERMAL_CRITICAL:      return "ERR_THERMAL_CRITICAL";
-        case HN4_ERR_CPU_INSANITY:          return "ERR_CPU_INSANITY";
-        case HN4_ERR_MEDIA_TOXIC:           return "ERR_MEDIA_TOXIC";
-        
-        /* --- The Chrono-Sphere --- */
-        case HN4_ERR_GENERATION_SKEW:       return "ERR_GENERATION_SKEW";
-        case HN4_ERR_EPOCH_LOST:            return "ERR_EPOCH_LOST";
-        case HN4_ERR_SNAPSHOT_INVALID:      return "ERR_SNAPSHOT_INVALID";
-        case HN4_ERR_QUANTUM_VIOLATION:     return "ERR_QUANTUM_VIOLATION";
-        case HN4_ERR_TIME_DILATION:         return "ERR_TIME_DILATION";
-        case HN4_ERR_TAMPERED:              return "ERR_TAMPERED";
-        case HN4_ERR_TIME_PARADOX:          return "ERR_TIME_PARADOX";
-        
-        /* --- The Manifold --- */
-        case HN4_ERR_BAD_SUPERBLOCK:        return "ERR_BAD_SUPERBLOCK";
-        case HN4_ERR_VERSION_INCOMPAT:      return "ERR_VERSION_INCOMPAT";
-        case HN4_ERR_NOMEM:                 return "ERR_NOMEM";
-        case HN4_ERR_DMA_MAPPING:           return "ERR_DMA_MAPPING";
-        case HN4_ERR_PROFILE_MISMATCH:      return "ERR_PROFILE_MISMATCH";
-        case HN4_ERR_PICO_LIMIT:            return "ERR_PICO_LIMIT";
-        case HN4_ERR_ENDIAN_MISMATCH:       return "ERR_ENDIAN_MISMATCH";
-        case HN4_ERR_INTERNAL_FAULT:        return "ERR_INTERNAL_FAULT";
-        case HN4_ERR_GEOMETRY:              return "ERR_GEOMETRY";
-        case HN4_ERR_INVALID_ARGUMENT:      return "ERR_INVALID_ARGUMENT";
-        case HN4_ERR_UNINITIALIZED:         return "ERR_UNINITIALIZED";
-        case HN4_ERR_EEXIST:                return "ERR_EEXIST";
-        case HN4_ERR_COMPRESSION_INEFFICIENT: return "ERR_COMPRESSION_INEFFICIENT";
-        case HN4_ERR_ALGO_UNKNOWN:          return "ERR_ALGO_UNKNOWN";
-        case HN4_ERR_KEY_EXPIRED:           return "ERR_KEY_EXPIRED";
-        
-        default:                            return "ERR_UNKNOWN";
+        default: return "ERR_UNKNOWN";
     }
 }
-
 #ifdef __cplusplus
 }
 #endif

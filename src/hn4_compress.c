@@ -542,7 +542,8 @@ static uint32_t _tcc_scan_manifold(const uint8_t* ip, const uint8_t* iend, uint3
 
 /* MANIFOLD: Emit (Write Only) */
 static uint8_t* _tcc_emit_manifold(uint8_t* op, const uint8_t* oend, 
-                                   const uint8_t* ip, uint32_t len, uint32_t stride) 
+                                   const uint8_t* ip, uint32_t len, uint32_t stride,
+                                   uint64_t hw_flags) 
 {
     /* Header: ESC + OP + STRIDE + VARINT_LEN */
     if (op + 3 + HN4_VARINT_MAX_BYTES > oend) return NULL;
@@ -556,8 +557,13 @@ static uint8_t* _tcc_emit_manifold(uint8_t* op, const uint8_t* oend,
 
     if ((size_t)(oend - op) < len) return NULL;
 
-    /* Row 0: Raw Copy */
-    memcpy(op, ip, stride);
+    /* Use Non-Temporal stores if targeting NVM to avoid cache pollution */
+    if (HN4_UNLIKELY(hw_flags & HN4_HW_NVM)) {
+        _hn4_nvm_stream_copy(op, ip, stride);
+    } else {
+        memcpy(op, ip, stride);
+    }
+    
     op += stride;
     
     /* Row 1..N: Spatial Delta */
@@ -733,8 +739,6 @@ hn4_result_t hn4_compress_block(
             }
         }
 
-        /* --- PRIORITY 5: MANIFOLD (2D Delta) --- */
-        /* Check bounds for ip[1] before access to prevent OOB near buffer end */
         if ((device_type == HN4_DEV_SSD) && (ip + 1 < iend) && (ip[0] != 0 && ip[1] != 0)) {
             uint32_t stride = 64; 
             uint32_t m_len = _tcc_scan_manifold(ip, iend, stride);
@@ -746,7 +750,8 @@ hn4_result_t hn4_compress_block(
                      anchor = ip;
                 }
                 
-                op = _tcc_emit_manifold(op, oend, ip, m_len, stride);
+                /* Pass hw_flags to enable NVM streaming stores */
+                op = _tcc_emit_manifold(op, oend, ip, m_len, stride, hw_flags);
                 if (!op) return HN4_ERR_ENOSPC;
                 
                 ip += m_len;

@@ -363,8 +363,10 @@ hn4_result_t hn4_write_anchor_atomic(
     
     hn4_hal_spinlock_release(&vol->locking.shards[lock_idx].lock);
     
-    if (HN4_LIKELY(res == HN4_OK)) {
-        hn4_hal_barrier(vol->target_device);
+     if (HN4_LIKELY(res == HN4_OK)) {
+        if (!(vol->sb.info.hw_caps_flags & HN4_HW_NVM)) {
+            hn4_hal_barrier(vol->target_device);
+        }
     }
 
     hn4_hal_mem_free(io_buf);

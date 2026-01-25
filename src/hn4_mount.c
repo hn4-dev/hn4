@@ -762,7 +762,18 @@ static hn4_result_t _mark_volume_dirty_and_sync(HN4_IN hn4_hal_device_t* dev, HN
 #endif
 
     /* 1. Write North */
-    if (hn4_hal_sync_io(dev, HN4_IO_WRITE, lba0, io_buf, sectors) == HN4_OK) {
+    bool zns_ready = true;
+    
+    if (caps->hw_flags & HN4_HW_ZNS_NATIVE) {
+        /* Reset Zone 0 (Superblock) */
+        if (hn4_hal_sync_io(dev, HN4_IO_ZONE_RESET, lba0, NULL, 0) != HN4_OK) {
+            zns_ready = false;
+        } else {
+            hn4_hal_barrier(dev);
+        }
+    }
+
+    if (zns_ready && hn4_hal_sync_io(dev, HN4_IO_WRITE, lba0, io_buf, sectors) == HN4_OK) {
         if (hn4_hal_sync_io(dev, HN4_IO_FLUSH, lba0, NULL, 0) == HN4_OK) {
             north_ok = true;
         }
@@ -1017,7 +1028,6 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     cap_bytes = sb->info.total_capacity;
     hw_cap = caps->total_capacity_bytes;
     
-    /* FIX: Allow Virtual Capacity if Mount Intent permits it */
     bool is_virtual = (sb->info.mount_intent & HN4_MNT_VIRTUAL);
 
     /* Check: Partition Cap > HW Cap? */
@@ -1032,7 +1042,6 @@ static hn4_result_t _validate_sb_layout(const hn4_superblock_t* sb, const hn4_ha
     cap_bytes = sb->info.total_capacity;
     hw_cap = caps->total_capacity_bytes;
     
-    /* FIX: Allow Virtual Capacity if Mount Intent permits it */
     bool is_virtual = (sb->info.mount_intent & HN4_MNT_VIRTUAL);
 
     if (!is_virtual && cap_bytes > hw_cap) return HN4_ERR_GEOMETRY;

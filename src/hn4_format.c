@@ -58,6 +58,14 @@ static const uint32_t PREF_IO_SIZES[] = {
     4  * (uint32_t)HN4_SZ_KB  /* Desperation Mode */
 };
 
+
+/* Waterfall allocation: progressively smaller buffers on failure */
+
+   const uint32_t attempts[] = { 
+        32 * 1024 * 1024, 
+        2 * 1024 * 1024, 
+        64 * 1024 
+    };
 /* 
  * Device Resolution Matrix
  * Maps [Profile][HW_Traits] -> Device Type
@@ -457,18 +465,15 @@ static hn4_result_t _zero_region_explicit(hn4_hal_device_t* dev,
         /* Pass NULL buffer. HAL handles generation via HN4_IO_ZERO. */
         return hn4_hal_sync_io_large(dev, HN4_IO_ZERO, start_lba, NULL, byte_len, block_size);
     }
+   
+    void* buffer = NULL;
+    uint32_t buf_sz = 0;
 
-    /* Try 32MB, fall back to 2MB, then 64KB */
-    uint32_t buf_sz = 32 * 1024 * 1024;
-    void* buffer = hn4_hal_mem_alloc(buf_sz);
-
-    if (!buffer) {
-        buf_sz = 2 * 1024 * 1024;
-        buffer = hn4_hal_mem_alloc(buf_sz);
-    }
-    if (!buffer) {
-        buf_sz = 64 * 1024;
-        buffer = hn4_hal_mem_alloc(buf_sz);
+    for (int i = 0; i < 3; i++) {
+        if ((buffer = hn4_hal_mem_alloc(attempts[i])) != NULL) {
+            buf_sz = attempts[i];
+            break;
+        }
     }
 
     if (!buffer) return HN4_ERR_NOMEM;
@@ -1346,33 +1351,69 @@ hn4_result_t hn4_format(hn4_hal_device_t* dev, const hn4_format_params_t* params
 
 #endif
 
-    res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
+    /*
+     * CARDINAL BROADCAST
+     * Writes the Superblock to all active cardinal points (North, East, West, South).
+     * North (LBA 0) is always written first.
+     */
     
+    struct { 
+        hn4_addr_t lba; 
+        bool active; 
+        bool is_south; 
+    } targets[] = {
+        { lba_n, true,        false }, /* North */
+        { lba_e, write_east,  false }, /* East */
+        { lba_w, write_west,  false }, /* West */
+        { lba_s, write_south, true  }  /* South (Optional) */
+    };
+
+    /* Write North First (Primary) */
+    res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, targets[0].lba, sb_buf, write_sz, bs);
+
     if (res == HN4_OK) {
         hn4_hal_barrier(dev);
 
-        if (res == HN4_OK && write_east) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
-        if (res == HN4_OK && write_west) res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
-        
-        /* Use the boolean calculated above */
-        if (res == HN4_OK && write_south) {
-            hn4_result_t s_res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_s, sb_buf, write_sz, bs);
-            
-            if (s_res != HN4_OK) {
-                HN4_LOG_WARN("South SB write failed. Volume is Degraded.");
-                
-                sb_cpu.info.state_flags |= HN4_VOL_DEGRADED;
-                hn4_packed_sb_t* fix_buf = (hn4_packed_sb_t*)sb_buf;
-                hn4_sb_to_disk((hn4_superblock_t*)&sb_cpu, (hn4_superblock_t*)fix_buf);
-                
-                hn4_superblock_t* disk = (hn4_superblock_t*)fix_buf;
-                disk->raw.sb_crc = 0;
-                uint32_t c = hn4_crc32(0, disk, HN4_SB_SIZE - 4);
-                disk->raw.sb_crc = hn4_cpu_to_le32(c);
-                
-                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_n, sb_buf, write_sz, bs);
-                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_e, sb_buf, write_sz, bs);
-                hn4_hal_sync_io_large(dev, HN4_IO_WRITE, lba_w, sb_buf, write_sz, bs);
+        /* Write Replicas */
+        for (int i = 1; i < 4; i++) {
+            if (!targets[i].active) continue;
+
+            hn4_result_t io_res = hn4_hal_sync_io_large(dev, HN4_IO_WRITE, 
+                                                        targets[i].lba, sb_buf, write_sz, bs);
+
+            if (io_res != HN4_OK) {
+                if (targets[i].is_south) {
+                    /* 
+                     * SOUTHBRIDGE FAILURE PROTOCOL
+                     * If South fails (often due to capacity limits or bad blocks at end of disk),
+                     * we mark the volume DEGRADED but do not fail the format.
+                     */
+                    HN4_LOG_WARN("South SB write failed. Volume marked DEGRADED.");
+                    
+                    sb_cpu.info.state_flags |= HN4_VOL_DEGRADED;
+                    
+                    /* Re-serialize SB with DEGRADED flag */
+                    hn4_sb_to_disk((hn4_superblock_t*)&sb_cpu, (hn4_superblock_t*)sb_buf);
+                    
+                    /* Re-calculate CRC */
+                    hn4_superblock_t* disk = (hn4_superblock_t*)sb_buf;
+                    disk->raw.sb_crc = 0;
+                    uint32_t c = hn4_crc32(0, disk, HN4_SB_SIZE - 4);
+                    disk->raw.sb_crc = hn4_cpu_to_le32(c);
+                    
+                    /* Re-commit previously successful sectors with updated flag */
+                    /* Note: Loop i=0 to <i re-writes N/E/W */
+                    for (int j = 0; j < i; j++) {
+                        if (targets[j].active) {
+                            hn4_hal_sync_io_large(dev, HN4_IO_WRITE, targets[j].lba, sb_buf, write_sz, bs);
+                        }
+                    }
+                    continue; /* Continue loop (though South was last) */
+                } else {
+                    /* Critical Mirror Failure (East/West) */
+                    res = io_res;
+                    break;
+                }
             }
         }
         hn4_hal_barrier(dev);

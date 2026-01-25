@@ -453,7 +453,11 @@ _Check_return_ hn4_result_t hn4_epoch_advance(
         if (out_new_ptr) *out_new_ptr = sb->info.epoch_ring_block_idx;
     }
 
-    if (res == HN4_OK) hn4_hal_barrier(dev);
+    if (res == HN4_OK) {
+        if (!(sb->info.hw_caps_flags & HN4_HW_NVM)) {
+            hn4_hal_barrier(dev);
+        }
+    }
 
     hn4_hal_mem_free(io_buf);
     return res;
